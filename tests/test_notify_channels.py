@@ -315,6 +315,21 @@ check("在线时显示「已使用」", "Cookie 已使用" in ok_txt)
 check("已使用时长按真实经过时间计算（不是累加器）", "1小时1分钟" in ok_txt, ok_txt[:200])
 check("在线时展示最近验证时间", "最近验证" in ok_txt)
 
+print("\n=== 9. Cookie 保活周期可配 ===")
+cfg_rc = dict(new)
+cfg_rc["refresh_cron"] = "*/30 * * * *"
+p_rc = Cfg(dict(cfg_rc))
+check("保活周期读取自定义值", p_rc._refresh_cron == "*/30 * * * *", p_rc._refresh_cron)
+p_rc2 = Cfg({**new, "input_id_list": "1000002"})
+check("未填写时回落默认 10 分钟", p_rc2._refresh_cron == "*/10 * * * *", p_rc2._refresh_cron)
+p_rc3 = Cfg({**new, "refresh_cron": "   "})
+check("空白值也回落默认（不把插件搞挂）", p_rc3._refresh_cron == "*/10 * * * *", p_rc3._refresh_cron)
+src_rc = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+check("表单含 refresh_cron 输入框", "'model': 'refresh_cron'" in src_rc)
+check("默认值含 refresh_cron", '"refresh_cron": ""' in src_rc)
+check("持久化含 refresh_cron", '"refresh_cron": self._refresh_cron' in src_rc)
+check("保活循环使用可配周期", "CronTrigger.from_crontab(self._refresh_cron" in src_rc)
+
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:

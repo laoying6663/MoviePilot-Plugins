@@ -40,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.3"
+    plugin_version = "3.1.4"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -51,7 +51,10 @@ class DynamicWeChat(_PluginBase):
     plugin_order = 47
     # 可使用的用户级别
     auth_level = 2
-    # 检测间隔时间,默认10分钟
+    # Cookie 保活默认周期（可在插件配置中覆盖）。
+    # 周期越短，保活越及时、对 Cookie 刷新越频繁；周期越长，请求次数越少、
+    # 被企业微信风控关注的概率越低。企微 Cookie 本身有效期很长，10 分钟一次偏保守。
+    _default_refresh_cron = '*/10 * * * *'
     _refresh_cron = '*/10 * * * *'
 
     # ---------- 常量配置 ----------
@@ -180,6 +183,8 @@ class DynamicWeChat(_PluginBase):
         self._last_code = ""
         self._notification_token = ''
         self._cron = '*/10 * * * *'
+        # 保活周期先回落默认值，再读配置；配置非法时不至于让插件起不来
+        self._refresh_cron = self._default_refresh_cron
         self._ip_changed = True
         self._forced_update = False
         self._use_cookiecloud = True
@@ -220,6 +225,10 @@ class DynamicWeChat(_PluginBase):
             self._use_cookiecloud = config.get("use_cookiecloud")
             self._cookie_header = config.get("cookie_header")
             self._await_ip = config.get("await_ip")
+            # Cookie 保活周期（风控敏感项：不填则沿用默认 */10）
+            refresh_cron = config.get("refresh_cron")
+            if refresh_cron and str(refresh_cron).strip():
+                self._refresh_cron = str(refresh_cron).strip()
 
             # 通知方式：勾选的 MoviePilot 渠道 + 手填的第三方 Token
             # 向后兼容的关键：
@@ -1741,6 +1750,7 @@ class DynamicWeChat(_PluginBase):
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
             "cron": self._cron,
+            "refresh_cron": self._refresh_cron,
             "notification_token": self._notification_token,
             "notify_channels": self._notify_channels,
             "wechat_userid": self._wechat_userid,
@@ -1830,7 +1840,22 @@ class DynamicWeChat(_PluginBase):
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {'component': 'VTextField',
-                                     'props': {'model': 'cron', 'label': '[必填]检测周期', 'placeholder': '0 * * * *'}}
+                                     'props': {'model': 'cron', 'label': '[必填] 检测周期',
+                                               'placeholder': '0 * * * *（默认每 10 分钟检查一次公网 IP）',
+                                               'hint': '公网 IP 变化检测的频率'}}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {'component': 'VTextField',
+                                     'props': {'model': 'refresh_cron',
+                                               'label': '[可选] Cookie 保活周期',
+                                               'placeholder': '*/10 * * * *（默认 10 分钟）',
+                                               'hint': '保活越频繁，Cookie 越不容易掉，但请求次数也越多、'
+                                                       '越可能引起企业微信风控关注。企微 Cookie 有效期本身很长，'
+                                                       '介意的话可改成 */30 或 0 */2 * * *。'}}
                                 ]
                             },
                             {
@@ -1917,6 +1942,7 @@ class DynamicWeChat(_PluginBase):
         ], {
             "enabled": False,
             "cron": "",
+            "refresh_cron": "",
             "onlyonce": False,
             "forced_update": False,
             "use_cookiecloud": True,

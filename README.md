@@ -1,87 +1,224 @@
-# dynamicwechat 插件保全包
+# 动态企微可信IP
 
-这个目录是 `laoying6663/MoviePilot-Plugins` 仓库的**唯一完整副本**。
-原仓库的 PR #2 与 PR #3 **从未合并**，仓库一旦删除，GitHub 上不会有任何备份。
+定时检查本机公网 IP,变化时自动写回企业微信应用的「可信 IP」列表,**保证企业微信通知不会因为 IP 变动而失效**。
 
-保全时间：2026-10-11
+> 本仓库是 [RamenRa/MoviePilot-Plugins](https://github.com/RamenRa/MoviePilot-Plugins) 中同名插件的独立维护分支,原始作者 RamenRa,原始创意来自 [suraxiuxiu/MoviePilot-Plugins](https://github.com/suraxiuxiu/MoviePilot-Plugins/)。
 
 ---
 
-## 目录结构
+## 这个插件解决什么问题
 
-```text
-dynamicwechat-backup/
-├── plugins.v3/dynamicwechat/          # V3 专用实现 3.0.0 ← 你要用的
-│   ├── __init__.py
-│   └── helper.py
-├── plugins.v2/dynamicwechat/          # V2 实现 2.1.9（V3 加载失败时的回退）
-│   ├── __init__.py
-│   ├── helper.py
-│   └── src/UpdateHelp.py
-├── package.v3.json                    # V3 索引（仅 DynamicWeChat = 3.0.0, system_version >=3.0.0）
-├── package.v2.json                    # V2 索引（仅 DynamicWeChat = 2.1.9, "v3": false）
-├── icons/Wecom_A.png                  # 插件图标（需手动上传，API 不支持二进制）
-├── tests/                             # 离线自测（v3 65 项 / v2 43 项）
-└── MANIFEST.json                      # 每个文件的 SHA256
-```
+企业微信应用只能从「可信 IP」列表里的地址发消息。家里宽带的公网 IP 一变,企微应用就发不出通知了——表现为「明明网络没问题,但微信收不到任何消息」。
 
-> **没有 `package.json`**：该文件是 V1 默认索引，对应 `plugins/` 目录。本仓库不含
-> V1 实现，保留它只会让索引指向一堆不存在的插件目录。
+本插件做的就是:每隔一段时间查一次公网 IP,变了就自动登录企微后台把新 IP 填进可信 IP 列表,你什么都不用管。
 
-## 版本状态
+顺带解决第二个痛点:**Cookie 反复失效**。企微后台的登录 Cookie 是有时效的,原版插件只把它存在内存里,重启或更新插件就没了,必须重新扫码。本仓库的 3.x 版本把 Cookie 持久化到磁盘,重启和更新都不会丢。
 
-| 目录 | 版本 | 说明 |
+---
+
+## 版本说明
+
+| 目录 | 版本 | 用途 |
 |---|---|---|
-| `plugins.v3/dynamicwechat` | **3.0.0** | V3 专用实现，`app.sdk.*` + `httpx2` |
-| `plugins.v2/dynamicwechat` | 2.1.9 | V2 实现，含同样的 Cookie 修复 |
-| `plugins/`（V1） | — | **不含**。原仓库的 1.7.3 未纳入，1.7.4 的改动已随 PR #1 关闭丢弃 |
+| `plugins.v3/dynamicwechat` | **3.1.4** | **MoviePilot V3 使用这个** |
+| `plugins.v2/dynamicwechat` | 2.1.9 | 兼容 MoviePilot V2 |
 
-## 署名
+MoviePilot V3 会优先加载 `package.v3.json` 里的条目,没有 V3 专用实现时才回退到 V2。
 
-- `author` / `plugin_author`：**RamenRa, laoying6663**
-  上游插件作者是 RamenRa，本仓库为其 fork 并由 laoying6663 维护修复，署名保留双方。
-- `author_url`：仍指向 `https://github.com/RamenRa/MoviePilot-Plugins`
-  —— 插件面板里的「作者主页 / 全功能详细说明」链接以上游仓库文档为准。
+---
 
-## 重建仓库步骤
+## 安装
 
-### 1. 建库
+### 方式一:插件市场(推荐)
 
-新建一个仓库（**不要 fork**），然后把本目录内容推上去：
+1. 进入 **系统 → 插件 → 插件市场**
+2. 添加仓库地址:
+   ```
+   https://github.com/laoying6663/MoviePilot-Plugins
+   ```
+3. 刷新市场,搜索「动态企微可信IP」并安装
+4. 安装后在插件列表里**重载一次插件**
 
-```powershell
-cd dynamicwechat-backup
-git init
-git add .
-git commit -m "feat(dynamicwechat): V3 专用实现 3.0.0"
-git remote add origin https://github.com/<你的账号>/<新仓库名>.git
-git push -u origin main
+> 市场拉取失败(日志报 `EndOfStream` / `所有策略均无法读取插件索引`)说明你的 MoviePilot 出站代理有问题,先解决代理再回来刷新,否则装不上新版。
+
+### 方式二:手动放进容器
+
+市场刷新不了时用这个,绕过索引直接覆盖代码:
+
+```bash
+# 把仓库里的 plugins.v3/dynamicwechat 目录拷进容器
+docker cp ./dynamicwechat <容器名>:/app/app/plugins/DynamicWeChat
 ```
 
-> 本机目前**没有系统级 git**。如果还没装，可用 `D:\minimax\tools\flutter\bin\cache\mingit`（Flutter 自带），
-> 或者安装 Git for Windows 后再执行上面的命令。
+然后在 MoviePilot 里**重载插件**或重启容器。
 
-### 2. 校验完整性（可选但建议）
+> 数据目录 `/config/plugins/DynamicWeChat/` 与代码目录是分开的,更新插件不会动你的 Cookie 和配置。
 
-```powershell
-python -c "import hashlib,json;m=json.load(open('MANIFEST.json',encoding='utf-8'));[print(('OK  ' if hashlib.sha256(open(f['path'],'rb').read()).hexdigest()==f['sha256'] else 'BAD '),f['path']) for f in m['files']]"
+---
+
+## 快速开始
+
+1. **填应用 ID** —— 打开企业微信管理后台的应用详情页,地址栏末尾那串数字就是应用 ID。多个应用用英文逗号分隔。
+2. **配通知渠道** —— 在插件配置里勾选你已在 MoviePilot「设定 → 通知」中配置好的渠道(3.1.0 起支持多选,不用再手打 `WeChat` 这种名字)。至少配一个才能用 `/push_qr`。
+3. **保存配置** —— 这一步不能跳过,配置要落库才会生效。
+4. **扫码登录一次** —— 用面板里的「本地扫码修改IP」,或在企微应用里发 `/push_qr`。扫完 Cookie 就存下来了,之后重启、更新都不会再丢。
+
+---
+
+## 配置项
+
+| 配置项 | 说明 |
+|---|---|
+| **启用插件** | 总开关 |
+| **应用ID** | 必填。企业微信应用 ID,多个用逗号分隔 |
+| **检测周期** | 公网 IP 检查频率,crontab 表达式,默认 `*/10 * * * *` |
+| **Cookie 保活周期** | 可选,crontab,默认 `*/10 * * * *`。**调长可降低被企微风控关注的概率**,见下方说明 |
+| **通知渠道(多选)** | 3.1.0 起从 MoviePilot 已配置的渠道里勾选,支持微信、Telegram、Slack、钉钉、QQ 等 |
+| **企业微信接收人 userid** | 可选。只推给指定成员时填,留空则发给该渠道所有已配置接收人 |
+| **第三方通知 Token** | Server酱(SCT开头)、PushPlus、AnPush、IYUU 的 Token,多个用 `\|\|` 分隔 |
+| **IP变动后通知** | Cookie 失效时不立即通知,等公网 IP 变动后再发。适合 IP 变动慢、Cookie 掉得快的环境 |
+| **使用CookieCloud** | 见下方「CookieCloud」一节 |
+| **Cookie(header)** | 高级。手工填入企微 Cookie,可作为 CookieCloud 不可用时的兜底 |
+
+---
+
+## 面板说明
+
+插件面板上有两个数字,含义不同,别混淆:
+
+```
+Cookie 已使用: 0天2小时15分钟       ← 当前这份 Cookie 已经用了多久(绿色)
+Cookie 已掉线，请重新扫码             ← Cookie 确认失效(红色)
+最近验证: 2026-10-12 01:52:14       ← 保活最后一次校验通过的时刻
 ```
 
-### 3. 在 MoviePilot 里换源
+- **「已使用」不是剩余有效期**。企微没有公开 Cookie 的有效期,这个数只表示「距离上次扫码过了多久」。
+- **「最近验证」每分钟都在走**,它才是判断保活是否还活着最直接的证据。如果它长时间不动,说明保活任务没跑起来。
 
-插件市场里把仓库地址改成新仓库 URL，然后刷新市场缓存。
+---
 
-## 重要提醒
+## 常用技巧
 
-**V3 那份（3.0.0）从未在真实 MoviePilot V3 宿主加载过。**
+### 微信作主通知,第三方作备用
 
-- `httpx2` 调用与 `app.sdk.*` 导入路径是**核对 V3 源码**确认存在的，但没有真机验证
-- 迁移涉及的类改名是**互换命名**，很容易搞反：
-  - 旧 `NotificationType.Plugin` → 新 `MessageType.Plugin`
-  - 旧 `MessageChannel.Wechat` → 新 `NotificationChannel.Wechat`
-- **如果 V3 版本加载失败**，把 `package.v3.json` 里的 `DynamicWeChat` 条目删掉、把
-  `package.v2.json` / `package.json` 里的 `"v3": false` 去掉，宿主就会回退加载
-  `plugins.v2/` 那份 2.1.9 —— 它经过更多验证，且 V3 通过兼容层本来就能加载。
+在「第三方通知 Token」里填 `SCTxxx`,同时在「通知渠道」勾选微信。企微通知发不出去时会自动切到第三方。
 
-**已验证的部分**：离线逻辑自测 v3 65/65、v2 43/43 全通过；索引契约按官方
-`check_plugin_versions.py` 逻辑校验通过；V3 源码零遗留旧导入、零 `aiohttp`。
+### 改 IP 后不发送通知
+
+在「第三方通知 Token」末尾加 `||Q`:
+
+```
+SCTxxx||Q
+```
+
+### 从指定 URL 获取 IP
+
+适用于 MoviePilot 部署在需要翻墙环境。在「应用ID」栏用 `||` 接 URL:
+
+```
+应用ID,应用ID2||https://myip.net,https://ip138.net
+```
+
+### Server³ 二维码推送到服务号
+
+在 Token 里填 `Server3的key,普通key`。失效通知走 Server³ 系统级推送,二维码推给服务号。
+
+### 多网络出口检测
+
+仅当你的出口 IP 会跳动(如爱快随机分流)时才需要,否则不建议开启。
+
+```
+应用ID||wan2
+```
+
+其中 `2` 表示最多保留 2 个 IP,一般设为 ≥ 宽带线路数。原理是从 orz.tools / m27.tech / skk.moe 获取多线路 IP。
+
+> 已知问题:首次检查大概率失败,可能要第三轮才正常(可用「立即检测一次」加速)。此时无法使用「从指定URL获取IP」。
+
+### Cookie 失效过快
+
+在「第三方通知 Token」里至少填一个可用 Token,保存后重新进配置面板打开「IP变动后通知」。这样真正用不了企微通知时才会发通知,二维码发到第三方。
+
+---
+
+## 远程命令
+
+在企业微信应用里直接发给 MoviePilot:
+
+| 命令 | 作用 |
+|---|---|
+| `/push_qr` | 推送登录二维码。也可用来**测试通知通道是否可用** |
+| `/wxcode 550110` | 发送短信验证码(需要启用 AI 全局助手) |
+
+> MoviePilot 可能因网络波动收不到命令,尤其是用 Cloudflare 隧道的用户。多发几次,以 **MP 日志为准**。
+
+---
+
+## 常见问题
+
+**Q: Cookie 老是掉怎么办?**
+
+3.1.0 起 Cookie 会持久化到 `/config/plugins/DynamicWeChat/settings.json`,重启和更新都不会丢。如果你仍然遇到掉线,检查两点:
+1. 容器里的 `/config` 是不是真的挂载了持久卷(不是容器重建就丢的那种)
+2. 日志里有没有 `没有可用的CookieCloud服务器` —— 有的话是 CookieCloud 走不通
+
+**Q: 面板显示「保活尚未完成首轮校验」?**
+
+说明保活循环还没成功跑过一次。等一个保活周期(默认 10 分钟),或去日志搜这几个关键字确认状态:
+
+| 搜什么 | 说明什么 |
+|---|---|
+| `后台循环已启动` | 保活循环起来了没,cron 配置是什么 |
+| `Cookie 保活成功` | 续期成功 |
+| `cookie 校验过程中发生异常` | 浏览器起不来(最常见原因) |
+| `Cookie 复核未通过` | 页面加载了但登录态没通过 |
+| `获取文件锁超时` | 续期被文件锁跳过 |
+
+**Q: 会不会触发企业微信风控?**
+
+3.x 的保活大部分轮次只是一次轻量 HTTP 请求,只有判定失效时才启动浏览器,请求量比原版更少。如果你的账号对自动化较敏感,可以把「Cookie 保活周期」调成 `*/30 * * * *` 或 `0 */2 * * *`。企微 Cookie 有效期本身很长,10 分钟一次偏保守。
+
+**Q: 插件市场一直拉取失败?**
+
+日志里的 `EndOfStream` / `所有策略均无法读取插件索引` 说明 MoviePilot 的出站代理有问题(常见于代理协议填错或代理进程挂了)。这个不修的话,CookieCloud 也用不了、市场也刷不出来。
+
+---
+
+## 3.x 相比上游改了什么
+
+| 改动 | 说明 |
+|---|---|
+| **Cookie 持久化** | 扫码后写入 `settings.json`,启动时恢复。重启 / 更新插件不再丢 |
+| **失效判定加退避** | 原版单轮判死——页面慢一次就清空 Cookie 并通知。现在连续 3 轮确认才判定 |
+| **异常不再误杀** | 浏览器启动失败、网络抖动只记日志,绝不清 Cookie、不发「已失效」通知 |
+| **复核后回写 Cookie** | 企微每次访问都会轮换会话 Cookie,原来只判有效却不保存新值 |
+| **修复自我锁死** | 原版关闭 CookieCloud 时手工填的 Cookie 永远取不回来,只能重启 |
+| **通知渠道可视化** | 3.1.0 起可勾选已配置的渠道,不再手打名称;支持多渠道路由 |
+| **面板语义修正** | 「已使用」改为按时间戳实时计算(每分钟都在走),新增「最近验证」时间戳 |
+| **保活周期可配** | 可调长以降低风控暴露 |
+| **数据丢失保护** | `settings.json` 区分「文件不存在」与「无法解析」,拒绝覆盖损坏文件;原子写 + 并发锁 |
+
+---
+
+## 版本历史
+
+完整历史见 `package.v3.json`。
+
+- **3.1.4** 当前版本
+- **3.1.3** 面板计时实时化 + 掉线提示
+- **3.1.2** 面板语义修正 + 最近验证时间戳
+- **3.1.1** 修复「已使用」重启后恒为 0
+- **3.1.0** 通知渠道多选 + userid 字段
+- **3.0.0** V3 专用实现,迁移到 `app.sdk.*` 稳定 SDK
+
+---
+
+## 致谢
+
+- 原始作者:[RamenRa](https://github.com/RamenRa/MoviePilot-Plugins)
+- 最初创意:[suraxiuxiu](https://github.com/suraxiuxiu/MoviePilot-Plugins/)
+- 插件框架:[MoviePilot](https://github.com/jxxghp/MoviePilot)
+
+## 许可证
+
+GPL-3.0,随上游。
