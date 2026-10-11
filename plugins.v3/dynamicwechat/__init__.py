@@ -3,6 +3,7 @@ import io
 import os
 import random
 import re
+import time
 import base64
 import threading
 from datetime import datetime, timedelta
@@ -39,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.2"
+    plugin_version = "3.1.3"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -137,6 +138,8 @@ class DynamicWeChat(_PluginBase):
     _cookie_lifetime = 0
     # 最近一次保活校验通过的时间戳（0 表示从未成功）
     _cookie_checked_at = 0
+    # 当前 Cookie 的「获得时刻」（扫码成功时刷新），用于展示已使用时长
+    _cookie_acquired_at = 0
     # 使用CookieCloud开关
     _use_cookiecloud = True
     # 登录cookie
@@ -386,12 +389,13 @@ class DynamicWeChat(_PluginBase):
         """
         Cookie 确认失效后才清除本地副本。
 
-        注意：这里失败也必须留日志。原实现静默返回 False，导致磁盘上的死 Cookie
-        留到下次 init_plugin 又被 _load_persisted_cookie 复活，还会把 _cookie_valid
-        重新置 True —— 用户会收到第二轮「已失效」通知。
+        同时清掉「获得时刻」：否则 Cookie 已经掉了，面板上的「已使用」还会继续往上走。
         """
         def _mutate(data):
             data.pop(self._cookie_store_key, None)
+            data['_cookie_acquired_at'] = 0
+
+        self._cookie_acquired_at = 0
 
         if not await self._acquire_file_lock():
             logger.warning("获取文件锁超时，本地 Cookie 未能清除，"
@@ -1081,6 +1085,8 @@ class DynamicWeChat(_PluginBase):
                 self._fail_count = 0
                 self._is_special_upload = True
                 logger.info("从浏览器获取cookie成功")
+                # 刚拿到一份全新 Cookie，重置「已使用」计时起点
+                await self._mark_cookie_acquired()
                 # 无论是否启用 CookieCloud，先在本地落盘一份，重启后可直接复用
                 if not await self._persist_cookie(current_cookies):
                     logger.warning("Cookie 未能落盘，重启后可能需要重新登录")
@@ -1525,10 +1531,24 @@ class DynamicWeChat(_PluginBase):
         )
 
     def _load_cookie_checked_at(self):
-        """从磁盘恢复「最近验证时间」，避免重启后显示为空。"""
+        """从磁盘恢复「最近验证时间」与「Cookie 获得时刻」，避免重启后显示为空。"""
         data = PyCookieCloud.read_settings(self._settings_file_path)
         if isinstance(data, dict):
             self._cookie_checked_at = int(data.get('_cookie_checked_at') or 0)
+            self._cookie_acquired_at = int(data.get('_cookie_acquired_at') or 0)
+
+    async def _mark_cookie_acquired(self):
+        """记录「当前 Cookie 刚刚获得」，用于重置「已使用」计时。"""
+        self._cookie_acquired_at = int(datetime.now().timestamp())
+        self._cookie_lifetime = 0
+
+        def _mutate(d):
+            d['_cookie_acquired_at'] = self._cookie_acquired_at
+            d['_cookie_lifetime'] = 0
+
+        await asyncio.to_thread(
+            PyCookieCloud.update_settings, self._settings_file_path, _mutate,
+        )
 
     async def check_login_status(self, page, task):
         """
@@ -1956,18 +1976,29 @@ class DynamicWeChat(_PluginBase):
         cookie_lifetime_component = None
         checked_at_component = None
         if self._is_special_upload and self._enabled:
-            cookie_lifetime_days = self._cookie_lifetime // 86400
-            cookie_lifetime_hours = (self._cookie_lifetime % 86400) // 3600
-            cookie_lifetime_minutes = (self._cookie_lifetime % 3600) // 60
-            bg_color = "#40bb45" if self._cookie_valid else "#ff0000"
-            if self._cookie_lifetime > 0:
-                elapsed = f"{cookie_lifetime_days}天{cookie_lifetime_hours}小时{cookie_lifetime_minutes}分钟"
-                # 说清这个数是什么：它是「距上次扫码/验证过去了多久」，会一直增长，
-                # 不是 Cookie 剩余有效期。写「已使用」容易被误解成倒计时。
-                cookie_lifetime_text = f"距上次验证登录: {elapsed}"
+            # 按「获得时刻」实时计算，而不是读累加器。
+            # 原实现每轮保活（默认 10 分钟）才 +600，所以面板十分钟才跳一次；
+            # 改成 now - acquired_at 之后，页面每次渲染拿到的都是当下真实值，
+            # 自然每分钟都在走，也不会有累加漂移。
+            if self._cookie_acquired_at > 0:
+                used = max(0, int(time.time()) - self._cookie_acquired_at)
             else:
-                # 从未成功续期过：明确说明是「还没跑过」而不是「时长为 0」，
-                # 否则绿色状态配一个 0 看起来像坏了，实际只是首轮保活还没完成。
+                # 老数据没有该字段：回退到旧的累加器
+                used = int(self._cookie_lifetime or 0)
+            days, rem = divmod(used, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes = rem // 60
+            elapsed = f"{days}天{hours}小时{minutes}分钟"
+
+            if not self._cookie_valid:
+                # Cookie 已确认失效：直接说掉线，不再显示一个还在增长的时长
+                bg_color = "#ff0000"
+                cookie_lifetime_text = "Cookie 已掉线，请重新扫码"
+            elif used > 0:
+                bg_color = "#40bb45"
+                cookie_lifetime_text = f"Cookie 已使用: {elapsed}"
+            else:
+                # 从未成功取得 Cookie：明确说明，而不是显示一个绿色 + 0
                 bg_color = "#ff9800"
                 cookie_lifetime_text = "Cookie 保活尚未完成首轮校验，请查看日志确认保活任务是否运行"
             cookie_lifetime_component = {

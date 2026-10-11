@@ -236,6 +236,8 @@ check("get_form() 含 notify_channels", "notify_channels" in blob)
 
 print("\n=== 8. 最近验证时间戳与面板文案 ===")
 import asyncio as _a
+import time
+import json as _json
 
 PyCookieCloud = helper.PyCookieCloud
 pT = DynamicWeChat.__new__(DynamicWeChat)
@@ -249,22 +251,69 @@ pT._is_special_upload = True
 PyCookieCloud.write_settings(sfT, {})
 _a.run(pT._mark_cookie_verified())
 check("校验成功后写入时间戳", pT._cookie_checked_at > 0, str(pT._cookie_checked_at))
-check("时间戳落盘", (json.load(open(sfT, encoding="utf-8")) or {}).get("_cookie_checked_at", 0) > 0)
+check("时间戳落盘", (_json.load(open(sfT, encoding="utf-8")) or {}).get("_cookie_checked_at", 0) > 0)
+
+# 获得时刻：扫码时刷新，且把累加器清零
+pT._cookie_lifetime = 999
+_a.run(pT._mark_cookie_acquired())
+check("扫码后记录获得时刻", pT._cookie_acquired_at > 0, str(pT._cookie_acquired_at))
+check("扫码后累加器清零", pT._cookie_lifetime == 0, str(pT._cookie_lifetime))
+d0 = _json.load(open(sfT, encoding="utf-8"))
+check("获得时刻已落盘", d0.get("_cookie_acquired_at", 0) > 0)
+check("落盘同时把 _cookie_lifetime 清零", d0.get("_cookie_lifetime", 1) == 0)
 
 pT2 = DynamicWeChat.__new__(DynamicWeChat)
 pT2._settings_file_path = sfT
 pT2._cookie_checked_at = 0
+pT2._cookie_acquired_at = 0
 pT2._load_cookie_checked_at()
-check("重启后能恢复最近验证时间", pT2._cookie_checked_at == pT._cookie_checked_at,
-      f"{pT2._cookie_checked_at} vs {pT._cookie_checked_at}")
+check("重启后恢复两个时间戳",
+      pT2._cookie_checked_at == pT._cookie_checked_at and pT2._cookie_acquired_at == pT._cookie_acquired_at)
 
 src3b = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
-check("面板文案已改为「距上次验证登录」", "距上次验证登录" in src3b)
-check("不再使用易误解的「已使用」", "Cookie 已使用" not in src3b)
+check("面板文案为「Cookie 已使用」", "Cookie 已使用" in src3b)
+check("掉线时显示「已掉线」", "Cookie 已掉线，请重新扫码" in src3b)
+check("面板按时间戳实时计算（每分钟都会走）",
+      "int(time.time()) - self._cookie_acquired_at" in src3b)
+check("已引入 time 模块", "\nimport time\n" in src3b)
 check("面板含「最近验证」时间戳", "最近验证" in src3b)
 check("从未成功时给出明确提示", "尚未完成首轮校验" in src3b)
+check("失效时清掉获得时刻", "'_cookie_acquired_at'] = 0" in src3b)
 check("时间戳组件已接入页面内容", "checked_at_component if checked_at_component" in src3b)
 check("续期成功后才打时间戳", "await self._mark_cookie_verified()" in src3b)
+
+# 掉线时「已使用」必须冻结，不能继续涨
+pZ = DynamicWeChat.__new__(DynamicWeChat)
+pZ._is_special_upload = True
+pZ._enabled = True
+pZ._cookie_valid = False
+pZ._cookie_acquired_at = int(time.time()) - 3600
+pZ._cookie_lifetime = 0
+pZ._cookie_checked_at = 0
+pZ._qr_code_image = None
+pZ._future_timestamp = 0
+pZ._settings_file_path = sfT
+pZ._file_lock = threading.Lock()
+pg_txt = json.dumps(pZ.get_page(), ensure_ascii=False, default=str)
+check("掉线时页面文案为「已掉线」", "Cookie 已掉线，请重新扫码" in pg_txt)
+check("掉线时不再显示「已使用」", "Cookie 已使用" not in pg_txt)
+
+# 在线时显示已使用，且按真实经过时间算
+pO = DynamicWeChat.__new__(DynamicWeChat)
+pO._is_special_upload = True
+pO._enabled = True
+pO._cookie_valid = True
+pO._cookie_acquired_at = int(time.time()) - 3661
+pO._cookie_lifetime = 0
+pO._cookie_checked_at = int(time.time()) - 60
+pO._qr_code_image = None
+pO._future_timestamp = 0
+pO._settings_file_path = sfT
+pO._file_lock = threading.Lock()
+ok_txt = json.dumps(pO.get_page(), ensure_ascii=False, default=str)
+check("在线时显示「已使用」", "Cookie 已使用" in ok_txt)
+check("已使用时长按真实经过时间计算（不是累加器）", "1小时1分钟" in ok_txt, ok_txt[:200])
+check("在线时展示最近验证时间", "最近验证" in ok_txt)
 
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
