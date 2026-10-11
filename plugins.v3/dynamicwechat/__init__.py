@@ -39,7 +39,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -270,6 +270,11 @@ class DynamicWeChat(_PluginBase):
         # _cookie_valid，可能把仍在运行的那份覆盖成更旧的磁盘副本；而且上一段
         # 若因「后台任务未退出」提前 return，这里根本不该生效。
         self._load_persisted_cookie()
+        # 恢复「Cookie 已使用」时长。
+        # 原实现只在续期成功后更新内存里的 _cookie_lifetime，从不在启动时从磁盘读回。
+        # 于是重启后 _cookie_valid 已是 True（面板显示绿色）而计时仍恒为 0，
+        # 表现为「绿色状态 + Cookie 已使用 0天0小时0分钟」，看着像保活没跑过。
+        self._cookie_lifetime = PyCookieCloud.load_cookie_lifetime(self._settings_file_path)
         self._loops_started = False
 
         # 配置检查
@@ -512,6 +517,7 @@ class DynamicWeChat(_PluginBase):
         self._start_bg_task(self._refresh_cookie_loop())
         if self._cron:
             self._start_bg_task(self._check_ip_loop())
+        logger.info(f"后台循环已启动：Cookie保活 cron={self._refresh_cron}，IP检测 cron={self._cron}")
 
     async def _refresh_cookie_loop(self):
         """
@@ -1928,7 +1934,14 @@ class DynamicWeChat(_PluginBase):
             cookie_lifetime_hours = (self._cookie_lifetime % 86400) // 3600
             cookie_lifetime_minutes = (self._cookie_lifetime % 3600) // 60
             bg_color = "#40bb45" if self._cookie_valid else "#ff0000"
-            cookie_lifetime_text = f"Cookie 已使用: {cookie_lifetime_days}天{cookie_lifetime_hours}小时{cookie_lifetime_minutes}分钟"
+            if self._cookie_lifetime > 0:
+                cookie_lifetime_text = (f"Cookie 已使用: {cookie_lifetime_days}天"
+                                        f"{cookie_lifetime_hours}小时{cookie_lifetime_minutes}分钟")
+            else:
+                # 从未成功续期过：明确说明是「还没跑过」而不是「时长为 0」，
+                # 否则绿色状态配一个 0 看起来像坏了，实际只是首轮保活还没完成。
+                bg_color = "#ff9800"
+                cookie_lifetime_text = "Cookie 保活尚未完成首轮校验，请查看日志确认保活任务是否运行"
             cookie_lifetime_component = {
                 "component": "div",
                 "text": cookie_lifetime_text,
