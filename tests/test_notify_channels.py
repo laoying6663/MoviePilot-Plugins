@@ -1,4 +1,4 @@
-﻿"""
+"""
 通知渠道勾选功能的离线自测（V3）。
 重点验证：向后兼容（老配置不被改写）与多渠道路由正确。
 """
@@ -384,6 +384,89 @@ check("无任何渠道时静默返回", MySender("").send_ip_updated("t", "c") i
 src_ip = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
 check("插件已改用 send_ip_updated", "send_ip_updated" in src_ip)
 check("不再硬编码 diy_channel=\"WeChat\"", 'diy_channel="WeChat"' not in src_ip)
+
+print("\n=== 11. CookieCloud 连通性检测（重定向 / 2xx / 日志）===")
+import sys as _sys
+_ccmod = _sys.modules["httpx2"]
+
+
+class _Resp:
+    def __init__(self, code=200, url="http://localhost:3000/cookiecloud/"):
+        self.status_code = code
+        self.url = url
+
+
+class _AC:
+    """记录 AsyncClient 的构造参数，用于断言 follow_redirects。
+
+    注意 get() 必须是 async def：若换成普通 lambda，await 会抛
+    'object _Resp can't be used in await expression'，再被 check_connection_async
+    的 except 吞掉返回 False —— 测试会「因为错误的原因通过」。
+    """
+
+    last_kwargs = None
+    status = 200
+
+    def __init__(self, **kw):
+        _AC.last_kwargs = kw
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url, **kw):
+        return _Resp(_AC.status, url + "/")
+
+
+_ccmod.AsyncClient = _AC
+
+pC = DynamicWeChat.__new__(DynamicWeChat)
+pC._use_cookiecloud = True
+pC._cc_server = None
+pC._server = "http://localhost:3000/cookiecloud"
+
+
+class _Settings:
+    NGINX_PORT = 3000
+    COOKIECLOUD_KEY = "k"
+    COOKIECLOUD_PASSWORD = "p"
+    COOKIECLOUD_ENABLE_LOCAL = True
+    COOKIECLOUD_HOST = "http://ext/cookiecloud"
+
+
+import app.sdk.config as _cfg
+_cfg.settings = _Settings()
+
+pC.try_connect_cc_async = DynamicWeChat.try_connect_cc_async.__get__(pC)
+_a.run(pC.try_connect_cc_async())
+check("AsyncClient 启用了 follow_redirects",
+      (_AC.last_kwargs or {}).get("follow_redirects") is True, str(_AC.last_kwargs))
+check("有超时设置", (_AC.last_kwargs or {}).get("timeout") is not None, str(_AC.last_kwargs))
+check("2xx 视为可用", pC._cc_server is not None)
+
+# 非 2xx 时置空
+_AC.status = 503
+pC._cc_server = None
+_a.run(pC.try_connect_cc_async())
+check("503 判定为不可用", pC._cc_server is None)
+
+# helper 侧的异步检查（先把 mock 复位成 200）
+_ccmod.AsyncClient = _AC
+_AC.status = 200
+cp = helper.PyCookieCloud("http://localhost:3000/cookiecloud", "u", "p")
+check("helper 检查连接启用 follow_redirects",
+      (_AC.last_kwargs or {}).get("follow_redirects") is True)
+check("helper 2xx 判定为可用", _a.run(cp.check_connection_async()) is True)
+_AC.status = 404
+check("helper 非 2xx 判定为不可用", _a.run(cp.check_connection_async()) is False)
+
+src_cc = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+src_hc = open(os.path.join(B, "plugins.v3", "dynamicwechat", "helper.py"), encoding="utf-8").read()
+check("CookieCloud 报错带真实状态码", "没有可用的CookieCloud服务器：HTTP" in src_cc)
+check("不再用 == 200 判连通", "resp.status_code != 200" not in src_cc)
+check("helper 同样用 2xx 区间", "resp.status_code == 200" not in src_hc)
 
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")

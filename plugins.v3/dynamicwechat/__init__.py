@@ -40,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.5"
+    plugin_version = "3.1.6"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -925,11 +925,20 @@ class DynamicWeChat(_PluginBase):
             )
             logger.info("使用自定义CookieCloud服务器")
         try:
-            async with httpx2.AsyncClient(timeout=3) as client:
+            # 必须 follow_redirects=True：httpx 默认不跟随重定向，而原来的 aiohttp
+            # GET 是默认跟随的。内建 CookieCloud 挂在 /cookiecloud，访问不带尾斜杠的
+            # 地址会收到 307 重定向，不跟随就会被判成「不可用」——这正是 3.x 迁移
+            # 到 httpx2 时丢掉的行为。
+            async with httpx2.AsyncClient(timeout=3, follow_redirects=True) as client:
                 resp = await client.get(self._cc_server.url)
-            if resp.status_code != 200:
+            if not 200 <= resp.status_code < 300:
+                # 先取 URL 再置空：置空后 self._cc_server 为 None，日志里再取属性会二次报错
+                target = getattr(self._cc_server, "url", "")
+                final_url = str(resp.url)
                 self._cc_server = None
-                logger.error("没有可用的CookieCloud服务器")
+                # 带上真实状态码与最终地址，否则连接失败时完全无从排查
+                logger.error(f"没有可用的CookieCloud服务器：HTTP {resp.status_code}，"
+                             f"{target} -> {final_url}")
         except Exception as e:
             self._cc_server = None
             logger.error(f"CookieCloud连接失败: {e}")

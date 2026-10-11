@@ -64,16 +64,18 @@ class PyCookieCloud:
         """同步检查连接（保留兼容）"""
         try:
             resp = requests.get(self.url, timeout=3)
-            return resp.status_code == 200
+            return 200 <= resp.status_code < 300
         except Exception:
             return False
 
     async def check_connection_async(self) -> bool:
         """异步检查连接"""
         try:
-            async with httpx2.AsyncClient(timeout=3) as client:
+            # 同 try_connect_cc_async：httpx 默认不跟随重定向，
+            # 而原来的 aiohttp GET 默认跟随。少了它会把 307 误判成不可用。
+            async with httpx2.AsyncClient(timeout=3, follow_redirects=True) as client:
                 resp = await client.get(self.url)
-            return resp.status_code == 200
+            return 200 <= resp.status_code < 300
         except Exception:
             return False
 
@@ -110,7 +112,7 @@ class PyCookieCloud:
             json={'uuid': self.uuid, 'encrypted': encrypted_data},
             timeout=10,  # 必须有超时：CookieCloud 侧卡住会挂死整个保活协程
         )
-        if cookie_cloud_request.status_code == 200:
+        if 200 <= cookie_cloud_request.status_code < 300:
             if cookie_cloud_request.json().get('action') == 'done':
                 return True
         return False
