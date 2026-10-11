@@ -36,6 +36,13 @@ dynamicwechat-backup/
 | `plugins.v2/dynamicwechat` | 2.1.9 | V2 实现，含同样的 Cookie 修复 |
 | `plugins/`（V1） | — | **不含**。原仓库的 1.7.3 未纳入，1.7.4 的改动已随 PR #1 关闭丢弃 |
 
+## 署名
+
+- `author` / `plugin_author`：**RamenRa, laoying6663**
+  上游插件作者是 RamenRa，本仓库为其 fork 并由 laoying6663 维护修复，署名保留双方。
+- `author_url`：仍指向 `https://github.com/RamenRa/MoviePilot-Plugins`
+  —— 插件面板里的「作者主页 / 全功能详细说明」链接以上游仓库文档为准。
+
 ## 重建仓库步骤
 
 ### 1. 建库

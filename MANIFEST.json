@@ -4,8 +4,8 @@
   "files": [
     {
       "path": "README.md",
-      "git_blob_sha1": "99d3b205bf452bc660779e407468429b8f31180a",
-      "bytes": 3448
+      "git_blob_sha1": "646235e7f6236fc45cb1b1c638454924bbf16cbd",
+      "bytes": 3808
     },
     {
       "path": "icons/Wecom_A.png",
@@ -14,18 +14,18 @@
     },
     {
       "path": "package.v2.json",
-      "git_blob_sha1": "4db8b46cde867c83d0bb08b783726b741a790ee6",
-      "bytes": 3153
+      "git_blob_sha1": "c85ff6a85a1ed442e2a23cc8d04a4a8fd74ebbd9",
+      "bytes": 3166
     },
     {
       "path": "package.v3.json",
-      "git_blob_sha1": "b7d2f261e1f6ddfe6c44cbaca0a0f83e037ad99d",
-      "bytes": 3392
+      "git_blob_sha1": "8ae6889cc17fc0b0d902813021a6a5402036d0db",
+      "bytes": 3405
     },
     {
       "path": "plugins.v2/dynamicwechat/__init__.py",
-      "git_blob_sha1": "c5db814d813b5a809918eccf30dcd7c08bdd1e96",
-      "bytes": 95339
+      "git_blob_sha1": "274a39fc5799d3ed2c99ea9e67d326477876ad37",
+      "bytes": 95352
     },
     {
       "path": "plugins.v2/dynamicwechat/helper.py",
@@ -39,8 +39,8 @@
     },
     {
       "path": "plugins.v3/dynamicwechat/__init__.py",
-      "git_blob_sha1": "a73a58e8d696bd56e15a410913f1f386bade9c38",
-      "bytes": 95791
+      "git_blob_sha1": "5486d6af4b1fab6d49bba55d6e84aaa938043369",
+      "bytes": 95804
     },
     {
       "path": "plugins.v3/dynamicwechat/helper.py",

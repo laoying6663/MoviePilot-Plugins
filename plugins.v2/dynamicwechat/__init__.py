@@ -33,7 +33,7 @@ class DynamicWeChat(_PluginBase):
     # 插件版本
     plugin_version = "2.1.9"
     # 插件作者
-    plugin_author = "RamenRa"
+    plugin_author = "RamenRa, laoying6663"
     # 作者主页
     author_url = "https://github.com/RamenRa/MoviePilot-Plugins"
     # 插件配置项ID前缀
