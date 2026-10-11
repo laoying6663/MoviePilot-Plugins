@@ -1,16 +1,16 @@
 {
   "repo": "laoying6663/MoviePilot-Plugins",
-  "note": "dynamicwechat 插件保全包；PR #2/#3 未合并，此为唯一副本",
+  "note": "dynamicwechat 插件保全包（仓库已重建）",
   "files": [
     {
       "path": "MANIFEST.json",
-      "bytes": 2004,
-      "sha256": "76f6aa9b4a5441fc7fa496af58d76f46aaca6b4936e8e46d52711605501a77b8"
+      "bytes": 2306,
+      "sha256": "a41451aca93a36636bc17ba2f364ce650a41d323ccfeb4a0f37a01baa9c9c6a7"
     },
     {
       "path": "README.md",
-      "bytes": 3269,
-      "sha256": "a76497589130802bcdda6fdd05afa817ea432741486d6b00ea5380176dc3875b"
+      "bytes": 3448,
+      "sha256": "9b30a86f251656d537cad8b28c4f76e27adaf7bb8346481f10cf07b73add109a"
     },
     {
       "path": "icons/Wecom_A.png",
@@ -18,19 +18,14 @@
       "sha256": "c4c6c450ff6a65bc00468f6637f9d6ea72f48359d874bbe2f5e9e1d523f343cf"
     },
     {
-      "path": "package.json",
-      "bytes": 43023,
-      "sha256": "70eca145c060170974339944cee7d949d84da8709d5cdcfebbe53b11e3ca33eb"
-    },
-    {
       "path": "package.v2.json",
-      "bytes": 93199,
-      "sha256": "d5723a69a7e2b9271ad26db7f7ed12f9030bbdb259efd759c4e8c14435760602"
+      "bytes": 3189,
+      "sha256": "866e9d21f32de7409c7dd490848fe73818b80292e3a12cab176e75159d28a613"
     },
     {
       "path": "package.v3.json",
-      "bytes": 76021,
-      "sha256": "6b7949a6f3137643764472fc5355f9f856f215296d8fd94f4734d9018215360e"
+      "bytes": 3489,
+      "sha256": "5db38446de5d1dce2ad90813b22ef454ec276ef86865b18f75051430388ec0b3"
     },
     {
       "path": "plugins.v2/dynamicwechat/__init__.py",

@@ -14,17 +14,19 @@ dynamicwechat-backup/
 ├── plugins.v3/dynamicwechat/          # V3 专用实现 3.0.0 ← 你要用的
 │   ├── __init__.py
 │   └── helper.py
-├── plugins.v2/dynamicwechat/          # V2 实现 2.1.9
+├── plugins.v2/dynamicwechat/          # V2 实现 2.1.9（V3 加载失败时的回退）
 │   ├── __init__.py
 │   ├── helper.py
 │   └── src/UpdateHelp.py
-├── package.v3.json                    # V3 索引（DynamicWeChat = 3.0.0, system_version >=3.0.0）
-├── package.v2.json                    # V2 索引（2.1.9, 标记 "v3": false）
-├── package.json                       # V1 索引（1.7.3, 标记 "v3": false）
-├── icons/Wecom_A.png                  # 插件图标
+├── package.v3.json                    # V3 索引（仅 DynamicWeChat = 3.0.0, system_version >=3.0.0）
+├── package.v2.json                    # V2 索引（仅 DynamicWeChat = 2.1.9, "v3": false）
+├── icons/Wecom_A.png                  # 插件图标（需手动上传，API 不支持二进制）
 ├── tests/                             # 离线自测（v3 65 项 / v2 43 项）
 └── MANIFEST.json                      # 每个文件的 SHA256
 ```
+
+> **没有 `package.json`**：该文件是 V1 默认索引，对应 `plugins/` 目录。本仓库不含
+> V1 实现，保留它只会让索引指向一堆不存在的插件目录。
 
 ## 版本状态
 
@@ -32,7 +34,7 @@ dynamicwechat-backup/
 |---|---|---|
 | `plugins.v3/dynamicwechat` | **3.0.0** | V3 专用实现，`app.sdk.*` + `httpx2` |
 | `plugins.v2/dynamicwechat` | 2.1.9 | V2 实现，含同样的 Cookie 修复 |
-| `plugins/`（V1） | — | **未包含**。原仓库里那份是 1.7.3，未合并的 1.7.4 改动已随 PR #1 关闭丢弃 |
+| `plugins/`（V1） | — | **不含**。原仓库的 1.7.3 未纳入，1.7.4 的改动已随 PR #1 关闭丢弃 |
 
 ## 重建仓库步骤
 
