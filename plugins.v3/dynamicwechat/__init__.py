@@ -39,7 +39,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.1"
+    plugin_version = "3.1.2"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -135,6 +135,8 @@ class DynamicWeChat(_PluginBase):
     _fail_threshold = 3
     # cookie存活时间
     _cookie_lifetime = 0
+    # 最近一次保活校验通过的时间戳（0 表示从未成功）
+    _cookie_checked_at = 0
     # 使用CookieCloud开关
     _use_cookiecloud = True
     # 登录cookie
@@ -270,11 +272,12 @@ class DynamicWeChat(_PluginBase):
         # _cookie_valid，可能把仍在运行的那份覆盖成更旧的磁盘副本；而且上一段
         # 若因「后台任务未退出」提前 return，这里根本不该生效。
         self._load_persisted_cookie()
-        # 恢复「Cookie 已使用」时长。
+        # 恢复「距上次验证登录」的时长。
         # 原实现只在续期成功后更新内存里的 _cookie_lifetime，从不在启动时从磁盘读回。
         # 于是重启后 _cookie_valid 已是 True（面板显示绿色）而计时仍恒为 0，
-        # 表现为「绿色状态 + Cookie 已使用 0天0小时0分钟」，看着像保活没跑过。
+        # 表现为「绿色状态 + 计时 0」，看着像保活没跑过。
         self._cookie_lifetime = PyCookieCloud.load_cookie_lifetime(self._settings_file_path)
+        self._load_cookie_checked_at()
         self._loops_started = False
 
         # 配置检查
@@ -1469,6 +1472,7 @@ class DynamicWeChat(_PluginBase):
                 if self._my_send:
                     self._my_send.reset_limit()
                 await self._extend_cookie_lifetime()
+                await self._mark_cookie_verified()
                 return
 
             # 复核未通过：先退避，不清空、不通知
@@ -1505,6 +1509,26 @@ class DynamicWeChat(_PluginBase):
         else:
             logger.warning("获取文件锁超时，跳过增加Cookie生命周期")
         self._cookie_lifetime = await PyCookieCloud.load_cookie_lifetime_async(self._settings_file_path)
+
+    async def _mark_cookie_verified(self):
+        """
+        记录「最近一次保活校验通过」的时刻，并持久化。
+
+        面板上那个计数只会单调增长（每轮 +600 秒），无法回答「Cookie 还剩多久有效」。
+        真正能证明保活还在跑的，是这个时间戳：它每轮刷新，用户能直接看出保活是否工作。
+        """
+        self._cookie_checked_at = int(datetime.now().timestamp())
+        await asyncio.to_thread(
+            PyCookieCloud.update_settings,
+            self._settings_file_path,
+            lambda d: d.__setitem__('_cookie_checked_at', self._cookie_checked_at),
+        )
+
+    def _load_cookie_checked_at(self):
+        """从磁盘恢复「最近验证时间」，避免重启后显示为空。"""
+        data = PyCookieCloud.read_settings(self._settings_file_path)
+        if isinstance(data, dict):
+            self._cookie_checked_at = int(data.get('_cookie_checked_at') or 0)
 
     async def check_login_status(self, page, task):
         """
@@ -1929,14 +1953,18 @@ class DynamicWeChat(_PluginBase):
                     }
                 }
             }
+        cookie_lifetime_component = None
+        checked_at_component = None
         if self._is_special_upload and self._enabled:
             cookie_lifetime_days = self._cookie_lifetime // 86400
             cookie_lifetime_hours = (self._cookie_lifetime % 86400) // 3600
             cookie_lifetime_minutes = (self._cookie_lifetime % 3600) // 60
             bg_color = "#40bb45" if self._cookie_valid else "#ff0000"
             if self._cookie_lifetime > 0:
-                cookie_lifetime_text = (f"Cookie 已使用: {cookie_lifetime_days}天"
-                                        f"{cookie_lifetime_hours}小时{cookie_lifetime_minutes}分钟")
+                elapsed = f"{cookie_lifetime_days}天{cookie_lifetime_hours}小时{cookie_lifetime_minutes}分钟"
+                # 说清这个数是什么：它是「距上次扫码/验证过去了多久」，会一直增长，
+                # 不是 Cookie 剩余有效期。写「已使用」容易被误解成倒计时。
+                cookie_lifetime_text = f"距上次验证登录: {elapsed}"
             else:
                 # 从未成功续期过：明确说明是「还没跑过」而不是「时长为 0」，
                 # 否则绿色状态配一个 0 看起来像坏了，实际只是首轮保活还没完成。
@@ -1954,6 +1982,26 @@ class DynamicWeChat(_PluginBase):
                         "borderRadius": "5px",
                         "textAlign": "center",
                         "marginTop": "10px",
+                        "display": "block"
+                    }
+                }
+            }
+            # 「最近验证时间」：这是保活是否还在跑的直接证据。
+            # 计数每轮才跳一次，中间隔很久不动；时间戳则能一眼看出保活有没有在工作。
+            if self._cookie_checked_at:
+                checked_text = ("最近验证: "
+                                + datetime.fromtimestamp(self._cookie_checked_at).strftime("%Y-%m-%d %H:%M:%S"))
+            else:
+                checked_text = "最近验证: 尚无成功记录"
+            checked_at_component = {
+                "component": "div",
+                "text": checked_text,
+                "props": {
+                    "style": {
+                        "fontSize": "13px",
+                        "color": "#bbbbbb",
+                        "textAlign": "center",
+                        "marginTop": "6px",
                         "display": "block"
                     }
                 }
@@ -1995,6 +2043,7 @@ class DynamicWeChat(_PluginBase):
                                 }
                             },
                             cookie_lifetime_component if cookie_lifetime_component else {},
+                            checked_at_component if checked_at_component else {},
                         ]
                     },
                     img_component

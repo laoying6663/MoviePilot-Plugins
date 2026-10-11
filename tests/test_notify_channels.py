@@ -234,6 +234,38 @@ check("get_form() 可正常执行并含 VSelect", "VSelect" in blob)
 check("get_form() 含 wechat_userid", "wechat_userid" in blob)
 check("get_form() 含 notify_channels", "notify_channels" in blob)
 
+print("\n=== 8. 最近验证时间戳与面板文案 ===")
+import asyncio as _a
+
+PyCookieCloud = helper.PyCookieCloud
+pT = DynamicWeChat.__new__(DynamicWeChat)
+pT._settings_file_path = sfT = os.path.join(tmpdir, "ts.json")
+pT._file_lock = threading.Lock()
+pT._cookie_checked_at = 0
+pT._cookie_lifetime = 0
+pT._cookie_valid = True
+pT._enabled = True
+pT._is_special_upload = True
+PyCookieCloud.write_settings(sfT, {})
+_a.run(pT._mark_cookie_verified())
+check("校验成功后写入时间戳", pT._cookie_checked_at > 0, str(pT._cookie_checked_at))
+check("时间戳落盘", (json.load(open(sfT, encoding="utf-8")) or {}).get("_cookie_checked_at", 0) > 0)
+
+pT2 = DynamicWeChat.__new__(DynamicWeChat)
+pT2._settings_file_path = sfT
+pT2._cookie_checked_at = 0
+pT2._load_cookie_checked_at()
+check("重启后能恢复最近验证时间", pT2._cookie_checked_at == pT._cookie_checked_at,
+      f"{pT2._cookie_checked_at} vs {pT._cookie_checked_at}")
+
+src3b = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+check("面板文案已改为「距上次验证登录」", "距上次验证登录" in src3b)
+check("不再使用易误解的「已使用」", "Cookie 已使用" not in src3b)
+check("面板含「最近验证」时间戳", "最近验证" in src3b)
+check("从未成功时给出明确提示", "尚未完成首轮校验" in src3b)
+check("时间戳组件已接入页面内容", "checked_at_component if checked_at_component" in src3b)
+check("续期成功后才打时间戳", "await self._mark_cookie_verified()" in src3b)
+
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:
