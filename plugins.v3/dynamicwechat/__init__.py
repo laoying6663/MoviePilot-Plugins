@@ -26,7 +26,7 @@ from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
-from app.schemas.types import EventType
+from app.schemas.types import EventType, NotificationChannel
 
 from .helper import PyCookieCloud, MySender, IpLocationParser, JsonFieldManager
 
@@ -39,7 +39,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -90,6 +90,10 @@ class DynamicWeChat(_PluginBase):
     _saved_cookie = None
     # 通知方式token/api
     _notification_token = ''
+    # 勾选的 MoviePilot 通知渠道（枚举名列表）
+    _notify_channels = []
+    # 企业微信指定接收人 userid（可选）
+    _wechat_userid = ''
     # 标记企业微信通知可用
     _wechat_available = True
     # 仅标记IP变动后 通知发送过了没有
@@ -211,6 +215,23 @@ class DynamicWeChat(_PluginBase):
             self._use_cookiecloud = config.get("use_cookiecloud")
             self._cookie_header = config.get("cookie_header")
             self._await_ip = config.get("await_ip")
+
+            # 通知方式：勾选的 MoviePilot 渠道 + 手填的第三方 Token
+            # 向后兼容的关键：
+            #   - 老配置里没有 notify_channels 这个键（config.get 返回 None）
+            #     → token 一个字都不改，只是解析出渠道用于表单回显
+            #   - 键存在（用户在��版表单里选过，哪怕选成空）→ 以勾选为准重组
+            picked = config.get("notify_channels")
+            raw_token = config.get("notification_token") or ""
+            if picked is None:
+                self._notification_token = raw_token
+                self._notify_channels = self._parse_mp_channels(raw_token)
+            else:
+                self._notify_channels = [str(c).strip() for c in (picked or []) if str(c).strip()]
+                self._notification_token = self._compose_notification_token(
+                    self._notify_channels, raw_token
+                )
+            self._wechat_userid = config.get("wechat_userid") or ""
 
         # 初始化通知发送器（兼容第三方）
         if self.version != "v1":
@@ -391,6 +412,58 @@ class DynamicWeChat(_PluginBase):
             logger.warning("Cookie 有效但未能落盘，重启后可能需要重新登录")
         elif source:
             logger.info(f"Cookie 复核通过({source})，已回写并落盘")
+
+    @staticmethod
+    def _compose_notification_token(channels, manual_token):
+        """
+        把「勾选的 MoviePilot 渠道」与「手填的第三方 Token」拼成 MySender 能解析的字符串。
+
+        格式与旧版完全一致：每个渠道 / Token 之间用 `||` 分隔，渠道可带 `,userid` 后缀。
+        - channels 为空 → 原样返回 manual_token（老配置不会被改写）
+        - channels 非空 → 以勾选渠道为准，manual_token 作为第三方渠道追加
+        """
+        manual = (manual_token or '').strip()
+        picked = [str(c).strip() for c in (channels or []) if str(c).strip()]
+        if not picked:
+            return manual
+        parts = []
+        for c in picked:
+            parts.append(c)
+        if manual:
+            parts.append(manual)
+        return "||".join(parts)
+
+    def _mp_channel_options(self):
+        """返回可勾选的 MoviePilot 通知渠道选项。取不到枚举时回落到常见渠道。"""
+        try:
+            return [{"title": f"{c.name}（{c.value}）", "value": c.name} for c in NotificationChannel]
+        except Exception:
+            return [{"title": f"{n}（企业微信）", "value": "Wechat"} for n in ("Wechat",)] + [
+                {"title": n, "value": n} for n in ("Telegram", "Slack", "DingTalk", "QQ")
+            ]
+
+    def _parse_mp_channels(self, token):
+        """从 token 字符串里解析出 MoviePilot 渠道（枚举名），用于表单回显。"""
+        # _mp_channel_options() 返回 {"title":..,"value":..} 字典，取 value 才是枚举名
+        names = {str(o.get("value", "")).lower() for o in self._mp_channel_options()}
+        found = []
+        for tk in (token or "").split("||"):
+            head = tk.split(",", 1)[0].strip()
+            if head and head.lower() in names:
+                found.append(self._map_channel_name(head))
+        return found
+
+    def _current_mp_channels(self):
+        """从当前生效的 token 里解析出已勾选的 MoviePilot 渠道。"""
+        return self._parse_mp_channels(self._notification_token or "")
+
+    @staticmethod
+    def _map_channel_name(name):
+        """把界面上的显示名映射回枚举名（大小写不敏感）。"""
+        for c in NotificationChannel:
+            if c.name.lower() == name.lower():
+                return c.name
+        return name
 
     def _handle_once_tasks(self):
         """
@@ -1619,6 +1692,8 @@ class DynamicWeChat(_PluginBase):
             "onlyonce": self._onlyonce,
             "cron": self._cron,
             "notification_token": self._notification_token,
+            "notify_channels": self._notify_channels,
+            "wechat_userid": self._wechat_userid,
             "await_ip": self._await_ip,
             "forced_update": self._forced_update,
             "local_scan": self._local_scan,
@@ -1712,9 +1787,37 @@ class DynamicWeChat(_PluginBase):
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 6},
                                 'content': [
+                                    {'component': 'VSelect',
+                                     'props': {
+                                         'model': 'notify_channels',
+                                         'label': '[可选] 通知渠道（可多选）',
+                                         'items': self._mp_channel_options(),
+                                         'multiple': True,
+                                         'chips': True,
+                                         'hint': '勾选你在 MoviePilot「设定 → 通知」里已配置好的渠道，'
+                                                 '插件通过宿主 post_message 直接投递，无需手填名称。'
+                                     }},
+                                    {'component': 'VTextField',
+                                     'props': {
+                                         'model': 'wechat_userid',
+                                         'label': '[可选] 企业微信接收人 userid',
+                                         'hint': '仅在需要推送给指定成员时填写，留空则发给该渠道全部已配置接收人。'
+                                     }}
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
                                     {'component': 'VTextarea',
-                                     'props': {'model': 'notification_token', 'label': '[可选] 通知方式', 'rows': 1,
-                                               'placeholder': '支持微信、Server酱、PushPlus、AnPush等Token或API'}}
+                                     'props': {'model': 'notification_token',
+                                               'label': '[可选] 第三方通知 Token',
+                                               'rows': 2,
+                                               'hint': '这里只填第三方服务的 Token/API：Server酱(SCT开头)、'
+                                                       'PushPlus、AnPush、IYUU。多个之间用 || 分隔，'
+                                                       '末尾加 ||Q 表示改IP后不通知。'
+                                                       'MoviePilot 自带渠道请在上面勾选。',
+                                               'placeholder': 'SCTxxxxx || pushplus_token'}}
                                 ]
                             }
                         ]
@@ -1771,6 +1874,8 @@ class DynamicWeChat(_PluginBase):
             "await_ip": False,
             "cookie_header": "",
             "notification_token": "",
+            "notify_channels": [],
+            "wechat_userid": "",
             "input_id_list": ""
         }
 

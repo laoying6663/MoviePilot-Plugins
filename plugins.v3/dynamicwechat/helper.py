@@ -273,20 +273,39 @@ class MySender:
     def other_channel(self):
         """
         返回非 WeChat 通道及其对应 token 的列表
+        MoviePilot 原生渠道属于主通知，不计入（与旧行为保持一致）
         :return: [(channel, token), ...]
         """
-        return [(channel, token) for channel, token in zip(self.channels, self.tokens) if channel.lower() != "wechat"]
+        return [(channel, token) for channel, token in zip(self.channels, self.tokens)
+                if not MySender.is_mp_channel(channel) and channel.lower() != "wechat"]
+
+    @staticmethod
+    def _mp_channel_names():
+        """MoviePilot 通知渠道的枚举名集合（小写），识别时使用。"""
+        try:
+            return {c.name.lower() for c in NotificationChannel}
+        except Exception:
+            return {"wechat", "telegram", "slack", "dingtalk", "qq", "webpush"}
+
+    @staticmethod
+    def is_mp_channel(channel):
+        return bool(channel) and str(channel).startswith("MoviePilot:")
 
     @staticmethod
     def _detect_channel(token):
-        """根据 token 判断通知渠道"""
-        token = token.lower()
+        """
+        根据 token 判断通知渠道。
 
-        if "wechat" in token:
-            return "WeChat"
-        if token.startswith("sct"):
+        优先识别 MoviePilot 原生渠道（枚举名，支持 `Wechat` / `Wechat,userid` 形式），
+        再回落到 Server酱 / IYUU / PushPlus 的 token 形态。
+        """
+        t = (token or '').lower()
+        name = t.split(',', 1)[0].strip()
+        if name in MySender._mp_channel_names():
+            return f"MoviePilot:{name}"
+        if t.startswith("sct"):
             return "ServerChan"
-        elif "iyuu" in token:
+        elif "iyuu" in t:
             return "IYUU"
         else:
             return "PushPlus"
@@ -318,6 +337,11 @@ class MySender:
 
     def _try_send(self, title, content, image, channel, token=None, diy_token=None):
         """尝试使用指定通道发送消息"""
+        # MoviePilot 原生渠道统一走宿主 post_message（对任意 NotificationChannel 通用）
+        if MySender.is_mp_channel(channel):
+            if self.post_message_func:
+                return self._send_mp_channel(title, content, image, token)
+            return f"缺少宿主通知能力，无法使用渠道 {channel}"
         if channel == "WeChat" and self.post_message_func:
             return self._send_v2_wechat(title, content, image, token)
         elif channel == "WeChat":
@@ -330,6 +354,34 @@ class MySender:
             return self._send_pushplus(title, content, image, diy_token)
         else:
             return f"未知的通知方式: {channel}"
+
+    def _send_mp_channel(self, title, content, image, token):
+        """
+        经宿主 post_message 发往指定的 MoviePilot 通知渠道。
+
+        token 形如 `Wechat` 或 `Wechat,userid`，逗号后为该渠道的用户标识（可选）。
+        """
+        raw = (token or '').strip()
+        name, _, userid = raw.partition(',')
+        name = name.strip()
+        try:
+            channel = NotificationChannel[name]
+        except KeyError:
+            return f"未知的 MoviePilot 通知渠道: {name}"
+        kwargs = dict(
+            channel=channel,
+            mtype=MessageType.Plugin,
+            title=title,
+            text=content,
+            link=image,
+        )
+        if image:
+            kwargs["image"] = image
+        userid = userid.strip()
+        if userid:
+            kwargs["userid"] = userid
+        self.post_message_func(**kwargs)
+        return None
 
     @staticmethod
     def _send_wechat(title, content, image, token):
