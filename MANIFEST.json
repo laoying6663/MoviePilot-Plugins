@@ -1,0 +1,71 @@
+{
+  "repo": "laoying6663/MoviePilot-Plugins",
+  "note": "dynamicwechat 插件保全包；PR #2/#3 未合并，此为唯一副本",
+  "files": [
+    {
+      "path": "MANIFEST.json",
+      "bytes": 2004,
+      "sha256": "76f6aa9b4a5441fc7fa496af58d76f46aaca6b4936e8e46d52711605501a77b8"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3269,
+      "sha256": "a76497589130802bcdda6fdd05afa817ea432741486d6b00ea5380176dc3875b"
+    },
+    {
+      "path": "icons/Wecom_A.png",
+      "bytes": 21986,
+      "sha256": "c4c6c450ff6a65bc00468f6637f9d6ea72f48359d874bbe2f5e9e1d523f343cf"
+    },
+    {
+      "path": "package.json",
+      "bytes": 43023,
+      "sha256": "70eca145c060170974339944cee7d949d84da8709d5cdcfebbe53b11e3ca33eb"
+    },
+    {
+      "path": "package.v2.json",
+      "bytes": 93199,
+      "sha256": "d5723a69a7e2b9271ad26db7f7ed12f9030bbdb259efd759c4e8c14435760602"
+    },
+    {
+      "path": "package.v3.json",
+      "bytes": 76021,
+      "sha256": "6b7949a6f3137643764472fc5355f9f856f215296d8fd94f4734d9018215360e"
+    },
+    {
+      "path": "plugins.v2/dynamicwechat/__init__.py",
+      "bytes": 97461,
+      "sha256": "c4ef1d4d260e1a3b6397d4a37a6f7f86e10746c79aa6f045a0ae3c85a0ce4ccc"
+    },
+    {
+      "path": "plugins.v2/dynamicwechat/helper.py",
+      "bytes": 28643,
+      "sha256": "701ccd3268eb9db7d68b10d59f89c46070c0843fcea74d22c3e7e1a386109c80"
+    },
+    {
+      "path": "plugins.v2/dynamicwechat/src/UpdateHelp.py",
+      "bytes": 2755,
+      "sha256": "8fa6ae03ca2a4e06d0a850b06c14cf222745873a09ed4b0b99afb887b358a3e0"
+    },
+    {
+      "path": "plugins.v3/dynamicwechat/__init__.py",
+      "bytes": 95791,
+      "sha256": "e5c1b249bd41838c1407bfaf67804a5a362b047febec262c461c31f97ee84f71"
+    },
+    {
+      "path": "plugins.v3/dynamicwechat/helper.py",
+      "bytes": 27899,
+      "sha256": "2d7d651b9a52ed0e2d3555dff064f7608a5f15a5ab08fa5009a5685e22286b42"
+    },
+    {
+      "path": "tests/test_dynamicwechat_v2.py",
+      "bytes": 15326,
+      "sha256": "150c56d58578d78b28ce861698c05aa282bdeb4a840944d3d2b488f4f91ef76d"
+    },
+    {
+      "path": "tests/test_dynamicwechat_v3.py",
+      "bytes": 21760,
+      "sha256": "c771d8a1473ad19c1eb8f2579cbb375a254d4e428e8b72602153e900638c2f8b"
+    }
+  ]
+}
