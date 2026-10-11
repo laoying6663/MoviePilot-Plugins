@@ -330,6 +330,61 @@ check("默认值含 refresh_cron", '"refresh_cron": ""' in src_rc)
 check("持久化含 refresh_cron", '"refresh_cron": self._refresh_cron' in src_rc)
 check("保活循环使用可配周期", "CronTrigger.from_crontab(self._refresh_cron" in src_rc)
 
+print("\n=== 10. 「更新可信IP成功」通知路由 ===")
+sent2 = []
+
+
+def _post2(**kw):
+    sent2.append(kw)
+
+
+# 配了微信 + userid：必须带上 userid，且走微信
+s_ip = MySender("Wechat,yingkansheng", func=_post2)
+err = s_ip.send_ip_updated("更新可信IP成功", "应用: 1000002 输入IP: 1.*.*.2")
+check("已配置微信时走微信渠道", err is None, str(err))
+check("微信渠道正确", sent2 and sent2[0]["channel"] is NotificationChannel.Wechat, str(sent2[:1]))
+check("配置的 userid 不再被丢弃", sent2 and sent2[0].get("userid") == "yingkansheng",
+      str(sent2[:1]))
+
+# 只勾了 Telegram、没勾微信：不能再硬发到未配置的 WeChat
+sent2.clear()
+s_tg = MySender("Telegram", func=_post2)
+s_tg.send_ip_updated("更新可信IP成功", "内容")
+check("未配微信时不硬发微信", all(c["channel"] is not NotificationChannel.Wechat for c in sent2),
+      str(sent2[:1]))
+check("未配微信时回落到已配置渠道", sent2 and sent2[0]["channel"] is NotificationChannel.Telegram,
+      str(sent2[:1]))
+
+# 旧写法 WeChat（大写 C）同样带 userid —— 3.1.0 曾因大小写查表失败而静默吞通知
+sent2.clear()
+s_w = MySender("WeChat,user2", func=_post2)
+e_w = s_w.send_ip_updated("更新可信IP成功", "内容")
+check("旧写法 WeChat 大小写不敏感可用", e_w is None, str(e_w))
+check("旧写法 WeChat 同样带 userid", sent2 and sent2[0].get("userid") == "user2", str(sent2[:1]))
+
+# 普通 send() 路径（不限 send_ip_updated）同样要能发出去
+sent2.clear()
+s_gen = MySender("WeChat,user3", func=_post2)
+e_gen = s_gen.send("标题", "内容", force_send=True)
+check("普通发送路径不再静默失败", e_gen is None, str(e_gen))
+check("普通发送路径正确投递微信", sent2 and sent2[0]["channel"] is NotificationChannel.Wechat, str(sent2[:1]))
+check("普通发送路径带上 userid", sent2 and sent2[0].get("userid") == "user3", str(sent2[:1]))
+
+# 大小写各种写法都应命中
+for spelling in ["WeChat", "wechat", "WECHAT", "Wechat"]:
+    sent2.clear()
+    mm = MySender(f"{spelling},u1", func=_post2)
+    mm.send("t", "c", force_send=True)
+    check(f"渠道写法「{spelling}」可正常投递",
+          sent2 and sent2[0]["channel"] is NotificationChannel.Wechat, str(sent2[:1]))
+
+# 未初始化时不报错
+check("无任何渠道时静默返回", MySender("").send_ip_updated("t", "c") is None)
+
+src_ip = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+check("插件已改用 send_ip_updated", "send_ip_updated" in src_ip)
+check("不再硬编码 diy_channel=\"WeChat\"", 'diy_channel="WeChat"' not in src_ip)
+
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:

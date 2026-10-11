@@ -335,6 +335,31 @@ class MySender:
             self.current_index = (self.current_index + 1) % len(self.tokens)
         return "所有的通知方式都发送失败"
 
+    def send_ip_updated(self, title, content, image=None):
+        """
+        发送「更新可信IP成功」通知。
+
+        原实现在插件里硬编码 `diy_channel="WeChat"`，有两个问题：
+          1) `send()` 走 diy 分支时不会把 token 往下传，`_send_v2_wechat`
+             收到 token=None，配置里指定的 userid 被直接丢弃；
+          2) 自 3.1.0 起渠道可在面板勾选，用户若勾的是 Telegram / 钉钉而没勾
+             微信，这条消息仍会硬发到 WeChat 渠道——而那个渠道根本没配置，
+             结果就是用户在所有已配置渠道上都收不到。
+
+        现在：优先走已配置的微信渠道（带上配置的 userid）；
+        没配微信则回落到按已配置渠道依次尝试。
+        """
+        if not self.init_success:
+            return None
+        for idx, ch in enumerate(self.channels):
+            tk = self.tokens[idx]
+            if MySender.is_mp_channel(ch) and ch.endswith("wechat"):
+                return self._send_mp_channel(title, content, image, tk)
+            if ch == "WeChat":
+                return self._send_v2_wechat(title, content, image, tk)
+        # 没配置微信渠道：按用户实际勾选的渠道依次尝试
+        return self.send(title, content, image, force_send=True)
+
     def _try_send(self, title, content, image, channel, token=None, diy_token=None):
         """尝试使用指定通道发送消息"""
         # MoviePilot 原生渠道统一走宿主 post_message（对任意 NotificationChannel 通用）
@@ -364,9 +389,19 @@ class MySender:
         raw = (token or '').strip()
         name, _, userid = raw.partition(',')
         name = name.strip()
+        # 大小写不敏感：文档与历史配置里写的是 `WeChat`（大写 C），
+        # 而枚举名是 `Wechat`。直接用 name 精确查表会 KeyError，
+        # 导致所有企微通知被静默吞掉——这是 3.1.0 引入的真实回归。
+        channel = None
         try:
             channel = NotificationChannel[name]
         except KeyError:
+            lowered = name.lower()
+            for member in NotificationChannel:
+                if member.name.lower() == lowered:
+                    channel = member
+                    break
+        if channel is None:
             return f"未知的 MoviePilot 通知渠道: {name}"
         kwargs = dict(
             channel=channel,

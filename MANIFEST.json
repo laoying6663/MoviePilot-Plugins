@@ -19,8 +19,8 @@
     },
     {
       "path": "package.v3.json",
-      "git_blob_sha1": "0063f3c5e53a8b321603cadd8ed672aa0a9b6c9d",
-      "bytes": 5245
+      "git_blob_sha1": "033208692ffd267c630e9cd37840a2000e4c8d68",
+      "bytes": 6058
     },
     {
       "path": "plugins.v2/dynamicwechat/__init__.py",
@@ -39,13 +39,13 @@
     },
     {
       "path": "plugins.v3/dynamicwechat/__init__.py",
-      "git_blob_sha1": "7566dee59710d44e3ea6af04687f6f51f6797ef6",
-      "bytes": 108089
+      "git_blob_sha1": "555a9f6e33cea6d32a5d931baaca8010a5d56c14",
+      "bytes": 108024
     },
     {
       "path": "plugins.v3/dynamicwechat/helper.py",
-      "git_blob_sha1": "44e02a2ceb8524eed536108c894f042243961bf4",
-      "bytes": 29997
+      "git_blob_sha1": "63c0c493197427e8c813f524abd27ae2d57a388d",
+      "bytes": 31840
     },
     {
       "path": "tests/test_dynamicwechat_v2.py",
@@ -59,8 +59,8 @@
     },
     {
       "path": "tests/test_notify_channels.py",
-      "git_blob_sha1": "c951a1bf7013f597c3b955ab544d2ec5370e4a0c",
-      "bytes": 15295
+      "git_blob_sha1": "8437c885ecfd5d60aafb23ad9ad7b55d2a3e0189",
+      "bytes": 17964
     }
   ]
 }

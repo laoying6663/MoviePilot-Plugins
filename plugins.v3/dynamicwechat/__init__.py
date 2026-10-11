@@ -40,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.4"
+    plugin_version = "3.1.5"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -1729,10 +1729,9 @@ class DynamicWeChat(_PluginBase):
                 logger.info(f"应用: {app_id} 输入IP：" + self._current_ip_address)
                 if self._my_send and not self._my_send.quiet_flag:
                     await asyncio.to_thread(
-                        self._my_send.send,
-                        title="更新可信IP成功",
-                        content='应用: ' + app_id + ' 输入IP：' + masked_ip_string,
-                        force_send=True, diy_channel="WeChat"
+                        self._my_send.send_ip_updated,
+                        "更新可信IP成功",
+                        '应用: ' + app_id + ' 输入IP：' + masked_ip_string,
                     )
 
     @staticmethod
