@@ -40,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.6"
+    plugin_version = "3.1.7"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -92,8 +92,10 @@ class DynamicWeChat(_PluginBase):
     _await_ip = False
     # 保存cookie
     _saved_cookie = None
-    # 通知方式token/api
+    # 通知方式token/api（组合后的运行时值，仅内存）
     _notification_token = ''
+    # 用户在表单里原始填写的第三方 Token（落库用，不能存组合结果）
+    _manual_token = ''
     # 勾选的 MoviePilot 通知渠道（枚举名列表）
     _notify_channels = []
     # 企业微信指定接收人 userid（可选）
@@ -237,11 +239,16 @@ class DynamicWeChat(_PluginBase):
             #   - 键存在（用户在��版表单里选过，哪怕选成空）→ 以勾选为准重组
             picked = config.get("notify_channels")
             raw_token = config.get("notification_token") or ""
+            # 原始输入单独留一份：__update_config 要落库的是它，而不是组合后的结果。
+            # 否则每保存一次 / 每重载一次插件，都会把已组合的 token 再叠加一遍
+            # （曾导致 notification_token 变成 "Wechat||Wechat||Wechat"）。
+            self._manual_token = raw_token
             if picked is None:
                 self._notification_token = raw_token
                 self._notify_channels = self._parse_mp_channels(raw_token)
             else:
                 self._notify_channels = [str(c).strip() for c in (picked or []) if str(c).strip()]
+                # 只在内存里组合用于发送；落库始终是 raw_token
                 self._notification_token = self._compose_notification_token(
                     self._notify_channels, raw_token
                 )
@@ -1759,7 +1766,7 @@ class DynamicWeChat(_PluginBase):
             "onlyonce": self._onlyonce,
             "cron": self._cron,
             "refresh_cron": self._refresh_cron,
-            "notification_token": self._notification_token,
+            "notification_token": self._manual_token,
             "notify_channels": self._notify_channels,
             "wechat_userid": self._wechat_userid,
             "await_ip": self._await_ip,

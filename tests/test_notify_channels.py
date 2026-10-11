@@ -468,6 +468,69 @@ check("CookieCloud 报错带真实状态码", "没有可用的CookieCloud服务�
 check("不再用 == 200 判连通", "resp.status_code != 200" not in src_cc)
 check("helper 同样用 2xx 区间", "resp.status_code == 200" not in src_hc)
 
+print("\n=== 12. 配置反复保存/重载不会自我叠加 ===")
+
+
+class Cfg2(DynamicWeChat):
+    """捕获 update_config 的落库内容"""
+
+    def __init__(self, config):
+        self.get_data_path = lambda: __import__("pathlib").Path(tmpdir)
+        self.get_state = lambda: False
+        self.get_form = lambda: ({}, {})
+        self.saved = {}
+        self.update_config = lambda d: self.saved.update(d)
+        self.post_message = lambda **k: None
+        self.systemmessage = type("SM", (), {"put": staticmethod(lambda *a: None)})()
+        self.stop_service = lambda: True
+        self._bg_tasks = None
+        self._bg_threads = None
+        self._file_lock = threading.Lock()
+        self._qr_lock = threading.Lock()
+        self._notify_lock = threading.Lock()
+        self._homepage_logged = False
+        self.version = "v2"
+        self.init_plugin(config)
+
+
+base_cfg = {"enabled": True, "input_id_list": "1000002", "cron": "*/10 * * * *"}
+
+# 第一次保存
+p1x = Cfg2(dict(base_cfg, notify_channels=["Wechat"], notification_token=""))
+# 第二次保存（模拟再次点保存 / 插件重载）
+p2x = Cfg2({**base_cfg, "notify_channels": p1x.saved.get("notify_channels", []),
+            "notification_token": p1x.saved.get("notification_token", "")})
+# 第三次
+p3x = Cfg2({**base_cfg, "notify_channels": p2x.saved.get("notify_channels", []),
+            "notification_token": p2x.saved.get("notification_token", "")})
+
+s1 = p1x.saved.get("notification_token")
+s2 = p2x.saved.get("notification_token")
+s3 = p3x.saved.get("notification_token")
+check("首次落库不含组合结果", s1 == "", repr(s1))
+check("第二次保存不叠加", s2 == "", repr(s2))
+check("第三次保存不叠加", s3 == "", repr(s3))
+check("三次保存结果一致（不再自我增长）", s1 == s2 == s3, f"{s1!r} / {s2!r} / {s3!r}")
+check("运行时仍能正确组合出可发送的 token",
+      p1x._notification_token == "Wechat", p1x._notification_token)
+check("勾选的渠道被保留", p1x.saved.get("notify_channels") == ["Wechat"],
+      str(p1x.saved.get("notify_channels")))
+
+# 带第三方 Token 时同样不叠加
+q1 = Cfg2(dict(base_cfg, notify_channels=["Wechat"], notification_token="SCT123"))
+q2 = Cfg2({**base_cfg, "notify_channels": q1.saved.get("notify_channels", []),
+           "notification_token": q1.saved.get("notification_token", "")})
+check("有第三方 Token 时落库保持原样", q1.saved.get("notification_token") == "SCT123",
+      repr(q1.saved.get("notification_token")))
+check("有第三方 Token 时二次保存不叠加",
+      q2.saved.get("notification_token") == "SCT123", repr(q2.saved.get("notification_token")))
+check("运行时组合结果正确", q1._notification_token == "Wechat||SCT123", q1._notification_token)
+
+src_mt = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+check("落库不再使用组合后的 token",
+      '"notification_token": self._manual_token' in src_mt and
+      '"notification_token": self._notification_token' not in src_mt)
+
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:
