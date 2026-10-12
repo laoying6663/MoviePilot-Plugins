@@ -40,7 +40,7 @@ class DynamicWeChat(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.7"
+    plugin_version = "3.1.8"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -1186,7 +1186,11 @@ class DynamicWeChat(_PluginBase):
                     self._my_send.send,
                     title="cookie已失效,请及时更新",
                     content="请在企业微信应用发送/push_qr, 验证码以'？'结束发送到企业微信应用。 如果使用'微信通知'请确保公网IP还没有变动",
-                    image=None, force_send=False
+                    # 必须 force_send=True：MySender 对纯文本有一次性闩锁 first_text_sent，
+                    # 闩锁被占用时 send() 会直接 return（返回 None 被上层当成「发送成功」），
+                    # 于是 _cookie_invalid_notified 保持 True，
+                    # 这条最关键的失效通知就永远不会再重试了。
+                    image=None, force_send=True
                 )
                 if error:
                     logger.info(f"cookie失效通知发送失败,原因：{error}")
@@ -1201,7 +1205,7 @@ class DynamicWeChat(_PluginBase):
                         self._my_send.send,
                         title="cookie已失效,且微信通知失效",
                         content="请在企业微信应用发送/push_qr, 验证码以'？'结束发送到企业微信应用。",
-                        image=None, force_send=False, diy_channel=channel, diy_token=token
+                        image=None, force_send=True, diy_channel=channel, diy_token=token
                     )
                     if error:
                         logger.error(f"通道 {channel} 发送失败，原因：{error}")

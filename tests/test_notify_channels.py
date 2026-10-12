@@ -531,6 +531,41 @@ check("落库不再使用组合后的 token",
       '"notification_token": self._manual_token' in src_mt and
       '"notification_token": self._notification_token' not in src_mt)
 
+print("\n=== 13. Cookie 失效通知必达（不受一次性闩锁影响）===")
+sent3 = []
+
+
+def _post3(**kw):
+    sent3.append(kw)
+
+
+# 先占掉一次性闩锁，模拟「之前已发过一条纯文本」
+s_lock = MySender("Wechat,user9", func=_post3)
+s_lock.first_text_sent = True
+err_lock = s_lock.send("某条纯文本", force_send=False)
+check("闩锁占用时普通纯文本被丢弃（这是原有行为）", err_lock is None and sent3 == [], str(sent3))
+
+# 失效通知必须用 force_send=True，闩锁占用也能发
+sent3.clear()
+err_force = s_lock.send("cookie已失效,请及时更新", force_send=True)
+check("force_send=True 时闩锁占用也能发出", sent3 and sent3[0]["title"].startswith("cookie已失效"),
+      str(sent3[:1]))
+check("返回值明确表示成功", err_force is None, str(err_force))
+
+src_f = open(os.path.join(B, "plugins.v3", "dynamicwechat", "__init__.py"), encoding="utf-8").read()
+check("失效通知使用 force_send=True",
+      'title="cookie已失效,请及时更新"' in src_f and
+      src_f.count("image=None, force_send=True") >= 2)
+check("失效通知不再使用 force_send=False",
+      'title="cookie已失效,且微信通知失效"' in src_f and
+      "image=None, force_send=False, diy_channel=channel" not in src_f)
+
+# 触发失效通知的三个入口都存在
+for entry in ["await self._send_cookie_false()"]:
+    check(f"保活失效入口 {entry}", entry in src_f)
+check("ChangeIP 见二维码时通知", "已尝试发送cookie失效通知" in src_f)
+check("check() 失效时通知", "await self._send_cookie_false()" in src_f)
+
 print("\n" + "=" * 62)
 print(f"  通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
 if FAIL:
