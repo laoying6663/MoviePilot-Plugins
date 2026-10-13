@@ -7,6 +7,7 @@
 """
 
 import random
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,7 +29,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -68,7 +69,7 @@ class ParkingBot(_PluginBase):
         """
         config = config or {}
         self._enabled = bool(config.get("enabled"))
-        self._cron = str(config.get("cron") or "").strip() or self._default_cron
+        self._cron = self._normalize_cron(config.get("cron")) or self._default_cron
         self._park_minutes = self._to_int(config.get("park_minutes"),
                                           self._default_park_minutes, minimum=10)
         self._max_cars = self._to_int(config.get("max_cars"),
@@ -102,7 +103,10 @@ class ParkingBot(_PluginBase):
         try:
             trigger = CronTrigger.from_crontab(self._cron)
         except Exception as err:
-            logger.error(f"[不可躺自动抢车位] 执行周期表达式非法：{self._cron}，错误：{err}")
+            logger.error(
+                f"[不可躺自动抢车位] 执行周期表达式非法：{self._cron}，错误：{err}；"
+                "应为 5 段标准 cron，例如 */5 * * * *（留空则用默认每 5 分钟）"
+            )
             return []
         return [
             {
@@ -363,6 +367,20 @@ class ParkingBot(_PluginBase):
             return int(car.get("flashEarnPerMin") or 5)
         definition = cars_map.get(car.get("carId"))
         return int(definition.get("earnPerMin") or 0) if definition else 0
+
+    @staticmethod
+    def _normalize_cron(value: Any) -> str:
+        """
+        规整 cron 表达式。
+
+        配置表单保存时可能把步进写法拆开（*/5 → * /5），多出一个字段会让
+        CronTrigger 报 "Wrong number of fields"。这里压掉分隔符两侧的空白，
+        顺带收敛连续空格，让 5 段表达式能稳定解析。
+        """
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            return ""
+        return re.sub(r"\s*([/,-])\s*", r"\1", text).strip()
 
     @staticmethod
     def _to_int(value: Any, default: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
