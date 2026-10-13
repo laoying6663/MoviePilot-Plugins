@@ -94,6 +94,12 @@ class CarMoveRequest(BaseModel):
     car_id: Any = Field(description="要挪走的车辆：车库序号或车辆实例 ID")
 
 
+class RefreshRequest(BaseModel):
+    """「立即刷新」按钮的请求体。目前没有参数，留一个空模型占位。"""
+
+    reason: str = Field(default="manual", description="刷新来源，仅用于日志")
+
+
 class FlashBuyRequest(BaseModel):
     """特卖卡片「抢购」按钮的请求体。"""
 
@@ -230,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.26.0"
+    plugin_version = "1.27.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -2834,6 +2840,15 @@ class ParkingBot(_PluginBase):
                 "description": "按车辆 ID 执行一次挪车结算，停车不足游戏规定时长会被拒绝",
             },
             {
+                "path": "/refresh_status",
+                "endpoint": self.api_refresh_status,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即刷新状态",
+                "response_model": ApiResult,
+                "description": "重新拉一次游戏状态并刷新页面快照，不挪车也不停车",
+            },
+            {
                 "path": "/buy_car",
                 "endpoint": self.api_buy_car,
                 "methods": ["POST"],
@@ -3460,6 +3475,83 @@ class ParkingBot(_PluginBase):
             btn["events"] = {"click": {"api": api, "method": "post",
                                        "params": {"car_id": number}}}
         return btn
+
+    async def api_refresh_status(self, request: RefreshRequest) -> ApiResult:
+        """
+        立即刷新一次游戏状态，不挪车也不停车。
+
+        页面的 JSON 渲染器（MoviePilot-Frontend 的 PageRender）没有任何定时能力，
+        `events` 只在用户点击时触发，所以页面自己不会跳。给一个「立即刷新」按钮
+        是这里能做到的最接近自动刷新的办法：点完宿主会重拉 get_page，车库里的
+        停车时长、收益、待结算都会换成刚拉到的数。
+
+        顺带把快照的更新时间刷新掉，页面上的「几分钟前更新」随之归零。
+        """
+        if not self.get_state():
+            return _result({"success": False, "error": "插件未启用"})
+
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
+
+        # record_history=False：这是一次纯展示刷新，执行历史里不该多出一行
+        # 「0 停车 / 0 挪车 / 0 收益」的噪声记录。
+        user_id = state.get("userId")
+        await self._record_round(client, state, user_id, 0, 0, 0,
+                                 record_history=False)
+        owned = sum(1 for c in (state.get("userCars") or [])
+                    if isinstance(c, dict)
+                    and str(c.get("userId")) == str(user_id))
+        parked = sum(1 for c in (state.get("userCars") or [])
+                     if isinstance(c, dict)
+                     and str(c.get("userId")) == str(user_id)
+                     and str(c.get("status")) != "idle")
+        note = f"已刷新状态：名下 {owned} 辆，停车中 {parked} 辆"
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "owned": owned, "parked": parked})
+
+    def _age_text(self, snapshot: dict) -> str:
+        """
+        把快照里的采集时间说成「几分钟前」，让用户判断数据新不新。
+
+        页面渲染器不会自己跳（PageRender 没有任何定时能力），所以数据新不新
+        全靠这一行字告诉用户 —— 没有它，用户只能凭猜。
+        """
+        raw = str(snapshot.get("time") or "").strip()
+        if not raw:
+            return "数据时间未知"
+        try:
+            taken = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return "数据时间未知"
+        minutes = int((self._now_naive() - taken).total_seconds() // 60)
+        if minutes < 0:
+            return f"数据时间 {raw}"
+        if minutes < 1:
+            return "刚刚更新"
+        if minutes < 60:
+            return f"{minutes} 分钟前更新"
+        return f"{minutes // 60} 小时 {minutes % 60} 分钟前更新"
+
+    def _garage_toolbar(self, snapshot: dict, api: str) -> dict:
+        """
+        车库区块顶部的工具条：左边一个「立即刷新」，右边标出数据有多旧。
+
+        刷新只重新拉状态，不挪车也不停车 —— 想挪车点卡片上的绿按钮，那是另一回事。
+        """
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "flex", "alignItems": "center", "justifyContent": "space-between",
+                "gap": "8px", "flexWrap": "wrap", "marginBottom": "10px",
+            }},
+            "content": [
+                self._action_btn("立即刷新状态", api, {}, kind="trade"),
+                self._text(self._age_text(snapshot),
+                           {"fontSize": "11px", "opacity": "0.55"}),
+            ],
+        }
 
     @staticmethod
     def _unpark_btn(number: Any, can: bool, reason: str, api: str) -> dict:
@@ -4300,6 +4392,7 @@ class ParkingBot(_PluginBase):
         ticket_api = f"plugin/{pid}/ticket"
         park_api = f"plugin/{pid}/park"
         unpark_api = f"plugin/{pid}/unpark"
+        refresh_api = f"plugin/{pid}/refresh_status"
         howto_card = self._card(
             "怎么操作",
             "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
@@ -4328,7 +4421,8 @@ class ParkingBot(_PluginBase):
                 f"当前已停 {self._to_int(snapshot.get('parked_total'), 0)}"
                 f"/{self._to_int(snapshot.get('car_max'), 1)}"
                 f"（手动停车不受这个上限限制）",
-                [self._garage(self._dict_rows(snapshot.get("cars")), min_duration,
+                [self._garage_toolbar(snapshot, refresh_api),
+                 self._garage(self._dict_rows(snapshot.get("cars")), min_duration,
                               self._to_int(snapshot.get("free_spots"), 0),
                               self._to_int(snapshot.get("parked_total"), 0),
                               self._to_int(snapshot.get("car_max"), 1),
