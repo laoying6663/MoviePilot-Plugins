@@ -1,5 +1,5 @@
 {
-  "DynamicWeChat": {
+  "DynamicWeChatSelfUse": {
     "name": "动态企微可信IP（自用版）",
     "description": "修改企微应用可信IP，支持Srever酱等第三方通知。验证码以？结尾发送到企业微信应用",
     "labels": "消息通知",

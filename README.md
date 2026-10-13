@@ -21,8 +21,8 @@
 
 | 目录 | 版本 | 用途 |
 |---|---|---|
-| `plugins.v3/dynamicwechat` | **3.1.4** | **MoviePilot V3 使用这个** |
-| `plugins.v2/dynamicwechat` | 2.1.9 | 兼容 MoviePilot V2 |
+| `plugins.v3/dynamicwechatselfuse` | **3.2.0** | **MoviePilot V3 使用这个** |
+| `plugins.v2/dynamicwechatselfuse` | 2.1.9 | 兼容 MoviePilot V2 |
 
 MoviePilot V3 会优先加载 `package.v3.json` 里的条目,没有 V3 专用实现时才回退到 V2。
 
@@ -47,13 +47,13 @@ MoviePilot V3 会优先加载 `package.v3.json` 里的条目,没有 V3 专用实
 市场刷新不了时用这个,绕过索引直接覆盖代码:
 
 ```bash
-# 把仓库里的 plugins.v3/dynamicwechat 目录拷进容器
-docker cp ./dynamicwechat <容器名>:/app/app/plugins/DynamicWeChat
+# 把仓库里的 plugins.v3/dynamicwechatselfuse 目录拷进容器
+docker cp ./dynamicwechatselfuse <容器名>:/app/app/plugins/DynamicWeChatSelfUse
 ```
 
 然后在 MoviePilot 里**重载插件**或重启容器。
 
-> 数据目录 `/config/plugins/DynamicWeChat/` 与代码目录是分开的,更新插件不会动你的 Cookie 和配置。
+> 数据目录 `/config/plugins/DynamicWeChatSelfUse/` 与代码目录是分开的,更新插件不会动你的 Cookie 和配置。
 
 ---
 
@@ -159,7 +159,7 @@ SCTxxx||Q
 
 **Q: Cookie 老是掉怎么办?**
 
-3.1.0 起 Cookie 会持久化到 `/config/plugins/DynamicWeChat/settings.json`,重启和更新都不会丢。如果你仍然遇到掉线,检查两点:
+3.1.0 起 Cookie 会持久化到 `/config/plugins/DynamicWeChatSelfUse/settings.json`,重启和更新都不会丢。如果你仍然遇到掉线,检查两点:
 1. 容器里的 `/config` 是不是真的挂载了持久卷(不是容器重建就丢的那种)
 2. 日志里有没有 `没有可用的CookieCloud服务器` —— 有的话是 CookieCloud 走不通
 
@@ -205,7 +205,7 @@ SCTxxx||Q
 
 完整历史见 `package.v3.json`。
 
-- **3.1.4** 当前版本
+- **3.2.0** 当前版本
 - **3.1.3** 面板计时实时化 + 掉线提示
 - **3.1.2** 面板语义修正 + 最近验证时间戳
 - **3.1.1** 修复「已使用」重启后恒为 0

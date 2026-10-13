@@ -1,14 +1,15 @@
 {
-  "DynamicWeChat": {
+  "DynamicWeChatSelfUse": {
     "name": "动态企微可信IP（自用版）",
     "description": "修改企微应用可信IP，支持Srever酱等第三方通知。验证码以？结尾发送到企业微信应用",
     "labels": "消息通知",
-    "version": "3.1.9",
+    "version": "3.2.0",
     "icon": "Wecom_A.png",
     "author": "RamenRa, laoying6663",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.2.0": "插件 ID 改为 DynamicWeChatSelfUse，与官方同名插件共存（原 ID 相同会在市场中互相覆盖）。注意：数据目录随之变更，旧 Cookie 与配置需重新扫码一次。",
       "v3.1.9": "插件更名「动态企微可信IP（自用版）」以区分官方同名插件；版本历史精简为一行。",
       "v3.1.8": "修复 Cookie 失效通知被一次性闩锁吞掉、永不重试的问题。",
       "v3.1.7": "修复配置反复保存/重载时通知渠道自我叠加。",
