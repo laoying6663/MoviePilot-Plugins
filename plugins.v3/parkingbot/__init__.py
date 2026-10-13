@@ -92,10 +92,10 @@ def _result(payload: Dict[str, Any]) -> ApiResult:
 # 收益绿、爱心位粉、警示琥珀。插件页跟着游戏走，看起来才像同一个东西。
 _CYAN = "#22D3EE"
 _PURPLE = "#A78BFA"
-_GOLD = _GOLD
-_GREEN = _GREEN
+_GOLD = "#FFD700"
+_GREEN = "#00E676"
 _PINK = "#FF4D6D"
-_AMBER = _AMBER
+_AMBER = "#FFB300"
 _MUTED = "rgba(255,255,255,0.62)"
 # 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图
 _HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
@@ -2559,17 +2559,15 @@ class ParkingBot(_PluginBase):
             ])
 
         garage_card = self._card(
-            "③ 我的车库",
-            f"数据来自游戏车库；停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
+            "我的车库",
+            f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
             [self._garage(snapshot.get("cars") or [], min_duration)],
         )
 
         spots_card = self._card(
-            "① 我的车位",
+            "我的车位",
             "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
-            [self._table(["车位", "当前占用"],
-                         [[i.get("label", ""), i.get("occupant", "")] for i in (snapshot.get("spots") or [])],
-                         ["1", "3"], ["left", "left"])],
+            [self._spot_grid(snapshot.get("spots") or [])],
         )
 
         history_card = self._card(
