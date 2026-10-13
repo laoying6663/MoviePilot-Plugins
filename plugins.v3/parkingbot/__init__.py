@@ -30,7 +30,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -205,6 +205,7 @@ class ParkingBot(_PluginBase):
             max(0, self._max_cars - (len(parked) - moved)),
         )
         self._summarize(new_parked, moved, earned_total)
+        await self._record_round(client, state, user_id, new_parked, moved, earned_total)
 
     async def _unpark_due_cars(
         self,
@@ -505,6 +506,104 @@ class ParkingBot(_PluginBase):
         self._set_result(text)
         logger.info(f"[不可躺自动抢车位] {text}")
 
+    async def _record_round(
+        self,
+        client: AsyncRequestUtils,
+        state: dict,
+        user_id: Any,
+        new_parked: int,
+        moved: int,
+        earned: int,
+    ) -> None:
+        """
+        记录本轮结果：账户快照 + 执行历史，供插件详情页展示。
+
+        快照保存的是已经算好的展示字段，不再依赖游戏接口 —— 页面渲染走同步读，
+        不会每次打开详情页都去打一次游戏。
+        """
+        try:
+            cars_map = await self._load_cars_map(client)
+            rules = state.get("gameSettings") or {}
+            max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
+            mine = (state.get("users") or {}).get(user_id) or {}
+            my_cars = [c for c in (state.get("userCars") or []) if c.get("userId") == user_id]
+            my_spots = [s for s in (state.get("parkingSpots") or []) if s.get("ownerId") == user_id]
+            now = datetime.now()
+
+            cars = []
+            for car in my_cars:
+                parked_at = self._parse_time(car.get("parkedTime"))
+                mins = max(0, (self._now_naive() - parked_at).total_seconds() / 60) if parked_at else 0
+                rate = self._earn_per_min(car, cars_map)
+                status = car.get("status")
+                cars.append({
+                    "name": self._car_name(car, cars_map),
+                    "rate": rate,
+                    "status": "空闲" if status == "idle" else ("爱心停车" if status == "charity" else "停车中"),
+                    "mins": round(mins),
+                    # 收益按「已停时长 × 每分钟收益」估算，单车位封顶
+                    "gain": min(int(mins * rate), max_earn) if status != "idle" else 0,
+                })
+            # 停车中的排前面，同状态按收益从高到低，方便一眼看出哪辆最值钱
+            cars.sort(key=lambda item: (item["status"] == "空闲", -item["rate"]))
+
+            spots = []
+            for index, spot in enumerate(my_spots, start=1):
+                kind = "爱心车位" if spot.get("spotType") == "charity" else "私家车位"
+                spots.append({"label": f"{kind} {index}", "occupant": self._spot_occupant(spot, state, cars_map)})
+
+            await self.async_save_data("snapshot", {
+                "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "name": mine.get("name") or "未命名",
+                "level": self._to_int(mine.get("level"), 1, minimum=1),
+                "cash": self._to_int(mine.get("cash"), 0),
+                "bonus": self._to_int(mine.get("bonus"), 0),
+                "car_total": len(my_cars),
+                "car_max": self._to_int(rules.get("MAX_CARS"), 10, minimum=1),
+                "parked_total": sum(1 for c in cars if c["status"] != "空闲"),
+                "pending_gain": sum(item["gain"] for item in cars),
+                "cars": cars,
+                "spots": spots,
+            })
+
+            history = await self.async_get_data("history") or []
+            if not isinstance(history, list):
+                history = []
+            history.insert(0, {
+                "time": now.strftime("%m-%d %H:%M"),
+                "parked": new_parked,
+                "moved": moved,
+                "earned": earned,
+            })
+            await self.async_save_data("history", history[:50])
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 记录本轮结果失败：{err}")
+
+    @staticmethod
+    def _car_name(car: dict, cars_map: Dict[int, dict]) -> str:
+        """取车辆显示名，限时车型直接取实例上的名称。"""
+        if car.get("carId") == 0:
+            return str(car.get("flashCarName") or "限时车型")
+        definition = cars_map.get(car.get("carId"))
+        return str(definition.get("name") or "未知车型") if definition else "未知车型"
+
+    @staticmethod
+    def _spot_occupant(spot: dict, state: dict, cars_map: Dict[int, dict]) -> str:
+        """返回车位占用者描述，空闲车位给出可否停车提示。"""
+        car_id = spot.get("carInSpot")
+        if not car_id:
+            return "空闲"
+        owner_id = spot.get("parkedBy")
+        cars = state.get("userCars") or []
+        car = next((c for c in cars if c.get("id") == car_id), None)
+        if not car:
+            return "已被占用"
+        owner = (state.get("users") or {}).get(owner_id) or {}
+        who = owner.get("name") or "他人"
+        if owner_id == spot.get("ownerId"):
+            return "我的车辆"
+        return f"{who} 的 {ParkingBot._car_name(car, cars_map)}"
+
     def _set_result(self, text: str) -> None:
         """记录最近一轮结果，供详情页展示。"""
         self._last_run = text
@@ -656,35 +755,204 @@ class ParkingBot(_PluginBase):
             "cookie": "",
         }
 
-    def get_page(self) -> List[dict]:
-        """返回插件详情页：展示最近一轮结果与累计挪车收益。"""
-        if self._last_run_ts:
-            moment = datetime.fromtimestamp(self._last_run_ts).strftime("%Y-%m-%d %H:%M:%S")
-            last_run = f"{self._last_run}（{moment}）"
+    @staticmethod
+    def _stat(label: str, value: Any, color: str) -> dict:
+        """单个数字指标块。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal"},
+            "style": {"marginBottom": "8px"},
+            "content": [
+                {"component": "VCardText", "content": [
+                    {"component": "div", "props": {"text": str(label)},
+                     "style": {"fontSize": "12px", "opacity": "0.75"}},
+                    {"component": "div", "props": {"text": str(value)},
+                     "style": {"fontSize": "22px", "fontWeight": "bold", "color": color}},
+                ]},
+            ],
+        }
+
+    @staticmethod
+    def _card(title: str, subtitle: str, content: List[dict]) -> dict:
+        """统一的信息卡片外壳。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined"},
+            "style": {"marginBottom": "12px"},
+            "content": [
+                {"component": "VCardTitle", "props": {"text": title},
+                 "style": {"fontSize": "16px", "paddingBottom": "0"}},
+                {"component": "VCardSubtitle", "props": {"text": subtitle},
+                 "style": {"fontSize": "12px", "opacity": "0.7"}},
+                {"component": "VCardText", "content": content},
+            ],
+        }
+
+    @staticmethod
+    def _table(headers: List[str], rows: List[List[Any]], aligns: List[str]) -> dict:
+        """组装一张数据表；无数据时给一行居中占位。"""
+        position = {"left": "start", "center": "center", "right": "end"}
+        head = [{
+            "component": "VTh",
+            "props": {"text": str(title)},
+            "style": {"textAlign": position.get(align, "start"), "fontSize": "12px", "opacity": "0.8"},
+        } for title, align in zip(headers, aligns)]
+        if rows:
+            body = [{
+                "component": "VTr",
+                "content": [{
+                    "component": "VTd",
+                    "props": {"text": str(cell)},
+                    "style": {"textAlign": position.get(align, "start"), "fontSize": "13px"},
+                } for cell, align in zip(row, aligns)],
+            } for row in rows]
         else:
-            last_run = self._last_run
+            body = [{
+                "component": "VTr",
+                "content": [{
+                    "component": "VTd",
+                    "props": {"text": "暂无数据", "colspan": str(len(headers))},
+                    "style": {"textAlign": "center", "fontSize": "13px", "opacity": "0.6"},
+                }],
+            }]
+        return {
+            "component": "VTable",
+            "content": [
+                {"component": "VThead", "content": [{"component": "VTr", "content": head}]},
+                {"component": "VTbody", "content": body},
+            ],
+        }
+
+    def get_page(self) -> List[dict]:
+        """返回插件详情页：账户概览、车辆状态、车位占用与执行历史。"""
+        snapshot = self.get_data("snapshot") or {}
+        history = self.get_data("history") or []
+        if not isinstance(history, list):
+            history = []
+
+        # ---------- 概览指标 ----------
+        if snapshot:
+            stats = [
+                self._stat("金币", snapshot.get("cash", 0), "#FFD700"),
+                self._stat("魔力", snapshot.get("bonus", 0), "#B388FF"),
+                self._stat("停车中", f"{snapshot.get('parked_total', 0)}/{snapshot.get('car_total', 0)}", "#4FC3F7"),
+                self._stat("待结算金币", snapshot.get("pending_gain", 0), "#00E676"),
+            ]
+            header = f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
+            subtitle = (f"车辆上限 {snapshot.get('car_max', 10)} 辆"
+                        f" · 数据时间 {snapshot.get('time', '-')}")
+        else:
+            # 布局固定渲染四块指标，未取到数据时也要给足占位，否则下面的
+            # stats[1..3] 会越界。全新安装、首次执行前正是这个状态。
+            stats = [
+                self._stat("状态", "待运行", "#9E9E9E"),
+                self._stat("金币", "-", "#9E9E9E"),
+                self._stat("停车中", "-", "#9E9E9E"),
+                self._stat("待结算金币", "-", "#9E9E9E"),
+            ]
+            header = self.plugin_name
+            subtitle = "勾选「立即执行一次」后这里会显示停车场实况"
+
+        last_run = self._last_run
+        if self._last_run_ts:
+            last_run = f"{last_run}（{datetime.fromtimestamp(self._last_run_ts):%Y-%m-%d %H:%M:%S}）"
+
+        # ---------- 车辆状态：停车中的排前面 ----------
+        car_rows = []
+        for item in (snapshot.get("cars") or []):
+            idle = item.get("status") == "空闲"
+            car_rows.append([
+                item.get("name", ""),
+                str(item.get("rate", 0)),
+                item.get("status", ""),
+                "-" if idle else str(item.get("mins", 0)),
+                "-" if idle else str(item.get("gain", 0)),
+            ])
+
+        # ---------- 车位占用 ----------
+        spot_rows = [[item.get("label", ""), item.get("occupant", "")]
+                     for item in (snapshot.get("spots") or [])]
+
+        # ---------- 执行历史 ----------
+        history_rows = [[item.get("time", ""), str(item.get("parked", 0)),
+                         str(item.get("moved", 0)), str(item.get("earned", 0))]
+                        for item in history[:20]]
+
         return [
             {
-                "component": "VRow",
+                "component": "VCard",
+                "props": {"variant": "tonal", "color": "primary"},
+                "style": {"marginBottom": "12px"},
                 "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 7},
-                        "content": [
-                            {"component": "VAlert",
-                             "props": {"type": "info", "variant": "tonal",
-                                       "text": f"最近一轮：{last_run}"}}
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 5},
-                        "content": [
-                            {"component": "VAlert",
-                             "props": {"type": "success", "variant": "tonal",
-                                       "text": f"累计挪车收益：{self._total_earned} 金币"}}
-                        ],
-                    },
+                    {"component": "VCardTitle", "props": {"text": header},
+                     "style": {"fontSize": "18px"}},
+                    {"component": "VCardSubtitle", "props": {"text": subtitle},
+                     "style": {"fontSize": "12px", "opacity": "0.8"}},
+                    {"component": "VCardText", "content": [
+                        {"component": "div", "props": {"text": f"最近一轮：{last_run}"},
+                         "style": {"fontSize": "13px", "opacity": "0.85", "marginBottom": "4px"}},
+                        {"component": "div",
+                         "props": {"text": f"本次进程累计挪车收益：{self._total_earned} 金币"},
+                         "style": {"fontSize": "13px", "opacity": "0.85"}},
+                    ]},
                 ],
-            }
+            },
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[0]]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[1]]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[2]]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[3]]},
+            ]},
+            self._card(
+                "车辆状态",
+                "停车中的车辆排在前面；待结算是挪车时可拿到的预估金币，单车位封顶",
+                [self._table(["车型", "金/分钟", "状态", "已停(分钟)", "待结算"],
+                             car_rows, ["left", "right", "center", "right", "right"])],
+            ),
+            self._card(
+                "我的车位",
+                "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
+                [self._table(["车位", "当前占用"], spot_rows, ["left", "left"])],
+            ),
+            self._card(
+                "执行历史",
+                "最近 20 轮定时或手动执行的记录（最多保留 50 轮）",
+                [self._table(["时间", "新停放", "挪走", "收益(金币)"],
+                             history_rows, ["left", "center", "center", "right"])],
+            ),
         ]
+
+    def get_dashboard_meta(self) -> List[Dict[str, str]]:
+        """在主面板登记一块状态卡。"""
+        return [{"key": "status", "name": "不可躺抢车位"}]
+
+    def get_dashboard(self, key: str, **kwargs: Any):
+        """返回主面板状态卡：账户概览 + 本进程累计收益。"""
+        if key != "status":
+            return None
+        snapshot = self.get_data("snapshot") or {}
+        if snapshot:
+            subtitle = (f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
+                        f" · 金币 {snapshot.get('cash', 0)}"
+                        f" · 停车中 {snapshot.get('parked_total', 0)}/{snapshot.get('car_total', 0)}"
+                        f" · 待结算 {snapshot.get('pending_gain', 0)}")
+        else:
+            subtitle = "尚未执行，勾选「立即执行一次」后显示实况"
+        elements = [{
+            "component": "VCardText",
+            "content": [
+                {"component": "div", "props": {"text": f"最近一轮：{self._last_run}"},
+                 "style": {"fontSize": "13px", "opacity": "0.85"}},
+                {"component": "div",
+                 "props": {"text": f"本进程累计挪车收益：{self._total_earned} 金币"},
+                 "style": {"fontSize": "13px", "opacity": "0.85"}},
+            ],
+        }]
+        cols = {"cols": 12, "md": 6, "lg": 4}
+        global_config = {
+            "refresh": 0,  # 不自动轮询，避免每次刷新都读库
+            "border": True,
+            "title": self.plugin_name,
+            "subtitle": subtitle,
+        }
+        return cols, global_config, elements
