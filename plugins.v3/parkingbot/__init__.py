@@ -2872,39 +2872,172 @@ class ParkingBot(_PluginBase):
         }
 
     @staticmethod
-    def _item(title: str, lines: List[Tuple[str, str]], button: Optional[dict],
-              accent: str = _CYAN, image: str = "") -> dict:
-        """车市里的一条：照游戏车市页——大图居中，下面是名字与参数。"""
+    def _fmt_num(value: Any) -> str:
+        """
+        抄游戏 formatNum 的口径：一万以上折成 K，一千万以上折成 M，以下走千分位。
+
+        车市价格必须用这个 —— 网页版上 3000 金显示成「3,000」，插件里再显示成
+        「3000」就等于没复刻。
+        """
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number >= 10000000:
+            return f"{number / 1000000:.1f}M"
+        if number >= 10000:
+            return f"{number / 1000:.1f}K"
+        return f"{number:,}"
+
+    @staticmethod
+    def _action_btn(label: str, api: str, params: Dict[str, Any],
+                    kind: str = "buy", disabled: bool = False) -> dict:
+        """
+        车市卡片底部的小按钮，样式照抄游戏 .car-btn：
+
+        购买是白底深字（#fff / #1a1a2e），以旧换新是透明底 + 青框青字
+        （#0df 配 rgba(0,210,255,0.4) 描边）。disabled 时整颗压暗并且不挂事件，
+        页面上灰掉的按钮是点不动的，不靠后端兜底。
+        """
+        style: Dict[str, Any] = {
+            "display": "inline-flex",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "padding": "6px 14px",
+            "borderRadius": "6px",
+            "fontSize": "12px",
+            "fontWeight": "bold",
+            "whiteSpace": "nowrap",
+            "userSelect": "none",
+        }
+        if disabled:
+            style.update({"cursor": "not-allowed", "opacity": "0.45",
+                          "color": "#9E9E9E",
+                          "backgroundColor": "rgba(255,255,255,0.07)",
+                          "border": "1px solid rgba(255,255,255,0.10)"})
+        elif kind == "buy":
+            style.update({"cursor": "pointer", "color": "#1A1A2E",
+                          "backgroundColor": "#FFFFFF",
+                          "border": "1px solid #FFFFFF"})
+        else:
+            style.update({"cursor": "pointer", "color": _SHOP_OWNED,
+                          "backgroundColor": "transparent",
+                          "border": "1px solid rgba(0,210,255,0.4)"})
+        node = {"component": "div", "props": {"style": style},
+                "content": [ParkingBot._text(label, {})]}
+        if not disabled:
+            node["events"] = {"click": {"api": api, "method": "post", "params": params}}
+        return node
+
+    @staticmethod
+    def _shop_categories(catalog: List[dict]) -> List[str]:
+        """
+        车型表里出现过的分类，去重且保持原顺序。
+
+        不写死「代步车 / 普通私家车 / …」那六個名字：分类是游戏侧下发的，
+        照抄一份常量只会和真实车型表对不上。车型表按价格升序，价格从低到高
+        正好是代步车 → 普通 → 精致 → 高级，胶囊顺序自然也就对了。
+        """
+        names: List[str] = []
+        for car in catalog:
+            if not isinstance(car, dict):
+                continue
+            name = str(car.get("category") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _cat_pills(categories: List[str], current: str, api: str) -> dict:
+        """
+        车市顶部分类胶囊，照抄游戏 .category-tab。
+
+        未选中是灰底灰字，选中态是玫红→紫的渐变（.category-tab.active）。
+        整排横向滚动 —— 游戏里也是这样，手机上不会挤成两行。
+        """
+        pills = []
+        for name in categories:
+            active = name == current
+            pills.append({
+                "component": "div",
+                "props": {"style": {
+                    "flex": "0 0 auto",
+                    "padding": "6px 14px",
+                    "borderRadius": "15px",
+                    "fontSize": "13px",
+                    "whiteSpace": "nowrap",
+                    "cursor": "pointer",
+                    "userSelect": "none",
+                    "color": "#FFFFFF" if active else "#CCCCCC",
+                    "backgroundColor": (
+                        "linear-gradient(135deg, rgba(233,69,96,0.85), rgba(83,52,131,0.85))"
+                        if active else "rgba(255,255,255,0.10)"),
+                    "border": (f"1px solid {_SHOP_LOCK}" if active
+                               else "1px solid rgba(255,255,255,0.15)"),
+                }},
+                "content": [ParkingBot._text(name, {})],
+                "events": {"click": {"api": api, "method": "post",
+                                     "params": {"category": name}}},
+            })
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "overflowX": "auto", "gap": "8px",
+                                "marginBottom": "12px", "paddingBottom": "4px"}},
+            "content": pills,
+        }
+
+    @staticmethod
+    def _grid(items: List[dict]) -> dict:
+        """车市卡片排布。游戏是两列栅格，这里用可换行的 flex 近似。"""
+        return {"component": "div",
+                "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                    "marginRight": "-5px"}},
+                "content": items}
+
+    @staticmethod
+    def _item(title: str, lines: List[Tuple[str, str]],
+              actions: Optional[List[dict]] = None,
+              accent: str = _CYAN, image: str = "", locked: bool = False) -> dict:
+        """
+        车市里的一辆车：照抄游戏 .car-card。
+
+        结构和网页版一致 —— 车图居中最大、名字、🪙 价格、每分钟收益、
+        ✓ 已拥有 N 辆，最后一行是并排的按钮。等级不足的整张卡压到半透明，
+        按钮换成「需要 Lv.N」，和游戏的 .car-card.locked 一个做法。
+        """
         content = []
         if image:
             content.append({
                 "component": "div",
                 "props": {"style": {"display": "flex", "justifyContent": "center",
                                     "marginBottom": "6px"}},
-                "content": [ParkingBot._pic(image, str(title or "🚗")[:1], 84)],
+                "content": [ParkingBot._pic(image, str(title or "🚗")[:1], 96)],
             })
-        content.append(ParkingBot._text(title, {"fontSize": "17px", "fontWeight": "bold",
-                                                "textAlign": "center", "marginBottom": "2px"}))
+        content.append(ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
+                                                "textAlign": "center", "marginBottom": "4px"}))
         for text, color in lines:
             content.append(ParkingBot._text(
                 text, {"fontSize": "13px", "color": color, "marginTop": "3px",
                        "textAlign": "center"}))
-        if button:
-            button = dict(button)
-            button["props"] = dict(button.get("props") or {})
-            button["props"]["style"] = {"marginTop": "10px"}
-            content.append(button)
+        if actions:
+            content.append({
+                "component": "div",
+                "props": {"style": {"display": "flex", "gap": "8px", "marginTop": "10px",
+                                    "justifyContent": "center", "flexWrap": "wrap"}},
+                "content": list(actions),
+            })
         return {
             "component": "div",
             "props": {"style": {
-                "flex": "1 1 250px",
-                "minWidth": "230px",
-                "margin": "0 8px 8px 0",
+                "flex": "1 1 190px",
+                "minWidth": "178px",
+                "margin": "0 5px 10px 0",
                 "padding": "14px",
-                "borderRadius": "14px",
-                "border": "1px solid rgba(255,255,255,0.10)",
-                "borderLeft": f"3px solid {accent}",
-                "backgroundColor": "rgba(255,255,255,0.045)",
+                "borderRadius": "12px",
+                "textAlign": "center",
+                "border": f"1px solid {ParkingBot._alpha(accent, 0.34)}",
+                "backgroundColor": "rgba(255,255,255,0.04)",
+                "opacity": "0.5" if locked else "1",
             }},
             "content": content,
         }
