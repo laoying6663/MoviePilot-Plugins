@@ -345,37 +345,50 @@ class ParkingBot(_PluginBase):
         if charity:
             logger.debug(f"[不可躺自动抢车位] {len(charity)} 辆车停在爱心车位，不参与自动挪车")
 
-        # 自动买卖排在挪车/停车之前：新买的车、刚换上的车能在同一轮就停出去。
-        # 买卖会改变服务端状态，所以之后重新取一次状态，避免用到过期快照。
+        # 买卖时机是有讲究的，不能都塞在挪车之前：
+        #   买车 —— 排在停车之前，买到的车当轮就能停出去赚钱
+        #   换新 —— 必须排在挪车之后。以旧换新要求旧车处于空闲，而刚挪完的车
+        #           正好变空闲；排在挪车之前的话，上一轮停着的车都还「停车中」，
+        #           能当旧车的只剩恰好被剩在空闲池里的少数几辆，几乎换不动。
         shop_note = ""
         stale_after_shop = False
-        if self._auto_buy or self._auto_trade:
+        cars_map = await self._load_cars_map(client)
+
+        def _recompute(state: dict) -> None:
+            """按最新状态重算本轮要动的三类车辆与挪车时长门槛。"""
+            nonlocal parked, idle, charity, min_duration, target_minutes
+            settings_map = state.get("gameSettings") or {}
+            min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"),
+                                        10, minimum=1)
+            target_minutes = max(self._park_minutes, min_duration)
+            mine = [c for c in (state.get("userCars") or [])
+                    if c.get("userId") == user_id]
+            parked = [c for c in mine if c.get("status") not in ("idle", "charity")]
+            idle = [c for c in mine if c.get("status") == "idle"]
+            charity = [c for c in mine if c.get("status") == "charity"]
+
+        async def _refresh_state() -> bool:
+            """重新拉一次游戏状态。买卖改动了服务端，拿旧快照继续操作会用到废车 ID。"""
+            nonlocal state
+            fresh = await client.get_json(f"{self.API_BASE}/state.php")
+            if fresh and fresh.get("success"):
+                state = fresh
+                _recompute(state)
+                return True
+            return False
+
+        if self._auto_buy:
             try:
-                shop_note = await self._auto_shop(
-                    client, state, await self._load_cars_map(client), user_id)
-                if shop_note:
-                    fresh = await client.get_json(f"{self.API_BASE}/state.php")
-                    if fresh and fresh.get("success"):
-                        state = fresh
-                        settings_map = state.get("gameSettings") or {}
-                        min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"),
-                                                    10, minimum=1)
-                        target_minutes = max(self._park_minutes, min_duration)
-                        my_cars = [c for c in (state.get("userCars") or [])
-                                   if c.get("userId") == user_id]
-                        parked = [c for c in my_cars if c.get("status") not in ("idle", "charity")]
-                        idle = [c for c in my_cars if c.get("status") == "idle"]
-                        charity = [c for c in my_cars if c.get("status") == "charity"]
-                    else:
-                        # 买卖已经改动了服务端状态，但状态没刷新回来。此时 parked/idle
-                        # 里还是旧的车实例 ID（以旧换新吃掉的那辆已经不存在了），
-                        # 继续挪车/停车就是拿废 ID 发请求。本轮到此为止，下一轮重来。
+                note = await self._auto_buy_one(client, state, cars_map, user_id)
+                if note:
+                    shop_note = note
+                    if not await _refresh_state():
                         stale_after_shop = True
                         logger.warning(
-                            "[不可躺自动抢车位] 自动买卖后刷新状态失败，本轮跳过挪车与停车，"
+                            "[不可躺自动抢车位] 自动买车后刷新状态失败，本轮跳过挪车与停车，"
                             "避免用过期的车辆 ID 继续操作")
             except Exception as err:
-                logger.error(f"[不可躺自动抢车位] 自动买卖异常：{err}")
+                logger.error(f"[不可躺自动抢车位] 自动买车异常：{err}")
 
         if stale_after_shop:
             self._set_result(shop_note or "状态刷新失败，本轮未挪车")
@@ -383,6 +396,35 @@ class ParkingBot(_PluginBase):
             return
 
         earned_total, moved = await self._unpark_due_cars(client, parked, idle, target_minutes)
+
+        # 挪车之后：以旧换新只在这一步做。刚挪完的车刚从「停车中」变成「空闲」，
+        # 这才是游戏允许拿它当旧车的时刻。挪车前那批车还停着，换不动。
+        if self._auto_trade:
+            try:
+                # 先刷新：上面挪过的车，本地这份 state 里还标着「停车中」
+                if moved and not await _refresh_state():
+                    stale_after_shop = True
+                    logger.warning(
+                        "[不可躺自动抢车位] 挪车后刷新状态失败，本轮跳过换新与停车，"
+                        "避免用过期的车辆 ID 继续操作")
+                if not stale_after_shop:
+                    note = await self._auto_trade_one(client, state, cars_map, user_id)
+                    if note:
+                        shop_note = f"{shop_note}；{note}" if shop_note else note
+                        if not await _refresh_state():
+                            stale_after_shop = True
+                            logger.warning(
+                                "[不可躺自动抢车位] 自动换新后刷新状态失败，本轮跳过停车，"
+                                "避免用过期的车辆 ID 继续操作")
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 自动换新异常：{err}")
+
+        if stale_after_shop:
+            self._set_result(shop_note or "状态刷新失败，本轮未停车")
+            await self._record_round(client, state, user_id, 0, moved, earned_total,
+                                     note=shop_note)
+            return
+
         new_parked = await self._park_idle_cars(
             client, idle, state.get("parkingSpots") or [], user_id,
             max(0, self._max_cars - (len(parked) - moved)),
@@ -402,16 +444,96 @@ class ParkingBot(_PluginBase):
             new_parked, moved, earned_total, note=shop_note,
         )
 
-    async def _auto_shop(self, client: Any, state: dict, cars_map: Dict[Any, dict],
-                         user_id: Any) -> str:
+    async def _auto_trade_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
+                             user_id: Any) -> str:
         """
-        自动买车 / 自动以旧换新。
+        自动以旧换新。只在「挪车之后」调用。
 
-        两个开关默认关闭，这里只在用户主动打开后才动真金白银。
-        每轮最多换一辆、买一辆：一次把金币抽干既不必要，也会让后续几轮
-        因为没钱而停摆。返回一句执行摘要，供详情页展示。
+        游戏要求旧车必须处于空闲状态，而刚挪完的车正好从停车中变空闲 ——
+        这是唯一说得通的触发时机，所以这个方法由 run_once 放在挪车之后调用。
+
+        每轮最多换一辆：一次换多辆既不必要，也会让后续几轮因为没钱而停摆。
+        返回一句执行摘要，供详情页展示。
         """
-        notes: List[str] = []
+        if not self._auto_trade:
+            return ""
+        rules = state.get("gameSettings") or {}
+        mine = (state.get("users") or {}).get(user_id) or {}
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        my_cars = [c for c in (state.get("userCars") or [])
+                   if str(c.get("userId")) == str(user_id)]
+
+        idle_cars = sorted((c for c in my_cars if c.get("status") == "idle"),
+                           key=lambda c: self._earn_per_min(c, cars_map))
+        if not idle_cars:
+            logger.debug("[不可躺自动抢车位] 本轮没有空闲车，跳过自动以旧换新")
+            return ""
+
+        for car in idle_cars:
+            # 限时/限量车（carId 为 0）不可再生，换掉就再也买不回来了，
+            # 不拿它当自动换新的「旧车」，需要的话用 /换车 手动处理。
+            if car.get("carId") == 0:
+                logger.debug("[不可躺自动抢车位] 限时车型不参与自动以旧换新")
+                continue
+            old_rate = self._earn_per_min(car, cars_map)
+            old_def = self._lookup_car(cars_map, car.get("carId"))
+            if not old_def:
+                # 车型表里查不到的车同样不碰：算不出旧价，差价无从谈起，
+                # 贸然换掉有可能白扔一辆好车。
+                logger.debug(
+                    "[不可躺自动抢车位] 车型 %s 不在车型表中，跳过自动以旧换新",
+                    car.get("carId"))
+                continue
+            old_price = self._to_int(old_def.get("price"), 0, minimum=0)
+            best = None
+            for definition in cars_map.values():
+                if not isinstance(definition, dict):
+                    continue
+                price = self._to_int(definition.get("price"), 0, minimum=0)
+                diff = price - old_price
+                # 以旧换新只扣「差价」，不是新车的全价：旧车已经折价抵掉了大半。
+                # 所以这里按差价卡金币门槛，全价高的车型也能换得起。
+                if diff <= 0:
+                    continue
+                if self._to_int(definition.get("levelReq"), 1, minimum=1) > level:
+                    continue
+                if diff > cash:
+                    continue
+                gain = self._to_int(definition.get("earnPerMin"), 0) - old_rate
+                if gain <= 0:
+                    continue
+                if best is None or gain > best[0]:
+                    best = (gain, definition, diff)
+            if best is None:
+                continue
+            gain, target, diff = best
+            result = await self._post(client, "trade_in.php", {
+                "oldCarInstanceId": car.get("id"),
+                "newCarId": target.get("id"),
+            })
+            if not (result and result.get("success")):
+                logger.warning(
+                    f"[不可躺自动抢车位] 自动以旧换新失败：{(result or {}).get('error') or '未知原因'}")
+                return ""
+            # 记账给「数据统计」页用：换车补的差价是真金白银的支出
+            self._shop_diff += diff
+            self._shop_traded += 1
+            note = (f"自动以旧换新：{self._car_name(car, cars_map)} → {target.get('name')}，"
+                    f"补 {diff} 金，每分钟收益 +{gain}")
+            logger.info(f"[不可躺自动抢车位] {note}")
+            return note
+        return ""
+
+    async def _auto_buy_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
+                            user_id: Any) -> str:
+        """
+        自动买车。排在停车之前调用，买到的车当轮就能停出去赚钱。
+
+        每轮最多买一辆。返回一句执行摘要，供详情页展示。
+        """
+        if not self._auto_buy:
+            return ""
         rules = state.get("gameSettings") or {}
         mine = (state.get("users") or {}).get(user_id) or {}
         level = self._to_int(mine.get("level"), 1, minimum=1)
@@ -419,98 +541,38 @@ class ParkingBot(_PluginBase):
         max_cars = self._to_int(rules.get("MAX_CARS"), 10, minimum=1)
         my_cars = [c for c in (state.get("userCars") or [])
                    if str(c.get("userId")) == str(user_id)]
+        if len(my_cars) >= max_cars:
+            return ""
+        if not my_cars:
+            logger.info("[不可躺自动抢车位] 名下没有车辆，自动买车将补上第一辆")
 
-        def affordable(price: int, need: int) -> bool:
-            return need <= level and price <= cash
-
-        # ---- 自动以旧换新：优先把每分钟收益最低的空闲车往上换 ----
-        if self._auto_trade:
-            idle_cars = sorted((c for c in my_cars if c.get("status") == "idle"),
-                               key=lambda c: self._earn_per_min(c, cars_map))
-            for car in idle_cars:
-                # 限时/限量车（carId 为 0）不可再生，换掉就再也买不回来了，
-                # 不拿它当自动换新的「旧车」，需要的话用 /换车 手动处理。
-                if car.get("carId") == 0:
-                    logger.debug("[不可躺自动抢车位] 限时车型不参与自动以旧换新")
-                    continue
-                old_rate = self._earn_per_min(car, cars_map)
-                old_def = self._lookup_car(cars_map, car.get("carId"))
-                if not old_def:
-                    # 车型表里查不到的车同样不碰：算不出旧价，差价无从谈起，
-                    # 贸然换掉有可能白扔一辆好车。
-                    logger.debug(
-                        "[不可躺自动抢车位] 车型 %s 不在车型表中，跳过自动以旧换新",
-                        car.get("carId"))
-                    continue
-                old_price = self._to_int(old_def.get("price"), 0, minimum=0)
-                best = None
-                for definition in cars_map.values():
-                    if not isinstance(definition, dict):
-                        continue
-                    price = self._to_int(definition.get("price"), 0, minimum=0)
-                    diff = price - old_price
-                    # 以旧换新只扣「差价」，不是新车的全价：旧车已经折价抵掉了大半。
-                    # 所以这里按差价卡金币门槛，全价高的车型也能换得起。
-                    if diff <= 0:
-                        continue
-                    if self._to_int(definition.get("levelReq"), 1, minimum=1) > level:
-                        continue
-                    if diff > cash:
-                        continue
-                    gain = self._to_int(definition.get("earnPerMin"), 0) - old_rate
-                    if gain <= 0:
-                        continue
-                    if best is None or gain > best[0]:
-                        best = (gain, definition, diff)
-                if best is None:
-                    continue
-                gain, target, diff = best
-                result = await self._post(client, "trade_in.php", {
-                    "oldCarInstanceId": car.get("id"),
-                    "newCarId": target.get("id"),
-                })
-                if not (result and result.get("success")):
-                    logger.warning(f"[不可躺自动抢车位] 自动以旧换新失败：{(result or {}).get('error') or '未知原因'}")
-                    break
-                cash -= diff
-                # 记账给「数据统计」页用：换车补的差价是真金白银的支出
-                self._shop_diff += diff
-                self._shop_traded += 1
-                notes.append(
-                    f"自动以旧换新：{self._car_name(car, cars_map)} → {target.get('name')}，"
-                    f"补 {diff} 金，每分钟收益 +{gain}"
-                )
-                logger.info(f"[不可躺自动抢车位] {notes[-1]}")
-                break  # 每轮最多换一辆
-
-        # ---- 自动买车：买当前等级下、金币买得起、每分钟收益最高的那辆 ----
-        if self._auto_buy and len(my_cars) < max_cars:
-            best = None
-            for definition in cars_map.values():
-                if not isinstance(definition, dict):
-                    continue
-                price = self._to_int(definition.get("price"), 0, minimum=0)
-                if not affordable(price, self._to_int(definition.get("levelReq"), 1, minimum=1)):
-                    continue
-                earn = self._to_int(definition.get("earnPerMin"), 0)
-                if earn <= 0:
-                    continue
-                if best is None or earn > best[0]:
-                    best = (earn, definition, price)
-            if best is not None:
-                earn, target, price = best
-                result = await self._post(client, "buy_car.php", {"carId": target.get("id")})
-                if result and result.get("success"):
-                    notes.append(f"自动买车：{target.get('name')}，花费 {price} 金，每分钟收益 {earn}")
-                    logger.info(f"[不可躺自动抢车位] {notes[-1]}")
-                    # 记账给「数据统计」页：买车是全额支出，和换车的差价分开记
-                    self._shop_spent += price
-                    self._shop_bought += 1
-                else:
-                    logger.warning(
-                        f"[不可躺自动抢车位] 自动买车失败：{(result or {}).get('error') or '未知原因'}")
-
-        return "；".join(notes)
+        best = None
+        for definition in cars_map.values():
+            if not isinstance(definition, dict):
+                continue
+            price = self._to_int(definition.get("price"), 0, minimum=0)
+            need = self._to_int(definition.get("levelReq"), 1, minimum=1)
+            if need > level or price > cash:
+                continue
+            earn = self._to_int(definition.get("earnPerMin"), 0)
+            if earn <= 0:
+                continue
+            if best is None or earn > best[0]:
+                best = (earn, definition, price)
+        if best is None:
+            return ""
+        earn, target, price = best
+        result = await self._post(client, "buy_car.php", {"carId": target.get("id")})
+        if not (result and result.get("success")):
+            logger.warning(
+                f"[不可躺自动抢车位] 自动买车失败：{(result or {}).get('error') or '未知原因'}")
+            return ""
+        # 记账给「数据统计」页：买车是全额支出，和换车的差价分开记
+        self._shop_spent += price
+        self._shop_bought += 1
+        note = f"自动买车：{target.get('name')}，花费 {price} 金，每分钟收益 {earn}"
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return note
 
     async def _unpark_due_cars(
         self,
