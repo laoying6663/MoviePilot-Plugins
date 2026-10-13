@@ -213,6 +213,10 @@ class ParkingBot(_PluginBase):
              ("garage", "③ 我的车库"), ("stats", "④ 数据统计"))
     _tab = "spots"
     _day = ""
+    # 车市页的两个临时状态：选中的车型分类、正在「选旧车换新」的目标车型。
+    # 必须给类级默认值 —— 详情页渲染可能在 __init_plugin_config__ 之前被调用。
+    _cat = ""
+    _trade_for = ""
     # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
     # 只在内存里跨这一轮传递，不单独落盘。
     _shop_spent = 0
