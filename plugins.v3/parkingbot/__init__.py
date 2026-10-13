@@ -2240,39 +2240,48 @@ class ParkingBot(_PluginBase):
         on<事件名> 绑到组件上：点击 → POST 指定 api → 渲染器随即重新拉取
         plugin/page/{id}。所以切换是真正的「只显示当前区块」，靠服务端记住
         当前页签实现的，不是前端动画，也不需要任何 JS。
+
+        这里刻意不用 <a href="#..."> 锚点：插件页是 hash 路由（#/plugins），
+        点锚点会把 hash 改成 #pb-xxx，路由匹配失败后整个插件弹窗被卸载，
+        表现为「点一下页面就没了」。
         """
         api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
+        active_color, idle_color = "#B388FF", "rgba(255,255,255,0.62)"
         buttons = []
-        for key, label in self._TABS:
+        for (key, label), icon in zip(self._TABS, ("mdi-parking", "mdi-store", "mdi-garage")):
             active = (key == current)
+            color = active_color if active else idle_color
             buttons.append({
                 "component": "div",
                 "props": {
                     "style": {
-                        "display": "block",
-                        "flex": "1 1 90px",
-                        "margin": "0 6px 6px 0",
-                        "padding": "11px 8px",
+                        "flex": "1 1 0",
+                        "minWidth": "84px",
+                        "padding": "4px 4px 0",
                         "textAlign": "center",
-                        "borderRadius": "8px",
-                        "border": "1px solid rgba(128,128,128,0.45)",
-                        # 当前页签高亮，一眼能看出当前在看哪一块
-                        "backgroundColor": (
-                            "rgba(79,195,247,0.45)" if active else "rgba(79,195,247,0.12)"),
-                        "color": "#FFFFFF" if active else "#4FC3F7",
-                        "fontSize": "14px",
-                        "fontWeight": "bold" if active else "normal",
                         "cursor": "pointer",
                         "userSelect": "none",
+                        # 当前页签用一条紫色下划线标出，样式对齐 MoviePilot 自带页签
+                        "borderBottom": (f"3px solid {active_color}" if active
+                                         else "3px solid transparent"),
                     },
                 },
-                "text": label,
+                "content": [
+                    {"component": "VIcon", "props": {"icon": icon, "size": "22px", "color": color}},
+                    {"component": "div", "text": label, "props": {"style": {
+                        "fontSize": "13px",
+                        "color": color,
+                        "fontWeight": "bold" if active else "normal",
+                        "marginTop": "2px",
+                        "whiteSpace": "nowrap",
+                    }}},
+                ],
                 "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
             })
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-6px",
-                                "marginBottom": "12px"}},
+            "props": {"style": {"display": "flex", "marginBottom": "14px",
+                                "borderBottom": "1px solid rgba(128,128,128,0.25)"}},
             "content": buttons,
         }
 
