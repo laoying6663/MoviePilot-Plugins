@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.27.0"
+    plugin_version = "1.28.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -482,6 +482,16 @@ class ParkingBot(_PluginBase):
         #           能当旧车的只剩恰好被剩在空闲池里的少数几辆，几乎换不动。
         shop_note = ""
         stale_after_shop = False
+        # recomputed / state_is_current 必须在第一次被读之前就初始化。
+        # 曾经把 recomputed 的初始化写在下面「还能再停几辆」那段的开头，结果它跑在
+        # _refresh_state() 之后，把 _recompute 刚置的 True 又抹回 False：
+        # still_parked 于是把同一批挪走的车扣了两遍，「最多同时停放 N 辆」被突破到
+        # N+moved（实测上限 2 变成能停 4 辆）。只��「自动换新」开着才会踩到 ——
+        # 因为走那条路才会先刷新一次状态。
+        recomputed = False
+        # state 是否已经是动作之后的最新状态。跑一轮里 state 会先后被买卖/挪车/停车
+        # 弄脏多次，只有刷新过才算当前；末尾落快照时据此决定要不要再拉一次。
+        state_is_current = True
         cars_map = await self._load_cars_map(client)
 
         def _recompute(state: dict) -> None:
@@ -505,7 +515,7 @@ class ParkingBot(_PluginBase):
             任何异常都吞掉并当作「刷新失败」返回 False —— 刷新失败时状态是陈旧的，
             绝不能继续往下走：换车已经把旧车换掉了，拿废 ID 去 park 是白白发请求。
             """
-            nonlocal state
+            nonlocal state, state_is_current
             try:
                 fresh = await client.get_json(f"{self.API_BASE}/state.php")
             except Exception as err:
@@ -514,6 +524,7 @@ class ParkingBot(_PluginBase):
             if fresh and fresh.get("success"):
                 state = fresh
                 _recompute(state)
+                state_is_current = True
                 return True
             return False
 
@@ -522,6 +533,7 @@ class ParkingBot(_PluginBase):
                 note = await self._auto_buy_one(client, state, cars_map, user_id)
                 if note:
                     shop_note = note
+                    state_is_current = False
                     if not await _refresh_state():
                         stale_after_shop = True
                         logger.warning(
@@ -536,6 +548,9 @@ class ParkingBot(_PluginBase):
             return
 
         earned_total, moved = await self._unpark_due_cars(client, parked, idle, target_minutes)
+        if moved:
+            # 服务端已变，这份 state 里的车还标着「停车中」
+            state_is_current = False
 
         # 挪车之后：以旧换新只在这一步做。刚挪完的车刚从「停车中」变成「空闲」，
         # 这才是游戏允许拿它当旧车的时刻。挪车前那批车还停着，换不动。
@@ -551,6 +566,7 @@ class ParkingBot(_PluginBase):
                     note = await self._auto_trade_one(client, state, cars_map, user_id)
                     if note:
                         shop_note = f"{shop_note}；{note}" if shop_note else note
+                        state_is_current = False
                         if not await _refresh_state():
                             stale_after_shop = True
                             logger.warning(
@@ -561,10 +577,10 @@ class ParkingBot(_PluginBase):
 
         # 还能再停几辆。
         #
-        # 买卖那几步会重新拉状态并重算 parked，被挪走的车此时已经是 idle，        # 自然不在 parked 里了 —— 这时再减一次 moved 就把同一批车扣了两遍，
+        # 买卖那几步会重新拉状态并重算 parked，被挪走的车此时已经是 idle，
+        # 自然不在 parked 里了 —— 这时再减一次 moved 就把同一批车扣了两遍，
         # 「最多同时停放 N 辆」会被突破到 N+moved。只有没重算过（没做买卖）
         # 时 parked 才还是挪车前的旧快照，才需要减掉 moved。
-        recomputed = False
         if stale_after_shop:
             self._set_result(shop_note or "状态刷新失败，本轮未停车")
             await self._record_round(client, state, user_id, 0, moved, earned_total,
@@ -576,13 +592,19 @@ class ParkingBot(_PluginBase):
             client, idle, self._dict_rows(state.get("parkingSpots")), user_id,
             max(0, self._max_cars - still_parked),
         )
+        if new_parked:
+            # 刚停出去的车在服务端已占位，这份 state 里还显示着「空闲」
+            state_is_current = False
         self._summarize(new_parked, moved, earned_total)
 
         # 本轮动过车就重新取一次状态：上面那份 state 是动作之前的快照，
         # 直接拿去落快照会让页面把刚停的车显示成「空闲」、按钮置灰，
-        # 要等下一轮才对上。动作数为 0 时沿用原状态，省一次请求。
+        # 要等下一轮才对上。
+        # 但只要中途某次 _refresh_state() 成功过，state 就已经是最新的，
+        # 再拉一次纯属浪费 —— 游戏站单请求约 1.1 秒，一轮能省一次是一���。
+        # 所以判据是「这份 state 是不是已经反映了全部动作」，而不是「有没有动过车」。
         snapshot_state = state
-        if new_parked or moved:
+        if not state_is_current:
             fresh = await client.get_json(f"{self.API_BASE}/state.php")
             if fresh and fresh.get("success"):
                 snapshot_state = fresh
