@@ -99,6 +99,9 @@ _GREEN = "#00E676"
 _PINK = "#FF4D6D"
 _AMBER = "#FFB300"
 _MUTED = "rgba(255,255,255,0.62)"
+# 游戏站点的静态资源根目录。游戏把头像/车图存成相对路径（如 assets/avatars/a.png），
+# 插件页在 MoviePilot 里渲染，相对路径会指到 MoviePilot 自己身上，所以要补全成绝对地址。
+_GAME_BASE = "https://qcw.tangpt.top/"
 # 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图
 _HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
           " rgba(255,255,255,0.015) 10px 20px)")
@@ -1035,11 +1038,8 @@ class ParkingBot(_PluginBase):
             for index, item in enumerate(cars, start=1):
                 item["no"] = index
 
-            spots = []
-            for index, spot in enumerate(my_spots, start=1):
-                kind = "爱心车位" if spot.get("spotType") == "charity" else "私家车位"
-                spots.append({"label": f"{kind} {index}", "kind": kind,
-                              "occupant": self._spot_occupant(spot, state, cars_map)})
+            spots = [self._spot_snapshot(spot, index, state, cars_map, rules, now)
+                     for index, spot in enumerate(my_spots, start=1)]
 
             snapshot = {
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1065,6 +1065,8 @@ class ParkingBot(_PluginBase):
                         "earn": self._to_int(item.get("earnPerMin"), 0, minimum=0),
                         "level": self._to_int(item.get("levelReq"), 1, minimum=1),
                         "category": str(item.get("category") or ""),
+                        # 车图：车位卡片要直接显示停着的那辆车
+                        "image": self._asset_url(item.get("image")),
                     }
                     for item in sorted(cars_map.values(), key=lambda c: self._to_int(c.get("price"), 0))
                 ],
@@ -1139,6 +1141,63 @@ class ParkingBot(_PluginBase):
             # 正是当初加缓存想避免的开销。
             if self._page_cache is None:
                 self._page_cache = {"snapshot": {}, "history": []}
+
+    @classmethod
+    def _spot_snapshot(cls, spot: dict, index: int, state: dict,
+                        cars_map: Dict[Any, dict], rules: dict,
+                        now: datetime) -> dict:
+        """
+        把一个车位整理成页面要用的展示字段。
+
+        口径完全对齐游戏前端（js/modules/parking.js）：
+        - 已停时长取自车位的 parkedTime，不是车辆的
+        - 私家车位预估收益 = min(分钟 × 该车每分钟收益, 单车位上限)
+        - 爱心车位不算金币，改为贡献经验，同样有上限
+        """
+        charity = spot.get("spotType") == "charity"
+        kind = "爱心车位" if charity else "私家车位"
+        out = {
+            "label": f"{kind} {index}",
+            "kind": kind,
+            "occupant": cls._spot_occupant(spot, state, cars_map),
+            "free": True,
+        }
+
+        car_in_spot = spot.get("carInSpot")
+        if not car_in_spot:
+            return out
+
+        car = next((c for c in (state.get("userCars") or [])
+                    if c.get("id") == car_in_spot), None)
+        if not car:
+            out["occupant"] = "已被占用"
+            out["free"] = False
+            return out
+
+        definition = cls._lookup_car(cars_map, car.get("carId")) or {}
+        parker = (state.get("users") or {}).get(car.get("userId")) or {}
+        parked_at = cls._parse_time(spot.get("parkedTime"))
+        mins = max(0, int((now - parked_at).total_seconds() / 60)) if parked_at else 0
+
+        out.update({
+            "free": False,
+            "carName": cls._car_name(car, cars_map),
+            "carImg": cls._asset_url(definition.get("image")
+                                    or car.get("flashCarImage")),
+            "parkedBy": str(parker.get("name") or "他人"),
+            "avatar": cls._avatar_url(parker.get("avatar")),
+            "avatarText": str(parker.get("avatar") or "M")[:1].upper(),
+            "mins": mins,
+            "mine": car.get("userId") == spot.get("ownerId"),
+        })
+        if charity:
+            per_min = cls._to_int(rules.get("CHARITY_EXP_PER_MIN"), 2, minimum=0)
+            limit = cls._to_int(rules.get("CHARITY_EXP_DAILY_LIMIT"), 200, minimum=0)
+            out["exp"] = min(mins * per_min, limit)
+        else:
+            cap = cls._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=0)
+            out["earn"] = min(mins * cls._to_int(definition.get("earnPerMin"), 0), cap)
+        return out
 
     @classmethod
     def _car_name(cls, car: dict, cars_map: Dict[Any, dict]) -> str:
@@ -1443,6 +1502,39 @@ class ParkingBot(_PluginBase):
         }
 
     @staticmethod
+    def _asset_url(value: Any) -> str:
+        """
+        把游戏返回的相对路径补成绝对地址；已经是 http 开头或非路径值的原样返回空串。
+
+        游戏侧 avatar 既可能是图片路径，也可能是性别字母 M/F；后者不是图片，
+        这里返回空串，由调用方退回文字头像。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.startswith("http://") or text.startswith("https://"):
+            return text
+        # 带图片扩展名或含斜杠的才算路径，否则是 M/F 之类的文字标记
+        if not (re.search(r"\.(png|jpe?g|gif|webp|svg)$", text, re.I) or "/" in text):
+            return ""
+        return _GAME_BASE + text.lstrip("/")
+
+    @staticmethod
+    def _avatar_url(value: Any) -> str:
+        """
+        头像地址。游戏的 avatar 字段不带 assets/avatars/ 前缀时要补上，
+        规则与游戏 renderAvatar 保持一致。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.startswith(("http://", "https://", "/", "assets/")):
+            return ParkingBot._asset_url(text)
+        if re.search(r"\.(png|jpe?g|gif|webp|svg)$", text, re.I):
+            return _GAME_BASE + "assets/avatars/" + text
+        return ""       # M / F 之类的性别标记，不是图片
+
+    @staticmethod
     def _alpha(hex_color: str, alpha: float) -> str:
         """#RRGGBB + 透明度 → rgba()，给徽章/卡片做同色淡底。"""
         h = hex_color.lstrip("#")
@@ -1670,19 +1762,91 @@ class ParkingBot(_PluginBase):
         return {"component": "div", "props": {"style": {}}, "content": blocks}
 
     @staticmethod
+    def _pic(url: str, fallback: str, size: int = 56) -> dict:
+        """
+        一张图片节点，走内联 html（插件页的声明式 JSON 引不了图片组件）。
+
+        游戏站的图挂了或没有图时退回占位符，所以内联 onerror 隐藏自己、显示兜底。
+        """
+        if not url:
+            return ParkingBot._text(fallback, {"fontSize": f"{size // 2}px",
+                                                "textAlign": "center",
+                                                "opacity": "0.45"})
+        html = (
+            f'<img src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" '
+            f'onerror="this.style.display=\'none\';'
+            f'this.nextElementSibling.style.display=\'flex\';">'
+            f'<span style="display:none;width:{size}px;height:{size}px;align-items:center;'
+            f'justify-content:center;font-size:{size // 2}px;opacity:0.45;">{fallback}</span>'
+        )
+        return {"component": "span", "props": {"style": {"lineHeight": "0"}}, "html": html}
+
+    @staticmethod
     def _spot_grid(spots: List[dict]) -> dict:
         """
-        我的车位：照游戏本体的画法，两列网格，空车位是斜纹底 + 角标。
+        我的车位：照游戏本体的画法，两列网格。
 
-        斜纹用 repeating-linear-gradient 直接画，不需要额外拉图。
+        被别人占用时按游戏那样显示：车图、停车人（带头像）、已停时长与预估收益；
+        空闲位是斜纹底 + 角标。斜纹用 repeating-linear-gradient 直接画，不需要额外拉图。
         """
         cards = []
         for spot in spots:
             label = str(spot.get("label") or "")
             kind = str(spot.get("kind") or ("爱心车位" if "爱心" in label else "私家车位"))
             charity = "爱心" in kind
-            occupant = str(spot.get("occupant") or "")
-            free = (not occupant) or "空闲" in occupant
+            free = spot.get("free", True)
+            badge = ParkingBot._badge(f"{'❤' if charity else '🅿'} {kind}",
+                                      _PINK if charity else _CYAN)
+            if free:
+                cards.append({
+                    "component": "div",
+                    "props": {"style": {
+                        "flex": "1 1 46%",
+                        "minWidth": "150px",
+                        "margin": "0 8px 8px 0",
+                        "padding": "12px",
+                        "borderRadius": "14px",
+                        "border": ("1px solid rgba(255,77,109,0.28)" if charity
+                                   else "1px solid rgba(34,211,238,0.24)"),
+                        "backgroundColor": _HATCH,
+                    }},
+                    "content": [
+                        badge,
+                        ParkingBot._text("空闲", {
+                            "fontSize": "17px", "fontWeight": "bold",
+                            "color": "rgba(255,255,255,0.42)",
+                            "textAlign": "center", "marginTop": "18px"}),
+                    ],
+                })
+                continue
+
+            # 停车人一行：头像 + 名字；停我自己的车时标出来
+            who = str(spot.get("parkedBy") or "他人")
+            if spot.get("mine"):
+                who = f"{who}（我的车）"
+            avatar = spot.get("avatar")
+            who_node = {
+                "component": "div",
+                "props": {"style": {"display": "flex", "alignItems": "center",
+                                    "justifyContent": "center", "gap": "6px",
+                                    "marginTop": "10px"}},
+                "content": [
+                    ParkingBot._pic(avatar, str(spot.get("avatarText") or "M"), 20),
+                    ParkingBot._text(who, {"fontSize": "13px",
+                                           "fontWeight": "bold",
+                                           "color": _PURPLE if spot.get("mine")
+                                           else "#FFFFFF"}),
+                ],
+            }
+
+            mins = ParkingBot._to_int(spot.get("mins"), 0)
+            if charity:
+                detail = f"贡献经验 {ParkingBot._to_int(spot.get('exp'), 0)} exp"
+                detail_color = _PURPLE
+            else:
+                detail = f"预估收益 🪙 {ParkingBot._to_int(spot.get('earn'), 0)}"
+                detail_color = _GOLD
+
             cards.append({
                 "component": "div",
                 "props": {"style": {
@@ -1691,18 +1855,27 @@ class ParkingBot(_PluginBase):
                     "margin": "0 8px 8px 0",
                     "padding": "12px",
                     "borderRadius": "14px",
-                    "border": ("1px solid rgba(255,77,109,0.28)" if charity
-                               else "1px solid rgba(34,211,238,0.24)"),
-                    "backgroundColor": _HATCH if free else "rgba(255,255,255,0.05)",
+                    "border": ("1px solid rgba(255,77,109,0.30)" if charity
+                               else "1px solid rgba(255,215,0,0.30)"),
+                    "backgroundColor": "rgba(255,255,255,0.05)",
+                    "textAlign": "center",
                 }},
                 "content": [
-                    ParkingBot._badge(f"{'❤' if charity else '🅿'} {kind}",
-                                      _PINK if charity else _CYAN),
-                    ParkingBot._text(occupant or "空闲", {
-                        "fontSize": "16px", "fontWeight": "bold",
-                        "color": "rgba(255,255,255,0.42)" if free else "#FFFFFF",
-                        "marginTop": "14px", "textAlign": "center",
-                    }),
+                    badge,
+                    {"component": "div",
+                     "props": {"style": {"display": "flex", "justifyContent": "center",
+                                         "marginTop": "8px"}},
+                     "content": [ParkingBot._pic(spot.get("carImg"),
+                                                 str(spot.get("carName") or "🚗")[:1], 56)]},
+                    ParkingBot._text(str(spot.get("carName") or "未知车型"),
+                                     {"fontSize": "14px", "fontWeight": "bold",
+                                      "marginTop": "4px"}),
+                    who_node,
+                    ParkingBot._text(f"已停 {mins} 分钟",
+                                     {"fontSize": "12px", "opacity": "0.72",
+                                      "marginTop": "6px"}),
+                    ParkingBot._text(detail, {"fontSize": "13px", "color": detail_color,
+                                             "fontWeight": "bold", "marginTop": "2px"}),
                 ],
             })
         if not cards:
