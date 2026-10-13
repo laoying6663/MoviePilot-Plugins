@@ -169,7 +169,7 @@ class ParkingBot(_PluginBase):
     # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
     _PLUGIN_ID = "ParkingBot"
     _TABS = (("spots", "① 我的车位"), ("shop", "② 车市"),
-             ("garage", "③ 我的车库"), ("stats", "④ 金币统计"))
+             ("garage", "③ 我的车库"), ("stats", "④ 数据统计"))
     _tab = "spots"
     _day = ""
     # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
@@ -500,6 +500,9 @@ class ParkingBot(_PluginBase):
                 if result and result.get("success"):
                     notes.append(f"自动买车：{target.get('name')}，花费 {price} 金，每分钟收益 {earn}")
                     logger.info(f"[不可躺自动抢车位] {notes[-1]}")
+                    # 记账给「数据统计」页：买车是全额支出，和换车的差价分开记
+                    self._shop_spent += price
+                    self._shop_bought += 1
                 else:
                     logger.warning(
                         f"[不可躺自动抢车位] 自动买车失败：{(result or {}).get('error') or '未知原因'}")
@@ -1111,6 +1114,12 @@ class ParkingBot(_PluginBase):
             bucket["parked"] = self._to_int(bucket.get("parked"), 0) + new_parked
             bucket["moved"] = self._to_int(bucket.get("moved"), 0) + moved
             bucket["rounds"] = self._to_int(bucket.get("rounds"), 0) + 1
+            # 买卖花费并进当天：购车记全额、换车记差价，两者在统计页分开显示
+            bucket["spent"] = self._to_int(bucket.get("spent"), 0) + self._shop_spent
+            bucket["bought"] = self._to_int(bucket.get("bought"), 0) + self._shop_bought
+            bucket["diff"] = self._to_int(bucket.get("diff"), 0) + self._shop_diff
+            bucket["traded"] = self._to_int(bucket.get("traded"), 0) + self._shop_traded
+            self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
             hours = dict(bucket.get("hours") or {})
             hours[hour_key] = self._to_int(hours.get(hour_key), 0) + earned
             bucket["hours"] = hours
@@ -1464,6 +1473,7 @@ class ParkingBot(_PluginBase):
 
         每张卡直接带上「切到 stats 页并选中该日」的事件，所以点卡片会同时
         切换页签和日期 —— 否则人在别的页签上点了卡片，日期改了却看不见。
+        卡片上显示的是当日净收（收益减掉买车与换车花费）。
         """
         cards = []
         for day, total in days:
@@ -1485,8 +1495,10 @@ class ParkingBot(_PluginBase):
                 }},
                 "content": [
                     ParkingBot._text(day, {"fontSize": "13px", "fontWeight": "bold"}),
-                    ParkingBot._text(f"🪙 {total}", {"fontSize": "14px", "color": _GOLD,
-                                                     "marginTop": "3px"}),
+                    ParkingBot._text(f"🪙 {total}",
+                                     {"fontSize": "14px",
+                                      "color": _GREEN if total >= 0 else _PINK,
+                                      "marginTop": "3px"}),
                 ],
                 "events": {"click": {"api": api, "method": "post",
                                      "params": {"tab": "stats", "day": day}}},
@@ -1555,63 +1567,94 @@ class ParkingBot(_PluginBase):
     def _stats_page(self, daily: Dict[str, Any], history: List[dict],
                     today_earned: int) -> dict:
         """
-        金币统计页：日期卡片行 + 当日汇总 + 24 小时柱状图 + 每日明细表。
+        数据统计页：日期卡片行 + 当日收支汇总 + 24 小时柱状图 + 每日明细表。
 
         执行历史只有 50 轮（约 4 小时），做不了按天统计，所以另有一份按天累计
         的存档 daily 在每轮结束时累加，这里只是把它画出来。
+        支出分两项记：购车是全额花费，换车只算补的差价。
         """
         api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
         days = sorted(daily.keys(), reverse=True)
         if not days:
             return self._card(
-                "金币统计",
+                "数据统计",
                 "从下一轮执行开始累积数据",
                 [self._text("还没有统计数据，插件执行一轮后就会出现。",
                             {"fontSize": "13px", "opacity": "0.7"})])
 
+        def day_row(d: str) -> Tuple[int, int, int]:
+            b = daily.get(d) or {}
+            earned = self._to_int(b.get("earned"), 0)
+            cost = (self._to_int(b.get("spent"), 0) + self._to_int(b.get("diff"), 0))
+            return earned, cost, earned - cost
+
         current = self._day if self._day in daily else days[0]
         bucket = daily.get(current) or {}
         hours = bucket.get("hours") or {}
-        day_total = self._to_int(bucket.get("earned"), 0)
+        day_earned, day_cost, day_net = day_row(current)
         month_prefix = current[:7]
-        month_total = sum(self._to_int((v or {}).get("earned"), 0)
-                          for k, v in daily.items() if str(k).startswith(month_prefix))
-        avg = round(month_total / max(1, sum(1 for k in daily
-                                             if str(k).startswith(month_prefix))))
+        month_days = [d for d in days if str(d).startswith(month_prefix)]
+        m_earned = sum(day_row(d)[0] for d in month_days)
+        m_cost = sum(day_row(d)[1] for d in month_days)
+        avg = round(m_earned / max(1, len(month_days)))
+        buys = sum(self._to_int((daily[d] or {}).get("bought"), 0) for d in month_days)
+        trades = sum(self._to_int((daily[d] or {}).get("traded"), 0) for d in month_days)
 
         blocks = [
             # 最近 7 天日期卡片
             self._card("", "", [self._day_chips(
-                [(d, self._to_int((daily[d] or {}).get("earned"), 0)) for d in days[:7]],
-                current, api)]),
-            # 当日汇总
+                [(d, day_row(d)[2]) for d in days[:7]], current, api)]),
+            # 当日收支
             {"component": "div",
              "props": {"style": {"display": "flex", "flexWrap": "wrap",
                                  "marginRight": "-8px", "marginBottom": "12px"}},
              "content": [
-                 self._stat("当日收益", day_total, _GOLD),
-                 self._stat("本月累计", month_total, _GREEN),
-                 self._stat("本月日均", avg, _CYAN),
+                 self._stat("当日收益", day_earned, _GOLD),
+                 self._stat("当日支出", day_cost, _PINK),
+                 self._stat("当日净收", day_net, _GREEN),
                  self._stat("挪走次数", self._to_int(bucket.get("moved"), 0), _PURPLE),
+             ]},
+            # 本月收支
+            {"component": "div",
+             "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                 "marginRight": "-8px", "marginBottom": "12px"}},
+             "content": [
+                 self._stat("本月收益", m_earned, _GOLD),
+                 self._stat("本月支出", m_cost, _PINK),
+                 self._stat("本月净收", m_earned - m_cost, _GREEN),
+                 self._stat("本月日均", avg, _CYAN),
              ]},
             # 小时柱状图
             self._card(f"{current} · 每小时收益",
-                       f"当日共 {self._to_int(bucket.get('rounds'), 0)} 轮执行",
+                       f"当日共 {self._to_int(bucket.get('rounds'), 0)} 轮执行，"
+                       f"买车 {self._to_int(bucket.get('bought'), 0)} 次、"
+                       f"换车 {self._to_int(bucket.get('traded'), 0)} 次",
                        [self._hour_chart(hours)]),
             # 每日明细
             self._card(
                 "每日明细",
-                f"共 {len(days)} 天记录，最多保留 60 天",
+                f"共 {len(days)} 天，最多保留 60 天",
                 [self._table(
-                    ["日期", "收益", "新停放", "挪走", "轮次"],
+                    ["日期", "收益", "买车", "换车差价", "净收"],
                     [[d,
-                      str(self._to_int((daily[d] or {}).get("earned"), 0)),
-                      str(self._to_int((daily[d] or {}).get("parked"), 0)),
-                      str(self._to_int((daily[d] or {}).get("moved"), 0)),
-                      str(self._to_int((daily[d] or {}).get("rounds"), 0))]
+                      str(day_row(d)[0]),
+                      str(self._to_int((daily[d] or {}).get("spent"), 0)),
+                      str(self._to_int((daily[d] or {}).get("diff"), 0)),
+                      str(day_row(d)[2])]
                      for d in days[:30]],
                     ["3", "2", "2", "2", "2"],
-                    ["left", "right", "center", "center", "center"])]),
+                    ["left", "right", "right", "right", "right"])]),
+            # 买卖汇总
+            self._card(
+                "本月买卖",
+                f"买车 {buys} 次、换车 {trades} 次，"
+                f"合计花出 {m_cost} 金币",
+                [self._text(
+                    f"买入 {sum(self._to_int((daily[d] or {}).get('spent'), 0) for d in month_days)} 金"
+                    f"　·　换车补差价 "
+                    f"{sum(self._to_int((daily[d] or {}).get('diff'), 0) for d in month_days)} 金",
+                    {"fontSize": "14px", "color": _PINK})],
+            ),
         ]
         # 最近几轮明细放在最下面，保留原来的执行历史能力
         if history:
