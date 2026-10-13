@@ -106,6 +106,18 @@ class TradePickRequest(BaseModel):
         default=None, description="要换成的目标车型 ID；留空表示退出选车模式")
 
 
+class TitleSetRequest(BaseModel):
+    """切换佩戴的称号。0 表示取消佩戴（游戏里是同一个接口、同一个 0）。"""
+
+    title_id: Any = Field(default=0, description="称号 ID；0 表示取消佩戴")
+
+
+class TitlePickRequest(BaseModel):
+    """展开 / 收起称号选择器。"""
+
+    open: bool = Field(default=False, description="True 展开选择器，False 收起")
+
+
 def _result(payload: Dict[str, Any]) -> ApiResult:
     """
     把接口内部构造的字典收敛成宿主要求的三键响应信封。
@@ -137,6 +149,19 @@ _MUTED = "rgba(255,255,255,0.62)"
 _SHOP_EARN = "#00FF00"
 _SHOP_OWNED = "#00DDFF"
 _SHOP_LOCK = "#E94560"
+# 金币图标，照抄游戏 index.html 雪碧图里的 <symbol id="ico-coin">，去掉了 use 引用。
+# 为什么不用 🪙 emoji：U+1FA99 是 2019 年才进 Unicode 的，Windows 默认字体里
+# 基本没有这个字形，插件页实测直接渲染成豆腐块 □。
+_COIN_SVG = ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@">'
+             '<circle cx="12" cy="12" r="10" fill="#ffd700" stroke="#daa520" '
+             'stroke-width="1.5"/><text x="12" y="16.5" text-anchor="middle" '
+             'font-size="13" font-weight="bold" fill="#8B6914">$</text></svg>')
+# 奖牌图标，照抄游戏雪碧图里的 <symbol id="ico-medal">。
+_MEDAL_SVG = ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@">'
+              '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10'
+              'S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z'
+              'm-1-13h2v6h-2zm0 8h2v2h-2z" fill="#ffd700"/>'
+              '<circle cx="12" cy="12" r="3" fill="#ffd700"/></svg>')
 # 游戏站点的静态资源根目录。游戏把头像/车图存成相对路径（如 assets/avatars/a.png），
 # 插件页在 MoviePilot 里渲染，相对路径会指到 MoviePilot 自己身上，所以要补全成绝对地址。
 _GAME_BASE = "https://qcw.tangpt.top/"
@@ -170,7 +195,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.15.0"
+    plugin_version = "1.16.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -217,6 +242,9 @@ class ParkingBot(_PluginBase):
     # 必须给类级默认值 —— 详情页渲染可能在 __init_plugin_config__ 之前被调用。
     _cat = ""
     _trade_for = ""
+    # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
+    # 切页签回来还在，和 _cat / _trade_for 一个套路。
+    _title_open = False
     # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
     # 只在内存里跨这一轮传递，不单独落盘。
     _shop_spent = 0
@@ -266,6 +294,7 @@ class ParkingBot(_PluginBase):
         # 分类直接取快照里真实存在的分类名，不认任何外部输入。
         self._cat = str(saved_view.get("cat") or "").strip()
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
+        self._title_open = bool(saved_view.get("title_open"))
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
@@ -777,6 +806,40 @@ class ParkingBot(_PluginBase):
             logger.debug(f"[不可躺自动抢车位] 读取特卖列表失败，已忽略：{err}")
             return []
 
+    async def _load_titles(self, client: AsyncRequestUtils, state: dict) -> dict:
+        """
+        读取称号列表。
+
+        state.php 只带 currentTitleId / currentTitleName，能选哪几个称号在
+        titles.php。这里只留已获得的 —— 游戏的选择器同样只列 owned，列一堆
+        拿不到的称号只会让人以为是自己哪里做错了。
+
+        当前佩戴称号自己的颜色也一并带出来，页面上的标签要按称号的颜色显示，
+        和游戏顶栏一致（currentTitleName 只在 state.php 里，颜色只有这里有）。
+        """
+        current = self._to_int(state.get("currentTitleId"), 0, minimum=0)
+        owned: List[dict] = []
+        color = _GOLD
+        try:
+            data = await client.get_json(f"{self.API_BASE}/titles.php")
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] 读取称号列表失败，已忽略：{err}")
+            data = None
+        for item in ((data or {}).get("titles") or []):
+            if not isinstance(item, dict) or not item.get("owned"):
+                continue
+            title_id = self._to_int(item.get("id"), 0, minimum=0)
+            owned.append({"id": title_id,
+                          "name": str(item.get("name") or ""),
+                          "desc": str(item.get("desc") or ""),
+                          "color": str(item.get("color") or _GOLD),
+                          # owned 一并留着：页面再过滤一次，快照里混进没解锁的
+                          # 称号时不会直接列出来给人点
+                          "owned": True})
+            if title_id == current:
+                color = owned[-1]["color"]
+        return {"owned": owned, "color": color}
+
     async def _load_game_context(self) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
         """
         取出「HTTP 客户端 + 游戏状态 + 车型表」。
@@ -1116,6 +1179,7 @@ class ParkingBot(_PluginBase):
         try:
             cars_map = await self._load_cars_map(client)
             flash = await self._load_flash_sales(client)
+            titles = await self._load_titles(client, state)
             rules = state.get("gameSettings") or {}
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
@@ -1167,6 +1231,12 @@ class ParkingBot(_PluginBase):
                 "pending_gain": sum(item["gain"] for item in cars),
                 "min_duration": min_duration,
                 "note": note,
+                # 称号：state.php 只给 currentTitleId 和 currentTitleName，
+                # 可选项列表要另打 titles.php
+                "title_id": self._to_int(state.get("currentTitleId"), 0, minimum=0),
+                "title_name": str(mine.get("currentTitleName") or ""),
+                "title_color": str(titles.get("color") or _GOLD),
+                "titles": titles["owned"],
                 "cars": cars,
                 "spots": spots,
                 # 车市需要的车型目录：价格、每分钟收益、等级门槛。
@@ -1532,8 +1602,42 @@ class ParkingBot(_PluginBase):
         MoviePilot 页面渲染器对原生 div 的约定是：`text` 放顶层、`style` 放
         `props` 内。写进 `props.text` 会渲染出空节点 —— 页面上只剩卡片轮廓、
         一个字都没有。
+
+        value 传 dict 时原样返回（style 不再生效）：金币图标这类「图标 + 数字」
+        的复合节点自带样式，可以直接塞进原本放文本的位置，不必为它单开一套接口。
         """
+        if isinstance(value, dict):
+            return value
         return {"component": "div", "text": str(value), "props": {"style": style}}
+
+    @staticmethod
+    def _coin(value: Any, size: int = 14, color: str = _GOLD, bold: bool = False,
+              label: str = "", style: Optional[Dict[str, Any]] = None,
+              align: str = "center") -> dict:
+        """
+        「金币图标 + 数字」一行，和游戏车市卡片里的 svgIco('coin') 同一颗。
+
+        size 是图标边长（px），数字比图标小 1px，这样一排金额下来基线看着齐。
+        align 给 "center" 用于卡片居中排版，给 "left" 用于左对齐的字段式布局。
+        """
+        row: Dict[str, Any] = {
+            "display": "flex",
+            "alignItems": "center",
+            "gap": "4px",
+            "justifyContent": "center" if align == "center" else "flex-start",
+        }
+        row.update(style or {})
+        text_style: Dict[str, Any] = {"fontSize": f"{max(11, size - 1)}px", "color": color}
+        if bold:
+            text_style["fontWeight"] = "bold"
+        content: List[dict] = []
+        if label:
+            content.append(ParkingBot._text(label, dict(text_style)))
+        content.append({"component": "span",
+                        "props": {"style": {"display": "flex", "flexShrink": "0"}},
+                        "html": _COIN_SVG.replace("@SIZE@", f"{size}px")})
+        content.append(ParkingBot._text(value, text_style))
+        return {"component": "div", "props": {"style": row}, "content": content}
 
     @staticmethod
     def _icon(name: str, size: int = 20) -> dict:
@@ -1701,10 +1805,10 @@ class ParkingBot(_PluginBase):
                 }},
                 "content": [
                     ParkingBot._text(day, {"fontSize": "13px", "fontWeight": "bold"}),
-                    ParkingBot._text(f"🪙 {total}",
-                                     {"fontSize": "14px",
-                                      "color": _GREEN if total >= 0 else _PINK,
-                                      "marginTop": "3px"}),
+                    ParkingBot._coin(total, size=14,
+                                     color=_GREEN if total >= 0 else _PINK,
+                                     bold=True, align="left",
+                                     style={"marginTop": "3px"}),
                 ],
                 "events": {"click": {"api": api, "method": "post",
                                      "params": {"tab": "stats", "day": day}}},
@@ -1961,11 +2065,14 @@ class ParkingBot(_PluginBase):
 
             mins = ParkingBot._to_int(spot.get("mins"), 0)
             if charity:
-                detail = f"贡献经验 {ParkingBot._to_int(spot.get('exp'), 0)} exp"
-                detail_color = _PURPLE
+                detail = ParkingBot._text(
+                    f"贡献经验 {ParkingBot._to_int(spot.get('exp'), 0)} exp",
+                    {"fontSize": "13px", "color": _PURPLE, "fontWeight": "bold",
+                     "marginTop": "2px"})
             else:
-                detail = f"预估收益 🪙 {ParkingBot._to_int(spot.get('earn'), 0)}"
-                detail_color = _GOLD
+                detail = ParkingBot._coin(
+                    ParkingBot._fmt_num(spot.get("earn")), size=14, color=_GOLD,
+                    bold=True, label="预估收益", style={"marginTop": "2px"})
 
             cards.append({
                 "component": "div",
@@ -1994,8 +2101,8 @@ class ParkingBot(_PluginBase):
                     ParkingBot._text(f"已停 {mins} 分钟",
                                      {"fontSize": "12px", "opacity": "0.72",
                                       "marginTop": "6px"}),
-                    ParkingBot._text(detail, {"fontSize": "13px", "color": detail_color,
-                                             "fontWeight": "bold", "marginTop": "2px"}),
+                    detail,
+
                 ],
             })
         if not cards:
@@ -2507,6 +2614,24 @@ class ParkingBot(_PluginBase):
                 "response_model": ApiResult,
                 "description": "记下要换成的目标车型，页面据此列出可用的空闲车；传空 car_id 表示取消",
             },
+            {
+                "path": "/title",
+                "endpoint": self.api_set_title,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换佩戴的称号",
+                "response_model": ApiResult,
+                "description": "按称号 ID 调用游戏 titles.php 切换佩戴；传 0 取消佩戴",
+            },
+            {
+                "path": "/title_pick",
+                "endpoint": self.api_title_pick,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "展开或收起称号选择器",
+                "response_model": ApiResult,
+                "description": "记录称号选择器是否展开；渲染器随后重新拉取页面并带上选择器",
+            },
         ]
 
     async def api_set_tab(self, request: TabSwitch) -> ApiResult:
@@ -2545,6 +2670,40 @@ class ParkingBot(_PluginBase):
         except Exception as err:
             # 记不住只影响下次打开时回到默认状态，不该让点击直接失败
             logger.warning(f"[不可躺自动抢车位] 保存详情页状态失败：{err}")
+
+    async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
+        """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
+        self._title_open = bool(getattr(request, "open", False))
+        await self._save_view({"title_open": self._title_open})
+        return _result({"success": True, "open": self._title_open})
+
+    async def api_set_title(self, request: TitleSetRequest) -> ApiResult:
+        """
+        切换佩戴的称号。
+
+        titleId 直接透传给游戏的 titles.php —— 能不能戴这个称号由游戏判定，
+        插件不自己比对列表，免得两边的解锁条件走偏。
+        """
+        if not self.get_state():
+            return _result({"success": False, "error": "插件未启用"})
+        title_id = self._to_int(getattr(request, "title_id", 0), 0, minimum=0)
+        client, state, _, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
+
+        result = await client.post_json(f"{self.API_BASE}/titles.php",
+                                       json={"titleId": title_id})
+        if not result or not result.get("success"):
+            return _result({"success": False,
+                            "error": (result or {}).get("error") or "切换称号失败"})
+        # 换完立刻拉一次快照，否则页面上还是旧称号，得等下一轮才对
+        await self._refresh_snapshot(client, "切换称号")
+        self._title_open = False
+        await self._save_view({"title_open": False})
+        name = str(result.get("titleName") or "")
+        self._set_result(f"称号已切换为：{name}" if name else "已取消佩戴称号")
+        logger.info(f"[不可躺自动抢车位] 称号切换为：{name or '无'}")
+        return _result({"success": True, "titleId": title_id, "name": name})
 
     async def api_shop_filter(self, request: ShopFilterRequest) -> ApiResult:
         """车市顶部分类胶囊：记住当前只看哪个分类。"""
@@ -2836,7 +2995,9 @@ class ParkingBot(_PluginBase):
                     ParkingBot._kv("盈利速率", f"{item.get('rate', 0)} 金/分钟", _GREEN),
                     ParkingBot._kv(
                         "累计收益" if not idle else "当前状态",
-                        f"🪙 {item.get('gain', 0)}" if not idle else "当前未停放",
+                        ParkingBot._coin(ParkingBot._fmt_num(item.get("gain")),
+                                         size=13, align="left")
+                        if not idle else "当前未停放",
                         _GOLD),
                     ParkingBot._kv(
                         "已停时长" if not idle else "说明",
@@ -2874,6 +3035,109 @@ class ParkingBot(_PluginBase):
                                 "marginRight": "-8px"}},
             "content": cards,
         }
+
+    @staticmethod
+    def _tint(color: str, alpha: float) -> str:
+        """
+        称号颜色由游戏下发，可能是任意 CSS 色值。只有 #RRGGBB 才敢算同色淡底，
+        其余回落到中性白 —— 直接丢给 _alpha 会 int() 炸掉，整页都渲染不出来。
+        """
+        text = str(color or "").strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+            return ParkingBot._alpha(text, alpha)
+        return f"rgba(255,255,255,{round(alpha * 0.18, 3)})"
+
+    def _owned_titles(self, snapshot: dict) -> List[dict]:
+        """
+        快照里可佩戴的称号。
+
+        缺 owned 字段的按已获得处理 —— 1.15.1 之前的快照没有这个键，
+        直接按 False 过滤会让老用户刚更新时称号整个消失。
+        """
+        return [t for t in (snapshot.get("titles") or [])
+                if isinstance(t, dict) and t.get("owned", True)]
+
+    def _title_chip(self, snapshot: dict) -> Optional[dict]:
+        """
+        概览里的称号标签，照游戏顶栏：奖牌图标 + 称号名，用称号自己的颜色，
+        点一下展开选择器（插件页没有弹窗，展开状态记在服务端）。
+        """
+        titles = self._owned_titles(snapshot)
+        if not titles:
+            return None
+        current = self._to_int(snapshot.get("title_id"), 0, minimum=0)
+        hit = next((t for t in titles if self._to_int(t.get("id"), 0) == current), None)
+        if hit:
+            name = str(hit.get("name") or "")
+            color = str(hit.get("color") or _GOLD)
+        else:
+            # 没佩戴、或佩戴的那个还没解锁时，state.php 的名字仍然可信
+            name = str(snapshot.get("title_name") or "") or "无称号"
+            color = str(snapshot.get("title_color") or "") or "#9E9E9E"
+        pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "alignItems": "center", "gap": "4px",
+                "padding": "3px 10px", "borderRadius": "12px", "fontSize": "12px",
+                "cursor": "pointer", "userSelect": "none", "color": color,
+                "border": f"1px solid {ParkingBot._tint(color, 0.55)}",
+                "backgroundColor": ParkingBot._tint(color, 0.14),
+            }},
+            "content": [
+                {"component": "span",
+                 "props": {"style": {"display": "flex", "flexShrink": "0"}},
+                 "html": _MEDAL_SVG.replace("@SIZE@", "13px")},
+                self._text(f"{name} ▾", {}),
+            ],
+            "events": {"click": {"api": f"plugin/{pid}/title_pick", "method": "post",
+                                 "params": {"open": not self._title_open}}},
+        }
+
+    def _title_picker(self, snapshot: dict) -> dict:
+        """称号选择器，同游戏 showTitleSelector：取消佩戴 + 已获得的称号，当前项玫红描边。"""
+        current = self._to_int(snapshot.get("title_id"), 0, minimum=0)
+        pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        api = f"plugin/{pid}/title"
+
+        def row(name: str, desc: str, color: str, active: bool,
+                title_id: Any) -> dict:
+            return {
+                "component": "div",
+                "props": {"style": {
+                    "display": "flex", "alignItems": "center", "gap": "10px",
+                    "padding": "10px", "marginBottom": "6px", "borderRadius": "8px",
+                    "cursor": "pointer", "backgroundColor": "rgba(255,255,255,0.05)",
+                    "border": (f"1px solid {_SHOP_LOCK}" if active
+                               else "1px solid transparent"),
+                }},
+                "content": [
+                    {"component": "div",
+                     "props": {"style": {"flex": "1 1 auto", "minWidth": "0"}},
+                     "content": [
+                         self._text(f"{name}{'（当前）' if active else ''}",
+                                    {"fontSize": "13px", "fontWeight": "bold",
+                                     "color": color}),
+                         self._text(desc, {"fontSize": "11px", "opacity": "0.62",
+                                           "marginTop": "2px"}),
+                     ]},
+                ],
+                "events": {"click": {"api": api, "method": "post",
+                                     "params": {"title_id": title_id}}},
+            }
+
+        rows = [row("取消佩戴称号", "", "#9E9E9E", current == 0, 0)]
+        rows += [row(str(t.get("name") or ""), str(t.get("desc") or ""),
+                     str(t.get("color") or _GOLD),
+                     self._to_int(t.get("id"), 0) == current,
+                     self._to_int(t.get("id"), 0))
+                 for t in self._owned_titles(snapshot)]
+        return self._card(
+            "选择称号",
+            "和游戏里点顶栏称号一样：只改显示的名字，不影响任何收益",
+            [*rows,
+             self._action_btn("收起", f"plugin/{pid}/title_pick", {"open": False},
+                              kind="trade")])
 
     @staticmethod
     def _fmt_num(value: Any) -> str:
@@ -3005,7 +3269,7 @@ class ParkingBot(_PluginBase):
         """
         车市里的一辆车：照抄游戏 .car-card。
 
-        结构和网页版一致 —— 车图居中最大、名字、🪙 价格、每分钟收益、
+        结构和网页版一致 —— 车图居中最大、名字、金币价格、每分钟收益、
         ✓ 已拥有 N 辆，最后一行是并排的按钮。等级不足的整张卡压到半透明，
         按钮换成「需要 Lv.N」，和游戏的 .car-card.locked 一个做法。
         """
@@ -3019,7 +3283,12 @@ class ParkingBot(_PluginBase):
             })
         content.append(ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
                                                 "textAlign": "center", "marginBottom": "4px"}))
-        for text, color in lines:
+        for line in lines:
+            # 复合节点（金币图标那种自带样式的）直接塞进来，样式它自己有
+            if isinstance(line, dict):
+                content.append(line)
+                continue
+            text, color = line
             content.append(ParkingBot._text(
                 text, {"fontSize": "13px", "color": color, "marginTop": "3px",
                        "textAlign": "center"}))
@@ -3182,7 +3451,9 @@ class ParkingBot(_PluginBase):
                 locked = need_level > level
                 sold_out = (not sale.get("timed")) and self._to_int(sale.get("stock"), 0) > 0 \
                     and self._to_int(sale.get("sold"), 0) >= self._to_int(sale.get("stock"), 0)
-                lines = [(f"🪙 {ParkingBot._fmt_num(price)}", _GOLD),
+                lines = [ParkingBot._coin(ParkingBot._fmt_num(price), size=14,
+                                          color=_GOLD,
+                                          style={"marginTop": "3px"}),
                          (f"{self._to_int(sale.get('earn'), 0)}金/分钟", _SHOP_EARN)]
                 if original > price:
                     lines.insert(0, (f"原价 {ParkingBot._fmt_num(original)} 金", "#9E9E9E"))
@@ -3230,7 +3501,9 @@ class ParkingBot(_PluginBase):
                 locked = need_level > level
                 mine_count = sum(1 for c in cars
                                  if str(c.get("carId")) == str(car.get("id")))
-                lines = [(f"🪙 {ParkingBot._fmt_num(price)}", _GOLD),
+                lines = [ParkingBot._coin(ParkingBot._fmt_num(price), size=14,
+                                          color=_GOLD,
+                                          style={"marginTop": "3px"}),
                          (f"{self._to_int(car.get('earn'), 0)}金/分钟", _SHOP_EARN)]
                 if mine_count:
                     lines.append((f"✓ 已拥有{mine_count}辆", _SHOP_OWNED))
@@ -3368,9 +3641,17 @@ class ParkingBot(_PluginBase):
         if self._last_run_ts:
             last_run = f"{last_run}（{datetime.fromtimestamp(self._last_run_ts):%Y-%m-%d %H:%M:%S}）"
 
+        chip = self._title_chip(snapshot) if snapshot else None
         head_lines = [
-            self._text(header, {"fontSize": "19px", "fontWeight": "bold",
-                                "letterSpacing": "0.3px"}),
+            # 名字和称号并排：称号标签是点的入口，和游戏顶栏一个位置
+            {"component": "div",
+             "props": {"style": {"display": "flex", "alignItems": "center",
+                                 "gap": "10px", "flexWrap": "wrap"}},
+             "content": [
+                 self._text(header, {"fontSize": "19px", "fontWeight": "bold",
+                                     "letterSpacing": "0.3px"}),
+                 *([chip] if chip else []),
+             ]},
             self._text(subtitle, {"fontSize": "12px", "opacity": "0.62",
                                   "marginTop": "4px", "lineHeight": "1.6"}),
             self._text(f"最近一轮　{last_run}",
@@ -3454,8 +3735,13 @@ class ParkingBot(_PluginBase):
             "stats": stats_cards,
         }
 
+        title_picker = ([self._title_picker(snapshot)]
+                        if snapshot and self._title_open
+                        and self._owned_titles(snapshot) else [])
+
         return [
             head_card,
+            *title_picker,
             # 四个指标块：手机上一行两个、宽屏一行四个。用单个 flex 容器而不是
             # VRow/VCol，少 8 层组件，宽度也能自己说了算。
             {"component": "div",
