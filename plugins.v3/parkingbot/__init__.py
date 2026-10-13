@@ -92,10 +92,10 @@ def _result(payload: Dict[str, Any]) -> ApiResult:
 # 收益绿、爱心位粉、警示琥珀。插件页跟着游戏走，看起来才像同一个东西。
 _CYAN = "#22D3EE"
 _PURPLE = "#A78BFA"
-_GOLD = "#FFD700"
-_GREEN = "#00E676"
+_GOLD = _GOLD
+_GREEN = _GREEN
 _PINK = "#FF4D6D"
-_AMBER = "#FFB300"
+_AMBER = _AMBER
 _MUTED = "rgba(255,255,255,0.62)"
 # 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图
 _HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
@@ -2159,9 +2159,9 @@ class ParkingBot(_PluginBase):
     @staticmethod
     def _garage(cars: List[dict], min_duration: int) -> dict:
         """
-        车库视图：每辆车一张卡片。
+        车库视图：照游戏车库页的排版，一辆车一张卡，字段在上、值在下。
 
-        停够最短时长的车才给「立即挪车」按钮，其余按钮置灰并显示还差几分钟。
+        停够最短时长的车才给「立即挪车」指令，其余置灰并显示还差几分钟。
         车牌、每分钟收益、状态、已停时长都直接来自游戏车库数据（state.php 的 userCars）。
         """
         cards = []
@@ -2170,52 +2170,48 @@ class ParkingBot(_PluginBase):
             minutes = int(item.get("mins") or 0)
             can_unpark = (not idle) and minutes >= min_duration
             if idle:
-                button_text = "空闲中"
+                button_text, status_color = "空闲中", "#9E9E9E"
             elif can_unpark:
-                button_text = "立即挪车"
+                button_text, status_color = "立即挪车", _GREEN
             else:
-                button_text = f"还需 {min_duration - minutes} 分钟"
+                button_text, status_color = f"还需 {min_duration - minutes} 分钟", _AMBER
 
             # 序号兜底取列表位置：插件刚升级时页面上可能还是上一版写的快照，
             # 那种快照没有 no 字段，直接取会渲染成「/挪车 None」。
             # 列表顺序与 _ordered_my_cars 的排序口径一致，所以位置就是指令序号。
             number = item.get("no") or position
 
-            if idle:
-                status_color = "#9E9E9E"
-                detail = "当前未停车"
-            elif can_unpark:
-                status_color = "#00E676"
-                detail = f"{item.get('status')} · 已停 {minutes} 分钟 · 可结算 {item.get('gain', 0)} 金"
-            else:
-                status_color = "#FFB300"
-                detail = f"{item.get('status')} · 已停 {minutes} 分钟 · 满 {min_duration} 分钟后可挪"
-
             cards.append({
                 "component": "div",
                 "props": {"style": {
-                    "flex": "1 1 250px",
-                    "minWidth": "230px",
+                    "flex": "1 1 260px",
+                    "minWidth": "240px",
                     "margin": "0 8px 8px 0",
-                    "border": "1px solid rgba(128,128,128,0.20)",
-                    "borderRadius": "12px",
-                    "padding": "12px 12px 10px",
-                    "backgroundColor": "rgba(255,255,255,0.03)",
+                    "padding": "12px 14px 10px",
+                    "borderRadius": "14px",
+                    "border": "1px solid rgba(255,255,255,0.10)",
+                    "backgroundColor": "rgba(255,255,255,0.045)",
                 }},
                 "content": [
                     ParkingBot._text(item.get("name", ""),
-                                     {"fontSize": "15px", "fontWeight": "bold"}),
-                    ParkingBot._text(f"{item.get('rate', 0)} 金/分钟",
-                                     {"fontSize": "12px", "color": "#4FC3F7",
-                                      "marginTop": "2px"}),
-                    ParkingBot._text(detail,
-                                     {"fontSize": "12px", "color": status_color,
-                                      "marginTop": "4px", "lineHeight": "1.5",
-                                      "marginBottom": "10px"}),
-                    ParkingBot._command_hint(
-                        f"/挪车 {number}", can_unpark,
-                        "" if can_unpark else button_text,
-                    ),
+                                     {"fontSize": "17px", "fontWeight": "bold"}),
+                    ParkingBot._kv("盈利速率", f"{item.get('rate', 0)} 金/分钟", _GREEN),
+                    ParkingBot._kv(
+                        "累计收益" if not idle else "当前状态",
+                        f"🪙 {item.get('gain', 0)}" if not idle else "当前未停放",
+                        _GOLD),
+                    ParkingBot._kv(
+                        "已停时长" if not idle else "说明",
+                        f"{minutes} 分钟" if not idle else "可立即停到他人车位",
+                        "rgba(255,255,255,0.75)"),
+                    {"component": "div",
+                     "props": {"style": {"marginTop": "10px"}},
+                     "content": [
+                         ParkingBot._badge(str(item.get("status", "")), status_color),
+                         ParkingBot._command_hint(
+                             f"/挪车 {number}", can_unpark,
+                             "" if can_unpark else button_text),
+                     ]},
                 ],
             })
 
@@ -2227,28 +2223,29 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _item(title: str, lines: List[Tuple[str, str]], button: Optional[dict],
-              accent: str = "#4FC3F7") -> dict:
-        """车市里的一条：标题 + 若干「文本/颜色」行 + 一个按钮（可为 None）。"""
-        content = [ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold"})]
+              accent: str = _CYAN) -> dict:
+        """车市里的一条：照游戏车市页，居中排版 + 左侧色条。"""
+        content = [ParkingBot._text(title, {"fontSize": "17px", "fontWeight": "bold",
+                                           "marginBottom": "2px"})]
         for text, color in lines:
             content.append(ParkingBot._text(
-                text, {"fontSize": "12px", "color": color, "marginTop": "2px"}))
+                text, {"fontSize": "13px", "color": color, "marginTop": "3px"}))
         if button:
             button = dict(button)
             button["props"] = dict(button.get("props") or {})
-            button["props"]["style"] = {"marginTop": "8px"}
+            button["props"]["style"] = {"marginTop": "10px"}
             content.append(button)
         return {
             "component": "div",
             "props": {"style": {
-                "flex": "1 1 260px",
-                "minWidth": "240px",
+                "flex": "1 1 250px",
+                "minWidth": "230px",
                 "margin": "0 8px 8px 0",
-                "border": "1px solid rgba(128,128,128,0.20)",
+                "padding": "14px",
+                "borderRadius": "14px",
+                "border": "1px solid rgba(255,255,255,0.10)",
                 "borderLeft": f"3px solid {accent}",
-                "borderRadius": "12px",
-                "padding": "12px 12px 10px",
-                "backgroundColor": "rgba(255,255,255,0.03)",
+                "backgroundColor": "rgba(255,255,255,0.045)",
             }},
             "content": content,
         }
@@ -2262,11 +2259,11 @@ class ParkingBot(_PluginBase):
         所以这里给聊天指令而不是假按钮。支持按钮回调的通知渠道上，
         发 /车库 会拿到真正可点的按钮。
         """
-        color = "#4FC3F7" if enabled else "#9E9E9E"
+        color = _CYAN if enabled else "#9E9E9E"
         content = []
         if not enabled and reason:
             content.append(ParkingBot._text(f"⛔ {reason}",
-                                             {"fontSize": "11px", "color": "#FFB300"}))
+                                             {"fontSize": "11px", "color": _AMBER}))
         content.append(ParkingBot._text(command, {
             "fontSize": "12px",
             "marginTop": "6px",
@@ -2302,15 +2299,15 @@ class ParkingBot(_PluginBase):
                 locked = self._to_int(sale.get("level"), 1) > level
                 sold_out = (not sale.get("timed")) and self._to_int(sale.get("stock"), 0) > 0 \
                     and self._to_int(sale.get("sold"), 0) >= self._to_int(sale.get("stock"), 0)
-                lines = [(f"{price} 金", "#FFD700"), (f"{sale.get('earn', 0)} 金/分钟", "#00E676")]
+                lines = [(f"{price} 金", _GOLD), (f"{sale.get('earn', 0)} 金/分钟", _GREEN)]
                 if original > price:
                     lines.insert(0, (f"原价 {original} 金", "#9E9E9E"))
                 if locked:
-                    lines.append((f"需要 Lv.{sale.get('level')}", "#FFB300"))
+                    lines.append((f"需要 Lv.{sale.get('level')}", _AMBER))
                 elif sold_out:
-                    lines.append(("已售罄", "#FFB300"))
+                    lines.append(("已售罄", _AMBER))
                 else:
-                    lines.append((("限时特卖" if sale.get("timed") else f"仅剩 {self._to_int(sale.get('stock'), 0) - self._to_int(sale.get('sold'), 0)} 辆"), "#B388FF"))
+                    lines.append((("限时特卖" if sale.get("timed") else f"仅剩 {self._to_int(sale.get('stock'), 0) - self._to_int(sale.get('sold'), 0)} 辆"), _PURPLE))
                 items.append(self._item(
                     str(sale.get("name", "特卖车型")), lines,
                     self._command_hint(
@@ -2338,15 +2335,15 @@ class ParkingBot(_PluginBase):
                 mine_count = sum(1 for c in cars
                                  if str(c.get("carId")) == str(car.get("id")))
                 lines = [
-                    (f"{price} 金", "#FFD700"),
-                    (f"{car.get('earn', 0)} 金/分钟", "#00E676"),
+                    (f"{price} 金", _GOLD),
+                    (f"{car.get('earn', 0)} 金/分钟", _GREEN),
                 ]
                 if car.get("category"):
                     lines.append((str(car["category"]), "#9E9E9E"))
                 if mine_count:
-                    lines.append((f"已拥有 {mine_count} 辆", "#4FC3F7"))
+                    lines.append((f"已拥有 {mine_count} 辆", _CYAN))
                 if locked:
-                    lines.append((f"需要 Lv.{need_level}", "#FFB300"))
+                    lines.append((f"需要 Lv.{need_level}", _AMBER))
                 hint = ""
                 if locked:
                     hint = f"需要 Lv.{need_level}"
@@ -2391,8 +2388,8 @@ class ParkingBot(_PluginBase):
                         {"fontSize": "11px", "opacity": "0.6", "marginTop": "6px"})]
                 items.append(self._item(
                     str(car.get("name", "车辆")),
-                    [(f"当前价值 {old_price} 金", "#FFD700"),
-                     (f"{car.get('rate', 0)} 金/分钟", "#00E676")],
+                    [(f"当前价值 {old_price} 金", _GOLD),
+                     (f"{car.get('rate', 0)} 金/分钟", _GREEN)],
                     {"component": "div", "props": {"style": {}}, "content": buttons},
                     accent="#00E676",
                 ))
@@ -2486,10 +2483,10 @@ class ParkingBot(_PluginBase):
         # ---------- 概览 ----------
         if snapshot:
             stats = [
-                self._stat("今日收益", today_earned, "#00E676"),
-                self._stat("金币", snapshot.get("cash", 0), "#FFD700"),
-                self._stat("待结算", snapshot.get("pending_gain", 0), "#4FC3F7"),
-                self._stat("距下次运行", self._next_run_text(), "#B388FF"),
+                self._stat("今日收益", today_earned, _GREEN),
+                self._stat("金币", snapshot.get("cash", 0), _GOLD),
+                self._stat("待结算", snapshot.get("pending_gain", 0), _CYAN),
+                self._stat("距下次运行", self._next_run_text(), _PURPLE),
             ]
             header = f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
             subtitle = (f"执行周期 {self._cron or '未启用'}"
@@ -2497,10 +2494,10 @@ class ParkingBot(_PluginBase):
                         f" · 数据时间 {snapshot.get('time', '-')}")
         else:
             stats = [
-                self._stat("今日收益", today_earned, "#00E676"),
+                self._stat("今日收益", today_earned, _GREEN),
                 self._stat("金币", "-", "#9E9E9E"),
                 self._stat("待结算", "-", "#9E9E9E"),
-                self._stat("距下次运行", self._next_run_text(), "#B388FF"),
+                self._stat("距下次运行", self._next_run_text(), _PURPLE),
             ]
             header = self.plugin_name
             subtitle = "勾选「立即执行一次」后这里会显示停车场实况"
@@ -2522,7 +2519,7 @@ class ParkingBot(_PluginBase):
         if note:
             head_lines.append(self._text(
                 f"自动操作　{note}",
-                {"fontSize": "12px", "color": "#FFD700", "marginTop": "6px",
+                {"fontSize": "12px", "color": _GOLD, "marginTop": "6px",
                  "lineHeight": "1.6"}))
 
         # 开关开着但这一轮没花钱（比如没找到划算的车型）时也给个提示，
