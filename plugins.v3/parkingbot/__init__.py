@@ -230,7 +230,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.25.0"
+    plugin_version = "1.26.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -3375,32 +3375,31 @@ class ParkingBot(_PluginBase):
 
         最短停车时长在服务端再校验一次：页面上的按钮禁用只是提示，
         真正的规则必须由后端把关，否则绕过界面就能提前挪车。
+
+        car_id 既可以是车库序号，也可以是车辆实例 ID。车库里的「立即挪车」
+        按钮传的是序号，所以必须和 api_park 走同一套 _resolve_car_ref 解析：
+        直接拿它当实例 ID 去匹配，序号 1 匹配不到 id 为 '1' 的车，
+        点按钮就会一律报「车辆不存在或不属于当前账号」。
         """
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
         # 车辆 ID 用字符串处理：游戏侧不保证是纯数字，按数字解析会把
         # 非数字 ID 误判成「缺少车辆 ID」。筛选时同样按字符串比较。
         raw = getattr(request, "car_id", None)
-        target = str(raw if raw is not None else "").strip()
-        if not target:
+        token = str(raw if raw is not None else "").strip()
+        if not token:
             return _result({"success": False, "error": "缺少车辆 ID"})
 
-        cookie = await self._resolve_cookie()
-        if not cookie:
-            return _result({"success": False, "error": "未取到登录 Cookie"})
-        client = AsyncRequestUtils(cookies=cookie, timeout=20)
-
-        state = await client.get_json(f"{self.API_BASE}/state.php")
-        if not state or not state.get("success"):
-            await self._drop_cached_cookie()
-            return _result({"success": False, "error": "登录状态失效，请重新获取会话"})
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
 
         # 必须在 userCars 全表里按 userId 过滤，不能只按 id 匹配：
         # state.php 返回的是所有玩家的车辆，缺了归属校验就能挪别人的车。
-        owner_id = state.get("userId")
-        car = next((c for c in (state.get("userCars") or [])
-                    if str(c.get("id")) == target
-                    and str(c.get("userId")) == str(owner_id)), None)
+        # _ordered_my_cars 内部已经按 userId 过滤过，从它里面挑就天然安全。
+        ordered = self._ordered_my_cars(state, cars_map)
+        car_id = self._resolve_car_ref(token, ordered)
+        car = next((c for c in ordered if str(c.get("id")) == str(car_id)), None)
         if not car:
             return _result({"success": False, "error": "车辆不存在或不属于当前账号"})
         if car.get("status") == "idle":
@@ -3426,7 +3425,7 @@ class ParkingBot(_PluginBase):
         fresh = await client.get_json(f"{self.API_BASE}/state.php")
         if fresh and fresh.get("success"):
             await self._record_round(client, fresh, fresh.get("userId"), 0, 1, earned)
-        logger.info(f"[不可躺自动抢车位] 手动挪车成功，车辆 {target}，收益 {earned} 金币")
+        logger.info(f"[不可躺自动抢车位] 手动挪车成功，车辆 {car.get('id')}，收益 {earned} 金币")
         return _result({"success": True, "earned": earned})
 
     @staticmethod
