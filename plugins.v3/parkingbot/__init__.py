@@ -1323,24 +1323,24 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _stat(label: str, value: Any, color: str) -> dict:
-        """单个数字指标块。用 div 拼而不是 VCard：少两层组件，样式也更好控。"""
+        """单个数字指标块。紫渐变底 + 小灰标签 + 大号彩值，对齐游戏车库页。"""
         return {
             "component": "div",
             "props": {"style": {
                 "flex": "1 1 0",
                 "minWidth": "128px",
                 "margin": "0 8px 8px 0",
-                "padding": "10px 12px",
-                "borderRadius": "12px",
-                "border": "1px solid rgba(128,128,128,0.20)",
-                "backgroundColor": "rgba(255,255,255,0.04)",
+                "padding": "12px 14px",
+                "borderRadius": "14px",
+                "border": "1px solid rgba(167,139,250,0.28)",
+                "backgroundColor": f"linear-gradient(135deg, rgba(167,139,250,0.20), rgba(34,211,238,0.08))",
             }},
             "content": [
-                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.68",
-                                         "letterSpacing": "0.6px"}),
-                ParkingBot._text(value, {"fontSize": "22px", "fontWeight": "bold",
+                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.72",
+                                         "letterSpacing": "0.5px"}),
+                ParkingBot._text(value, {"fontSize": "23px", "fontWeight": "bold",
                                          "color": color, "lineHeight": "1.3",
-                                         "marginTop": "2px"}),
+                                         "marginTop": "3px"}),
             ],
         }
 
@@ -1358,18 +1358,100 @@ class ParkingBot(_PluginBase):
             "props": {"style": {
                 "marginBottom": "12px",
                 "padding": "14px 14px 4px",
-                "borderRadius": "14px",
-                "border": "1px solid rgba(128,128,128,0.20)",
-                "backgroundColor": "rgba(255,255,255,0.035)",
+                "borderRadius": "16px",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "backgroundColor": "rgba(255,255,255,0.045)",
             }},
             "content": [
                 ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
-                                         "color": _ACCENT, "marginBottom": "3px",
-                                         "letterSpacing": "0.3px"}),
-                ParkingBot._text(subtitle, {"fontSize": "12px", "opacity": "0.62",
+                                         "color": _CYAN, "marginBottom": "4px",
+                                         "letterSpacing": "0.4px"}),
+                ParkingBot._text(subtitle, {"fontSize": "12px", "opacity": "0.58",
                                             "lineHeight": "1.55", "marginBottom": "10px"}),
                 *content,
             ],
+        }
+
+    @staticmethod
+    def _kv(label: str, value: Any, color: str = "") -> dict:
+        """游戏里最常见的那种「小灰标签在上、彩色值在下」的字段。"""
+        return {
+            "component": "div",
+            "props": {"style": {"marginTop": "8px"}},
+            "content": [
+                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.55"}),
+                ParkingBot._text(value, {"fontSize": "15px", "fontWeight": "bold",
+                                         "color": color, "marginTop": "1px"}),
+            ],
+        }
+
+    @staticmethod
+    def _alpha(hex_color: str, alpha: float) -> str:
+        """#RRGGBB + 透明度 → rgba()，给徽章/卡片做同色淡底。"""
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    @staticmethod
+    def _badge(text: str, color: str) -> dict:
+        """状态徽章：小圆角底 + 同色文字，游戏里「停车中」那种。"""
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-block",
+                "padding": "3px 10px",
+                "borderRadius": "6px",
+                "fontSize": "12px",
+                "fontWeight": "bold",
+                "color": color,
+                "backgroundColor": ParkingBot._alpha(color, 0.16),
+            }},
+            "text": text,
+        }
+
+    @staticmethod
+    def _spot_grid(spots: List[dict]) -> dict:
+        """
+        我的车位：照游戏本体的画法，两列网格，空车位是斜纹底 + 角标。
+
+        斜纹用 repeating-linear-gradient 直接画，不需要额外拉图。
+        """
+        cards = []
+        for spot in spots:
+            label = str(spot.get("label") or "")
+            kind = str(spot.get("kind") or ("爱心车位" if "爱心" in label else "私家车位"))
+            charity = "爱心" in kind
+            occupant = str(spot.get("occupant") or "")
+            free = (not occupant) or "空闲" in occupant
+            cards.append({
+                "component": "div",
+                "props": {"style": {
+                    "flex": "1 1 46%",
+                    "minWidth": "150px",
+                    "margin": "0 8px 8px 0",
+                    "padding": "12px",
+                    "borderRadius": "14px",
+                    "border": ("1px solid rgba(255,77,109,0.28)" if charity
+                               else "1px solid rgba(34,211,238,0.24)"),
+                    "backgroundColor": _HATCH if free else "rgba(255,255,255,0.05)",
+                }},
+                "content": [
+                    ParkingBot._badge(f"{'❤' if charity else '🅿'} {kind}",
+                                      _PINK if charity else _CYAN),
+                    ParkingBot._text(occupant or "空闲", {
+                        "fontSize": "16px", "fontWeight": "bold",
+                        "color": "rgba(255,255,255,0.42)" if free else "#FFFFFF",
+                        "marginTop": "14px", "textAlign": "center",
+                    }),
+                ],
+            })
+        if not cards:
+            return ParkingBot._text("还没有车位数据", {"fontSize": "13px", "opacity": "0.6"})
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                "marginRight": "-8px"}},
+            "content": cards,
         }
 
     @staticmethod
