@@ -202,7 +202,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.17.0"
+    plugin_version = "1.18.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1331,24 +1331,49 @@ class ParkingBot(_PluginBase):
             }
             await self.async_save_data("snapshot", snapshot)
 
+            day_key = now.strftime("%Y-%m-%d")
+            hour_key = str(now.hour)
+            if self._page_cache is not None:
+                daily = dict(self._page_cache.get("daily") or {})
+            else:
+                stored_daily = await self.async_get_data("daily") or {}
+                daily = dict(stored_daily) if isinstance(stored_daily, dict) else {}
+            bucket = dict(daily.get(day_key) or {})
+
+            # 买卖花费并进当天：购车记全额、换车记差价，两者在统计页分开显示。
+            #
+            # 这一段必须放在 record_history 分支之外 —— 手动买车/换车走的也是
+            # _refresh_snapshot（record_history=False），不并进来统计页就看不到
+            # 手动花掉的金币，当日净收会虚高一大截。
+            bucket["spent"] = self._to_int(bucket.get("spent"), 0) + self._shop_spent
+            bucket["bought"] = self._to_int(bucket.get("bought"), 0) + self._shop_bought
+            bucket["diff"] = self._to_int(bucket.get("diff"), 0) + self._shop_diff
+            bucket["traded"] = self._to_int(bucket.get("traded"), 0) + self._shop_traded
+            self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
+            daily[day_key] = bucket
+
             if not record_history:
-                # 买卖类操作只刷新展示，历史保持原样。
+                # 买卖/挪车这类操作不写执行历史（否则全是 0 停车 / 0 挪车的噪声行），
+                # 也不该顶掉「执行轮次」——但花费已经并进上面那个桶了。
                 #
-                # 这里绝不能在 _page_cache 为 None 时把 history/daily 写成空：
-                # 进程刚起（或插件重载）后还没打开过详情页，从聊天侧触发一次
-                # /买车 就会走到这里，下一轮 run_once 看到缓存非空便拿这份空值
-                # 整份覆盖回库，落盘的历史与每日统计直接清空。所以同样先捞一次库。
+                # 缓存为 None（进程刚起还没打开过详情页）时，历史必须先从库里捞：
+                # 写成空的话，下一轮 run_once 看到缓存非空便拿这份空值整份覆盖回库，
+                # 落盘的 50 条历史会被清空。
                 cache = self._page_cache
                 if cache is None:
                     stored_h = await self.async_get_data("history") or []
-                    stored_d = await self.async_get_data("daily") or {}
                     cache = {
                         "history": list(stored_h) if isinstance(stored_h, list) else [],
-                        "daily": dict(stored_d) if isinstance(stored_d, dict) else {},
+                        "daily": daily,
                     }
+                else:
+                    cache["daily"] = daily
                 cache["snapshot"] = snapshot
                 self._page_cache = cache
+                await self.async_save_data("daily", daily)
                 return
+
+            daily[day_key] = bucket
 
             # 历史在内存里维护一份，避免每轮都读库。但插件重载会把模块重新执行、
             # 类属性复位，此时 _page_cache 为 None；若不先从数据库把历史捞回来，
@@ -1360,7 +1385,7 @@ class ParkingBot(_PluginBase):
                 history = list(stored) if isinstance(stored, list) else []
             history.insert(0, {
                 "time": now.strftime("%m-%d %H:%M"),
-                "day": now.strftime("%Y-%m-%d"),
+                "day": day_key,
                 "parked": new_parked,
                 "moved": moved,
                 "earned": earned,
@@ -1371,24 +1396,10 @@ class ParkingBot(_PluginBase):
             # 执行历史只有 50 轮（约 4 小时），撑不起「每天金币统计」。
             # 这里另存一份按天累计：日期 → 当日收益/停放/挪走/轮次 + 24 小时分桶，
             # 长期保留，「金币统计」页的柱状图与日汇总都从这里出。
-            day_key = now.strftime("%Y-%m-%d")
-            hour_key = str(now.hour)
-            if self._page_cache is not None:
-                daily = dict(self._page_cache.get("daily") or {})
-            else:
-                stored_daily = await self.async_get_data("daily") or {}
-                daily = dict(stored_daily) if isinstance(stored_daily, dict) else {}
-            bucket = dict(daily.get(day_key) or {})
             bucket["earned"] = self._to_int(bucket.get("earned"), 0) + earned
             bucket["parked"] = self._to_int(bucket.get("parked"), 0) + new_parked
             bucket["moved"] = self._to_int(bucket.get("moved"), 0) + moved
             bucket["rounds"] = self._to_int(bucket.get("rounds"), 0) + 1
-            # 买卖花费并进当天：购车记全额、换车记差价，两者在统计页分开显示
-            bucket["spent"] = self._to_int(bucket.get("spent"), 0) + self._shop_spent
-            bucket["bought"] = self._to_int(bucket.get("bought"), 0) + self._shop_bought
-            bucket["diff"] = self._to_int(bucket.get("diff"), 0) + self._shop_diff
-            bucket["traded"] = self._to_int(bucket.get("traded"), 0) + self._shop_traded
-            self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
             hours = dict(bucket.get("hours") or {})
             hours[hour_key] = self._to_int(hours.get(hour_key), 0) + earned
             bucket["hours"] = hours
@@ -2928,6 +2939,10 @@ class ParkingBot(_PluginBase):
         if not result or not result.get("success"):
             return _result({"success": False, "error": (result or {}).get("error") or "购买失败"})
         name = definition.get("name") or "车辆"
+        # 手动买卖同样要记账：统计页的当日支出/净收靠的就是这几个数，
+        # 不记就等于手动花掉的金币凭空消失，当日净收虚高。
+        self._shop_spent += price
+        self._shop_bought += 1
         await self._refresh_snapshot(client, "买车")
         self._set_result(f"购买 {name}，花费 {price} 金币")
         logger.info(f"[不可躺自动抢车位] 已购买 {name}，花费 {price} 金币")
@@ -2996,6 +3011,8 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": (result or {}).get("error") or "换车失败"})
         old_name = old_def.get("name") or "旧车"
         new_name = new_def.get("name") or "新车"
+        self._shop_diff += diff
+        self._shop_traded += 1
         await self._refresh_snapshot(client, "换车")
         # 换完了就把选旧车的面板收掉，否则页面刷新后它还杵在最上面
         self._trade_for = ""
@@ -3040,6 +3057,8 @@ class ParkingBot(_PluginBase):
         )
         if not result or not result.get("success"):
             return _result({"success": False, "error": (result or {}).get("error") or "抢购失败"})
+        self._shop_spent += self._to_int(sale.get("price"), 0, minimum=0)
+        self._shop_bought += 1
         await self._refresh_snapshot(client, "抢购")
         name = sale.get("name") or "特卖车型"
         self._set_result(f"抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
@@ -3402,10 +3421,11 @@ class ParkingBot(_PluginBase):
                     "whiteSpace": "nowrap",
                     "cursor": "pointer",
                     "userSelect": "none",
-                    "color": "#FFFFFF" if active else "#CCCCCC",
+                    "color": "#FFC2CE" if active else "#CCCCCC",
+                    # 同样是实色而非渐变：渐变在插件页渲染不出来，选中态会退化成
+                    # 透明底。文字色本身已经够亮，底色成不成立都读得清。
                     "backgroundColor": (
-                        "linear-gradient(135deg, rgba(233,69,96,0.85), rgba(83,52,131,0.85))"
-                        if active else "rgba(255,255,255,0.10)"),
+                        "rgba(233,69,96,0.32)" if active else "rgba(255,255,255,0.10)"),
                     "border": (f"1px solid {_SHOP_LOCK}" if active
                                else "1px solid rgba(255,255,255,0.15)"),
                 }},
@@ -3764,12 +3784,17 @@ class ParkingBot(_PluginBase):
                         "cursor": "pointer",
                         "userSelect": "none",
                         "whiteSpace": "nowrap",
-                        # 当前页签是实心青底，未选中的是半透明描边 —— 和游戏顶部那排一致
-                        "color": "#04222B" if active else "rgba(255,255,255,0.82)",
+                        # 当前页签是实心青底，未选中的是半透明描边 —— 和游戏顶部那排一致。
+                        #
+                        # 刻意不用 linear-gradient：MoviePilot 的渲染器不会把渐变
+                        # 写进 backgroundColor（同一个 style 对象里的 border、
+                        # padding、boxShadow 都生效，唯独它不生效），于是选中态
+                        # 变成「透明底 + 深色字」，在深色页面上几乎看不清。
+                        # 改成实色 rgba + 亮青文字：底色成不成立文字都读得出来。
+                        "color": "#7FF6FF" if active else "rgba(255,255,255,0.82)",
                         "backgroundColor": (
-                            f"linear-gradient(135deg, {_CYAN}, #38BDF8)"
-                            if active else "rgba(255,255,255,0.07)"),
-                        "border": ("none" if active
+                            "rgba(34,211,238,0.22)" if active else "rgba(255,255,255,0.07)"),
+                        "border": (f"1px solid {_CYAN}" if active
                                    else "1px solid rgba(255,255,255,0.14)"),
                         "boxShadow": ("0 4px 14px rgba(34,211,238,0.28)"
                                       if active else "none"),
