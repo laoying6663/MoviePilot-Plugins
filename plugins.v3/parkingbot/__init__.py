@@ -30,7 +30,7 @@ from app.schemas.types import EventType
 
 class ActionResult(BaseModel):
     """
-    操作类接口的统一返回结构。
+    操作类接口的业务字段集合。
 
     宿主要求每个普通 JSON endpoint 都声明具体 response_model，使响应结构能在
     /docs 里查到并被校验；返回裸 dict 不符合这个约定。
@@ -46,6 +46,21 @@ class ActionResult(BaseModel):
     expGained: Optional[int] = Field(default=None, description="本次操作获得的经验")
 
 
+class ApiResult(BaseModel):
+    """
+    宿主前端强制要求的响应信封。
+
+    前端 axios 拦截器会校验：响应必须**恰好**是 success / message / data
+    三个键，success 是布尔、message 是字符串（不能是 null）、data 存在。
+    任何不符合的响应都会被判成 invalid-envelope，页面上直接弹
+    「服务器返回了无效响应」——哪怕后端确实返回了 200。
+    """
+
+    success: bool = Field(description="操作是否成功")
+    message: str = Field(description="失败原因；成功时为空字符串")
+    data: Dict[str, Any] = Field(default_factory=dict, description="业务数据")
+
+
 class TabSwitch(BaseModel):
     """
     详情页区块切换请求体。
@@ -57,11 +72,20 @@ class TabSwitch(BaseModel):
     tab: str = Field(default="spots", description="区块标识：spots / shop / garage")
 
 
+def _result(payload: Dict[str, Any]) -> ApiResult:
+    """
+    把接口内部构造的字典收敛成宿主要求的三键响应信封。
 
-
-def _result(payload: Dict[str, Any]) -> ActionResult:
-    """把接口内部构造的字典收敛为已声明的响应模型。"""
-    return ActionResult(**payload)
+    success / error 之外的业务字段进 data，error 提升为 message。
+    """
+    ok = bool(payload.get("success"))
+    data = {k: v for k, v in payload.items()
+            if k not in ("success", "error") and v is not None}
+    return ApiResult(
+        success=ok,
+        message="" if ok else str(payload.get("error") or "操作失败"),
+        data=data,
+    )
 
 class ParkingBot(_PluginBase):
     """自动停车 + 自动挪车。"""
@@ -70,7 +94,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.8.0"
+    plugin_version = "1.8.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1695,20 +1719,22 @@ class ParkingBot(_PluginBase):
         result = await self.api_buy_flash(args[0])
         await self._after_action(result, sender, "抢购")
 
-    async def _after_action(self, result: ActionResult, sender: dict, label: str) -> None:
+    async def _after_action(self, result: ApiResult, sender: dict, label: str) -> None:
         """动作完成后先报结果，再把最新车库菜单发一遍。"""
+        # 业务字段都在信封的 data 里，这里按需取用
+        info = result.data or {}
         if result.success:
             detail = []
-            if result.earned:
-                detail.append(f"收益 {result.earned} 金")
-            if result.price:
-                detail.append(f"花费 {result.price} 金")
-            if result.expGained:
-                detail.append(f"经验 +{result.expGained}")
+            if info.get("earned"):
+                detail.append(f"收益 {info['earned']} 金")
+            if info.get("price"):
+                detail.append(f"花费 {info['price']} 金")
+            if info.get("expGained"):
+                detail.append(f"经验 +{info['expGained']}")
             text = "、".join(detail) if detail else "操作完成"
             self._reply_data(sender, f"✅ {label}成功", text)
         else:
-            self._reply_data(sender, f"❌ {label}失败", result.error or "未知原因")
+            self._reply_data(sender, f"❌ {label}失败", result.message or "未知原因")
         await self._cmd_menu(sender)
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -1720,7 +1746,7 @@ class ParkingBot(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "立即挪车",
-                "response_model": ActionResult,
+                "response_model": ApiResult,
                 "description": "按车辆 ID 执行一次挪车结算，停车不足游戏规定时长会被拒绝",
             },
             {
@@ -1729,7 +1755,7 @@ class ParkingBot(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "购买车辆",
-                "response_model": ActionResult,
+                "response_model": ApiResult,
                 "description": "按车型 ID 买车，等级、金币与车辆上限由后端二次校验",
             },
             {
@@ -1738,7 +1764,7 @@ class ParkingBot(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "以旧换新",
-                "response_model": ActionResult,
+                "response_model": ApiResult,
                 "description": "用一辆空闲车换更贵的车型",
             },
             {
@@ -1747,7 +1773,7 @@ class ParkingBot(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "抢购特卖车",
-                "response_model": ActionResult,
+                "response_model": ApiResult,
                 "description": "按特卖场次 ID 购买限时/限量车辆",
             },
             {
@@ -1756,12 +1782,12 @@ class ParkingBot(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "切换详情页区块",
-                "response_model": ActionResult,
+                "response_model": ApiResult,
                 "description": "记录详情页当前展示的区块；渲染器随后会重新拉取页面，只下发这一块",
             },
         ]
 
-    async def api_set_tab(self, request: TabSwitch) -> ActionResult:
+    async def api_set_tab(self, request: TabSwitch) -> ApiResult:
         """
         记住详情页当前停留的区块。
 
@@ -1779,7 +1805,7 @@ class ParkingBot(_PluginBase):
             logger.warning(f"[不可躺自动抢车位] 保存详情页页签失败：{err}")
         return _result({"success": True, "name": dict(self._TABS)[tab]})
 
-    async def api_buy_car(self, car_id: Any) -> ActionResult:
+    async def api_buy_car(self, car_id: Any) -> ApiResult:
         """
         购买车辆。
 
@@ -1826,7 +1852,7 @@ class ParkingBot(_PluginBase):
         return _result({"success": True, "name": name, "price": price,
                 "expGained": self._to_int(result.get("expGained"), 0)})
 
-    async def api_trade_in(self, old_car_id: Any, new_car_id: Any) -> ActionResult:
+    async def api_trade_in(self, old_car_id: Any, new_car_id: Any) -> ApiResult:
         """
         以旧换新。
 
@@ -1885,7 +1911,7 @@ class ParkingBot(_PluginBase):
         return _result({"success": True, "old": old_name, "new": new_name, "price": diff,
                 "expGained": self._to_int(result.get("expGained"), 0)})
 
-    async def api_buy_flash(self, sale_id: Any) -> ActionResult:
+    async def api_buy_flash(self, sale_id: Any) -> ApiResult:
         """购买限时/限量特卖车辆。"""
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
@@ -1925,7 +1951,7 @@ class ParkingBot(_PluginBase):
         logger.info(f"[不可躺自动抢车位] 抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
         return _result({"success": True, "name": name, "price": sale.get("price", 0)})
 
-    async def api_unpark(self, car_id: Any) -> ActionResult:
+    async def api_unpark(self, car_id: Any) -> ApiResult:
         """
         立即挪车接口。
 
