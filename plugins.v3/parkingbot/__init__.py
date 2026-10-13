@@ -170,7 +170,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.14.0"
+    plugin_version = "1.15.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -3035,6 +3035,9 @@ class ParkingBot(_PluginBase):
             "props": {"style": {
                 "flex": "1 1 190px",
                 "minWidth": "178px",
+                # 游戏是两列栅格。没有 maxWidth 的话，只剩一张卡时 flex 会把它
+                # 拉满整行，看起来跟网页版完全不是一回事
+                "maxWidth": "360px",
                 "margin": "0 5px 10px 0",
                 "padding": "14px",
                 "borderRadius": "12px",
