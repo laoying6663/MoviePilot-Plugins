@@ -34,13 +34,13 @@ from .helper import PyCookieCloud, MySender, IpLocationParser, JsonFieldManager
 
 class DynamicWeChat(_PluginBase):
     # 插件名称
-    plugin_name = "动态企微可信IP"
+    plugin_name = "动态企微可信IP（自用版）"
     # 插件描述
     plugin_desc = "修改企微应用可信IP,详细说明查看'作者主页',支持第三方通知。验证码以？结尾发送到企业微信应用"
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "3.1.8"
+    plugin_version = "3.1.9"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页

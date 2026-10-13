@@ -1,7 +1,8 @@
-# 动态企微可信IP
+# 动态企微可信IP（自用版）
 
 定时检查本机公网 IP,变化时自动写回企业微信应用的「可信 IP」列表,**保证企业微信通知不会因为 IP 变动而失效**。
 
+> **本插件名为「动态企微可信IP（自用版）」，用于和插件市场上的同名官方插件区分，请勿混淆。**
 > 本仓库是 [RamenRa/MoviePilot-Plugins](https://github.com/RamenRa/MoviePilot-Plugins) 中同名插件的独立维护分支,原始作者 RamenRa,原始创意来自 [suraxiuxiu/MoviePilot-Plugins](https://github.com/suraxiuxiu/MoviePilot-Plugins/)。
 
 ---
