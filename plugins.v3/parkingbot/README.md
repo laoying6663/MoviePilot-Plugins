@@ -82,11 +82,17 @@ Telegram / Slack 上发 `/车库` 会直接收到**可点的按钮**。
 
 ## 插件图标
 
-市场页按 `/plugin_icon/<文件名>` 取图标，取不到就显示 MoviePilot 自带的拼图图标。
-所以 `plugin_icon` 必须和仓库里的文件名完全一致 —— 现在是 `Parking_A.png`。
+市场页的图标取自**仓库根目录的 `icons/` 文件夹**，走 `/plugin_icon/<文件名>`，
+取不到就显示 MoviePilot 自带的拼图图标。所以必须同时满足两条：
 
-`Parking_A.jpg`（原始设计稿，1024×1024）作为存档留在仓库里，但**不能**用作图标：
-实测 MoviePilot 取 `/plugin_icon/Parking_A.jpg` 返回 404。
+1. `package.v3.json` 的 `icon` 与代码里的 `plugin_icon` **都等于文件名本身**（不带路径）—— 现在都是 `Parking_A.png`
+2. 该文件实际存在于仓库根目录的 **`icons/Parking_A.png`** —— 放在 `plugins.v3/parkingbot/` 里是**取不到的**
+
+这是实测出来的：同仓库的「动态企微可信IP（自用版）」图标是 `icons/Wecom_A.png`，
+`/plugin_icon/Wecom_A.png` 返回 200；而放在插件目录里的图标一律 404。
+所以跟格式、跟大小都没关系，**纯粹是目录位置**。
+
+`Parking_A.jpg`（原始设计稿，1024×1024）作为存档留在仓库里，不作图标用。
 
 ## 车库里的「立即停到他人车位」
 
