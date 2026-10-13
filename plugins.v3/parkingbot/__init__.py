@@ -203,12 +203,11 @@ class ParkingBot(_PluginBase):
     plugin_name = "不可躺自动抢车位"
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
-    # 图标声明要和仓库里真实存在的文件同名。市场页把图标当
-    # /plugin_icon/<文件名> 取；这个名字取不到时卡片会退回 MoviePilot
-    # 自带的拼图图标。改成 .png 需要真正把二进制文件推上仓库，
-    # 文本通道只能推字符串，详见 README 的「图标」一节。
-    plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.18.0"
+    # 市场页把图标当 /plugin_icon/<文件名> 取，取不到就退回 MoviePilot 自带的
+    # 拼图图标。仓库里的图标文件必须叫 Parking_A.png —— 原来的
+    # Parking_A.jpg 取不到（404）。.jpg 原图仍留在仓库里作为存档。
+    plugin_icon = "Parking_A.png"
+    plugin_version = "1.19.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
