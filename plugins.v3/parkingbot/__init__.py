@@ -230,7 +230,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.22.0"
+    plugin_version = "1.23.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -3422,12 +3422,44 @@ class ParkingBot(_PluginBase):
         return btn
 
     @staticmethod
+    def _unpark_btn(number: Any, can: bool, reason: str, api: str) -> dict:
+        """
+        停车中的车的「立即挪车」按钮。
+
+        和停车按钮互为镜像：停车是把车放出去，挪车是收钱结算，所以用绿底白字
+        和停车的白底深字区分开，一眼能看出两个按钮方向相反。
+
+        不满足条件时压暗且不挂事件 —— 页面上的灰按钮是真点不动的，好过按下去
+        被服务端驳回再弹一句错误。时长的最终把关仍在 api_unpark 里做一遍。
+        """
+        btn = {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "alignItems": "center",
+                "justifyContent": "center", "gap": "4px",
+                "padding": "5px 12px", "fontSize": "11px", "fontWeight": "bold",
+                "borderRadius": "14px", "whiteSpace": "nowrap",
+                "userSelect": "none", "border": "none",
+                "cursor": "pointer" if can else "not-allowed",
+                "color": "#04281A" if can else "rgba(255,255,255,0.45)",
+                "backgroundColor": (_GREEN if can
+                                    else "rgba(255,255,255,0.10)"),
+            }},
+            "text": "立即挪车" if can else reason,
+        }
+        if can:
+            btn["events"] = {"click": {"api": api, "method": "post",
+                                       "params": {"car_id": number}}}
+        return btn
+
+    @staticmethod
     def _garage(cars: List[dict], min_duration: int, free_spots: int = 0,
-                parked_count: int = 0, max_cars: int = 1, api: str = "") -> dict:
+                parked_count: int = 0, max_cars: int = 1, api: str = "",
+                unpark_api: str = "") -> dict:
         """
         车库视图：照游戏车库页的排版，左图右信息，字段在上、值在下。
 
-        停够最短时长的车才给「立即挪车」指令，其余置灰并显示还差几分钟。
+        停够最短时长的车给可点的「立即挪车」按钮，其余置灰并显示还差几分钟。
         空闲的车另给一个「立即停到他人车位」按钮 —— 手动操作不受「最多同时停放
         车辆数」限制，旁边会把当前已停/上限写出来，由用户自己判断。
         车牌、每分钟收益、状态、已停时长都直接来自游戏车库数据（state.php 的 userCars）。
@@ -3480,9 +3512,8 @@ class ParkingBot(_PluginBase):
                                          "gap": "8px", "flexWrap": "wrap"}},
                      "content": [
                          ParkingBot._badge(str(item.get("status", "")), status_color),
-                         ParkingBot._command_hint(
-                             f"/挪车 {number}", can_unpark,
-                             "" if can_unpark else button_text),
+                         ParkingBot._unpark_btn(number, can_unpark, button_text,
+                                                unpark_api),
                          *([ParkingBot._park_btn(number, free_spots, api)]
                            if idle else []),
                      ]},
@@ -4217,6 +4248,7 @@ class ParkingBot(_PluginBase):
         pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
         ticket_api = f"plugin/{pid}/ticket"
         park_api = f"plugin/{pid}/park"
+        unpark_api = f"plugin/{pid}/unpark"
         howto_card = self._card(
             "怎么操作",
             "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
@@ -4241,7 +4273,7 @@ class ParkingBot(_PluginBase):
         elif tab == "garage":
             sections = [self._card(
                 "我的车库",
-                f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰；"
+                f"停车不足 {min_duration} 分钟的车不能挪走，按钮会标灰；"
                 f"当前已停 {self._to_int(snapshot.get('parked_total'), 0)}"
                 f"/{self._to_int(snapshot.get('car_max'), 1)}"
                 f"（手动停车不受这个上限限制）",
@@ -4249,7 +4281,7 @@ class ParkingBot(_PluginBase):
                               self._to_int(snapshot.get("free_spots"), 0),
                               self._to_int(snapshot.get("parked_total"), 0),
                               self._to_int(snapshot.get("car_max"), 1),
-                              park_api)])]
+                              park_api, unpark_api)])]
         else:
             sections = [self._stats_page(daily, history, today_earned)]
 
