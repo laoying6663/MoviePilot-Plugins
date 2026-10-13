@@ -59,7 +59,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -767,8 +767,7 @@ class ParkingBot(_PluginBase):
                 })
             # 排序口径必须与 _ordered_my_cars 完全一致，
             # 否则页面显示的序号和 /挪车 接受的序号会错位。
-            rank = {"停车中": 0, "爱心停车": 1, "空闲": 2}
-            cars.sort(key=lambda item: (rank.get(item["status"], 3), -item["rate"]))
+            cars.sort(key=lambda item: (self._car_rank(item["status"]), -item["rate"]))
             for index, item in enumerate(cars, start=1):
                 item["no"] = index
 
@@ -1303,15 +1302,45 @@ class ParkingBot(_PluginBase):
         名下车辆的统一排序口径：停车中的在前，其次爱心车位、空闲，
         同组内按每分钟收益从高到低。
 
-        菜单里显示的序号和 /挪车 接受的序号都基于它，两边必须一致。
+        菜单里显示的序号和 /挪车 接受的序号都基于它。排序键走 _car_rank，
+        与写快照时的口径完全一致 —— 两边若各写一套，游戏一旦新增状态字段
+        就会出现「页面显示第 1 辆，/挪车 1 挪的却是另一辆」。
         """
         user_id = state.get("userId")
         mine = [c for c in (state.get("userCars") or [])
                 if str(c.get("userId")) == str(user_id)]
-        rank = {"parked": 0, "charity": 1, "idle": 2}
-        mine.sort(key=lambda c: (rank.get(c.get("status"), 3),
+        mine.sort(key=lambda c: (self._car_rank(c.get("status")),
                                  -self._earn_per_min(c, cars_map)))
         return mine
+
+    # 排序权重表同时收录游戏原始状态与展示用中文，写快照时传的是后者、
+    # /挪车 解析时传的是前者，查同一张表即可保证两边永远一致。
+    _STATUS_RANK = {
+        "停车中": 0, "parked": 0,
+        "爱心停车": 1, "charity": 1,
+        "空闲": 2, "idle": 2,
+    }
+
+    @classmethod
+    def _car_rank(cls, status: Any) -> int:
+        """
+        按状态给出排序权重：停车中 0、爱心停车 1、空闲 2。
+
+        刻意不做任何状态转换，直接查表 —— 若在这里先转成显示名，
+        已经被转换过的中文会再走一次转换而被兜底成「停车中」，
+        导致爱心车位和空闲车混进同一组、页面序号与指令序号错位。
+        未知状态按「停车中」处理，与游戏前端 status !== 'idle' 的口径一致。
+        """
+        return cls._STATUS_RANK.get(status, 0)
+
+    @staticmethod
+    def _display_status(raw_status: Any) -> str:
+        """把游戏原始状态映射成展示用中文。"""
+        if raw_status == "idle":
+            return "空闲"
+        if raw_status == "charity":
+            return "爱心停车"
+        return "停车中"
 
     def _resolve_car_ref(self, token: str, ordered: List[dict]) -> Optional[str]:
         """
@@ -1710,7 +1739,7 @@ class ParkingBot(_PluginBase):
         车牌、每分钟收益、状态、已停时长都直接来自游戏车库数据（state.php 的 userCars）。
         """
         cards = []
-        for item in cars:
+        for position, item in enumerate(cars, start=1):
             idle = item.get("status") == "空闲"
             minutes = int(item.get("mins") or 0)
             can_unpark = (not idle) and minutes >= min_duration
@@ -1720,6 +1749,11 @@ class ParkingBot(_PluginBase):
                 button_text = "立即挪车"
             else:
                 button_text = f"还需 {min_duration - minutes} 分钟"
+
+            # 序号兜底取列表位置：插件刚升级时页面上可能还是上一版写的快照，
+            # 那种快照没有 no 字段，直接取会渲染成「/挪车 None」。
+            # 列表顺序与 _ordered_my_cars 的排序口径一致，所以位置就是指令序号。
+            number = item.get("no") or position
 
             if idle:
                 status_color = "#9E9E9E"
@@ -1750,7 +1784,7 @@ class ParkingBot(_PluginBase):
                                      {"fontSize": "12px", "color": status_color,
                                       "marginTop": "4px", "marginBottom": "10px"}),
                     ParkingBot._command_hint(
-                        f"/挪车 {item.get('no')}", can_unpark,
+                        f"/挪车 {number}", can_unpark,
                         "" if can_unpark else button_text,
                     ),
                 ],
