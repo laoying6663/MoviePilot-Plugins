@@ -113,6 +113,12 @@ class TradePickRequest(BaseModel):
         default=None, description="要换成的目标车型 ID；留空表示退出选车模式")
 
 
+class TicketRequest(BaseModel):
+    """车位卡片「贴条」按钮的请求体。"""
+
+    spot_id: Any = Field(description="要贴条的车位 ID（车位主人的车位）")
+
+
 class TitleSetRequest(BaseModel):
     """切换佩戴的称号。0 表示取消佩戴（游戏里是同一个接口、同一个 0）。"""
 
@@ -169,6 +175,12 @@ _MEDAL_SVG = ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@">'
               'S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z'
               'm-1-13h2v6h-2zm0 8h2v2h-2z" fill="#ffd700"/>'
               '<circle cx="12" cy="12" r="3" fill="#ffd700"/></svg>')
+# 贴条图标，照抄游戏雪碧图里的 <symbol id="ico-ticket">。
+_TICKET_SVG = ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@">'
+               '<path d="M22 10V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v4c1.1 0 2 .9 2 2s-.9 2-2 2v4'
+               'c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-4c-1.1 0-2-.9-2-2s.9-2 2-2z" '
+               'fill="#e94560"/><path d="M9 7h2v10H9zm4 0h2v10h-2z" '
+               'fill="rgba(0,0,0,0.3)"/></svg>')
 # 游戏站点的静态资源根目录。游戏把头像/车图存成相对路径（如 assets/avatars/a.png），
 # 插件页在 MoviePilot 里渲染，相对路径会指到 MoviePilot 自己身上，所以要补全成绝对地址。
 _GAME_BASE = "https://qcw.tangpt.top/"
@@ -207,7 +219,7 @@ class ParkingBot(_PluginBase):
     # 拼图图标。仓库里的图标文件必须叫 Parking_A.png —— 原来的
     # Parking_A.jpg 取不到（404）。.jpg 原图仍留在仓库里作为存档。
     plugin_icon = "Parking_A.png"
-    plugin_version = "1.19.0"
+    plugin_version = "1.20.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -269,6 +281,8 @@ class ParkingBot(_PluginBase):
     _shop_bought = 0
     _shop_diff = 0
     _shop_traded = 0
+    # 贴条罚款收入。同样并进「当日收益」，否则这笔真金白银在统计页上凭空消失。
+    _shop_fined = 0
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -1354,6 +1368,9 @@ class ParkingBot(_PluginBase):
             bucket["bought"] = self._to_int(bucket.get("bought"), 0) + self._shop_bought
             bucket["diff"] = self._to_int(bucket.get("diff"), 0) + self._shop_diff
             bucket["traded"] = self._to_int(bucket.get("traded"), 0) + self._shop_traded
+            # 贴条罚款是收入，和挪车收益同一口径，一并进当日收益
+            bucket["earned"] = self._to_int(bucket.get("earned"), 0) + self._shop_fined
+            self._shop_fined = 0
             self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
             daily[day_key] = bucket
 
@@ -1442,6 +1459,8 @@ class ParkingBot(_PluginBase):
         out = {
             "label": f"{kind} {index}",
             "kind": kind,
+            # 贴条按钮要拿车位 ID 去调 ticket.php，快照里必须带上
+            "spotId": spot.get("id"),
             "occupant": cls._spot_occupant(spot, state, cars_map),
             "free": True,
         }
@@ -1479,7 +1498,19 @@ class ParkingBot(_PluginBase):
             out["exp"] = min(mins * per_min, limit)
         else:
             cap = cls._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=0)
-            out["earn"] = min(mins * cls._to_int(definition.get("earnPerMin"), 0), cap)
+            gain = min(mins * cls._to_int(definition.get("earnPerMin"), 0), cap)
+            out["earn"] = gain
+            # 贴条：别人停在我私家车位够久，我可以贴条罚他。
+            # 罚款就是这个车位预估收益按分成比例切给我的一部分
+            # （游戏规则页：贴条时停车收益分成，车位主人得 TICKET_OWNER_PERCENT%）。
+            # 自己停自己车位上的车不给贴条按钮 —— 游戏那边也只在 !isMyCar 时给。
+            if not out["mine"]:
+                percent = cls._to_int(rules.get("TICKET_OWNER_PERCENT"), 90,
+                                      minimum=0, maximum=100)
+                min_ticket = cls._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
+                out["ticketFine"] = gain * percent // 100
+                out["ticketReady"] = mins >= min_ticket
+                out["ticketWait"] = max(0, min_ticket - mins)
         return out
 
     @classmethod
@@ -2111,7 +2142,54 @@ class ParkingBot(_PluginBase):
         return {"component": "span", "props": {"style": {"lineHeight": "0"}}, "html": html}
 
     @staticmethod
-    def _spot_grid(spots: List[dict]) -> dict:
+    def _ticket_row(spot: dict, api: str) -> Optional[dict]:
+        """
+        车位卡片底部的贴条区：预计罚款 + 贴条按钮。
+
+        样式照游戏 .btn-ticket（玫红底白字）。停不够 MIN_TICKET_TIME 时按钮压暗
+        并且不挂事件 —— 页面上的灰按钮是真点不动的，好过按下去被服务端驳回。
+        """
+        if spot.get("ticketFine") is None:
+            return None
+        ready = bool(spot.get("ticketReady"))
+        wait = ParkingBot._to_int(spot.get("ticketWait"), 0)
+        btn = {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "alignItems": "center", "gap": "4px",
+                "marginTop": "8px", "padding": "5px 12px", "fontSize": "11px",
+                "fontWeight": "bold", "borderRadius": "14px", "userSelect": "none",
+                "whiteSpace": "nowrap",
+                "cursor": "pointer" if ready else "not-allowed",
+                "color": "#FFFFFF" if ready else "rgba(255,255,255,0.5)",
+                "backgroundColor": ("rgba(233,69,96,0.85)" if ready
+                                    else "rgba(233,69,96,0.22)"),
+            }},
+            "content": [
+                {"component": "span",
+                 "props": {"style": {"display": "flex", "flexShrink": "0"}},
+                 "html": _TICKET_SVG.replace("@SIZE@", "12px")},
+                ParkingBot._text("贴条", {}),
+            ],
+        }
+        if ready:
+            btn["events"] = {"click": {
+                "api": api, "method": "post",
+                "params": {"spot_id": spot.get("spotId")}}}
+        hint = ParkingBot._text(
+            f"再等 {wait} 分钟可贴条" if not ready else "已到可贴条时长",
+            {"fontSize": "10px", "opacity": "0.6", "marginTop": "4px"})
+        fine = ParkingBot._coin(
+            ParkingBot._fmt_num(spot.get("ticketFine")), size=12, color=_GOLD,
+            bold=True, label="贴条收益",
+            style={"marginTop": "4px", "justifyContent": "center"})
+        return {"component": "div",
+                "props": {"style": {"display": "flex", "flexDirection": "column",
+                                    "alignItems": "center"}},
+                "content": [fine, btn, hint]}
+
+    @staticmethod
+    def _spot_grid(spots: List[dict], api: str) -> dict:
         """
         我的车位：照游戏本体的画法，两列网格。
 
@@ -2182,6 +2260,9 @@ class ParkingBot(_PluginBase):
                     ParkingBot._fmt_num(spot.get("earn")), size=14, color=_GOLD,
                     bold=True, label="预估收益", style={"marginTop": "2px"})
 
+            # 贴条：别人停我车位够久就能罚他一笔。爱心车位、自己停自己车不给。
+            ticket_row = ParkingBot._ticket_row(spot, api)
+
             cards.append({
                 "component": "div",
                 "props": {"style": {
@@ -2210,7 +2291,7 @@ class ParkingBot(_PluginBase):
                                      {"fontSize": "12px", "opacity": "0.72",
                                       "marginTop": "6px"}),
                     detail,
-
+                    ticket_row,
                 ],
             })
         if not cards:
@@ -2746,6 +2827,16 @@ class ParkingBot(_PluginBase):
                 "description": "记下要换成的目标车型，页面据此列出可用的空闲车；传空 car_id 表示取消",
             },
             {
+                "path": "/ticket",
+                "endpoint": self.api_ticket,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "给占我车位的车贴条",
+                "response_model": ApiResult,
+                "description": "按车位 ID 调用游戏 ticket.php 贴条；须为自己的私家车位、"
+                              "车已停够 MIN_TICKET_TIME 且不是自己的车",
+            },
+            {
                 "path": "/title",
                 "endpoint": self.api_set_title,
                 "methods": ["POST"],
@@ -2834,6 +2925,78 @@ class ParkingBot(_PluginBase):
             # 落盘失败只影响下次打开时的显示，本次的返回值照样是成功
             logger.warning(f"[不可躺自动抢车位] 保存称号快照失败：{err}")
         return True
+
+    async def api_ticket(self, request: TicketRequest) -> ApiResult:
+        """
+        给停在我私家车位上的别人的车贴条。
+
+        游戏规则（js/modules/parking.js 的 ticketCar + 规则页）：
+        只能贴自己的私家车位、爱心车位不行、车位上得有车、车得停够
+        MIN_TICKET_TIME 分钟；罚款是该车位预估收益按 TICKET_OWNER_PERCENT 分给我
+        的那一份。这里五道都在后端再校验一遍 —— 页面上的置灰只是提示。
+        """
+        if not self.get_state():
+            return _result({"success": False, "error": "插件未启用"})
+        spot_key = str(getattr(request, "spot_id", "") or "").strip()
+        if not spot_key:
+            return _result({"success": False, "error": "缺少车位 ID"})
+
+        cookie = await self._resolve_cookie()
+        if not cookie:
+            return _result({"success": False,
+                            "error": self._sso_error or "未取到登录 Cookie"})
+        client = AsyncRequestUtils(cookies=cookie, timeout=20)
+        state = await client.get_json(f"{self.API_BASE}/state.php")
+        if not state or not state.get("success"):
+            return _result({"success": False, "error": "登录状态失效，请检查站点 Cookie"})
+
+        user_id = state.get("userId")
+        spot = next((s for s in self._dict_rows(state.get("parkingSpots"))
+                     if str(s.get("id")) == spot_key), None)
+        if not spot:
+            return _result({"success": False, "error": "车位不存在"})
+        # 原样透传车位 ID，不做字符串化：游戏那边发的是数字（ticketCar(spot.id)），
+        # 服务端按数字取值。先用字符串比较定位车位，命中后回传原始值。
+        raw_spot_id = spot.get("id")
+        if str(spot.get("ownerId")) != str(user_id):
+            return _result({"success": False, "error": "只能给自己的车位贴条"})
+        if spot.get("spotType") == "charity":
+            return _result({"success": False, "error": "爱心车位不能贴条"})
+        car_in_spot = spot.get("carInSpot")
+        if not car_in_spot:
+            return _result({"success": False, "error": "车位上没有车"})
+        car = next((c for c in self._dict_rows(state.get("userCars"))
+                    if str(c.get("id")) == str(car_in_spot)), None)
+        if car is None:
+            return _result({"success": False, "error": "车位上的车已不在"})
+        if str(car.get("userId")) == str(user_id):
+            return _result({"success": False, "error": "自己停的车不用贴条"})
+
+        rules = state.get("gameSettings") or {}
+        min_ticket = self._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
+        parked_at = self._parse_time(spot.get("parkedTime"))
+        mins = max(0, int((self._now_naive() - parked_at).total_seconds() / 60)) \
+            if parked_at else 0
+        if mins < min_ticket:
+            return _result({"success": False,
+                            "error": f"停放不足 {min_ticket} 分钟，还差 {min_ticket - mins} 分钟"})
+
+        result = await client.post_json(f"{self.API_BASE}/ticket.php",
+                                       json={"spotId": raw_spot_id})
+        if not result or not result.get("success"):
+            return _result({"success": False,
+                            "error": (result or {}).get("error") or "贴条失败"})
+        fine = self._to_int(result.get("fine"), 0, minimum=0)
+        exp = self._to_int(result.get("expGained"), 0, minimum=0)
+        # 罚款是真金白银的收入，并进当天统计（和挪车收益同一口径）
+        self._shop_fined += fine
+        await self._refresh_snapshot(client, "贴条")
+        note = f"贴条 {self._car_name(car, await self._load_cars_map(client))}，罚款 {fine} 金"
+        if exp:
+            note += f"，经验 +{exp}"
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "fine": fine, "expGained": exp})
 
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
@@ -3917,6 +4080,8 @@ class ParkingBot(_PluginBase):
         #
         # 执行历史已挪到「金币统计」页，车库页不再夹带。
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
+        ticket_api = (f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}"
+                      f"/ticket")
         howto_card = self._card(
             "怎么操作",
             "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
@@ -3934,8 +4099,8 @@ class ParkingBot(_PluginBase):
         if tab == "spots":
             sections = [self._card(
                 "我的车位",
-                "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
-                [self._spot_grid(self._dict_rows(snapshot.get("spots")))]), howto_card]
+                "私家车位被别人的车停够规定时长后可以贴条，罚款按停车收益分成给自己",
+                [self._spot_grid(self._dict_rows(snapshot.get("spots")), ticket_api)]), howto_card]
         elif tab == "shop":
             sections = self._build_shop(snapshot)
         elif tab == "garage":
