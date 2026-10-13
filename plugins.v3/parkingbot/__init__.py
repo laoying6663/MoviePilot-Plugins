@@ -2485,6 +2485,24 @@ class ParkingBot(_PluginBase):
                 "response_model": ApiResult,
                 "description": "记录详情页当前展示的区块；渲染器随后会重新拉取页面，只下发这一块",
             },
+            {
+                "path": "/shop_filter",
+                "endpoint": self.api_shop_filter,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "车市分类筛选",
+                "response_model": ApiResult,
+                "description": "记录车市页当前选中的车型分类；分类名必须来自车型表，不认外部输入",
+            },
+            {
+                "path": "/trade_pick",
+                "endpoint": self.api_trade_pick,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "开始或取消以旧换新",
+                "response_model": ApiResult,
+                "description": "记下要换成的目标车型，页面据此列出可用的空闲车；传空 car_id 表示取消",
+            },
         ]
 
     async def api_set_tab(self, request: TabSwitch) -> ApiResult:
@@ -2498,26 +2516,76 @@ class ParkingBot(_PluginBase):
         if tab not in dict(self._TABS):
             return _result({"success": False, "error": f"未知区块：{tab}"})
         self._tab = tab
-        saved = {"tab": tab}
+        saved: Dict[str, Any] = {"tab": tab}
         # day 只在「金币统计」页有意义；非空且格式合法才认
         day = str(getattr(request, "day", "") or "").strip()
         if day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
             self._day = day
             saved["day"] = day
+        await self._save_view(saved)
+        return _result({"success": True, "name": dict(self._TABS)[tab]})
+
+    async def _save_view(self, patch: Dict[str, Any]) -> None:
+        """
+        把 view 状态读出来、合并这次的改动再写回。
+
+        必须读改写：切页签、选分类、选旧车是三组独立操作。原先直接
+        async_save_data({"tab": ...}) 是整份覆盖，切一次页签就会把车市里
+        选好的分类和待换新的目标车型一起冲掉。
+        """
+        stored = await self.async_get_data("view") or {}
+        saved = dict(stored) if isinstance(stored, dict) else {}
+        saved.update(patch)
         try:
             await self.async_save_data("view", saved)
         except Exception as err:
-            # 记不住只影响下次打开时回到默认页签，不该让点击直接失败
-            logger.warning(f"[不可躺自动抢车位] 保存详情页页签失败：{err}")
-        return _result({"success": True, "name": dict(self._TABS)[tab]})
+            # 记不住只影响下次打开时回到默认状态，不该让点击直接失败
+            logger.warning(f"[不可躺自动抢车位] 保存详情页状态失败：{err}")
 
-    async def api_buy_car(self, car_id: Any) -> ApiResult:
+    async def api_shop_filter(self, request: ShopFilterRequest) -> ApiResult:
+        """车市顶部分类胶囊：记住当前只看哪个分类。"""
+        snapshot = (self._page_cache or {}).get("snapshot") or {}
+        known = self._shop_categories(snapshot.get("catalog") or [])
+        category = str(getattr(request, "category", "") or "").strip()
+        # 只认快照里真实存在的分类名；空串表示看全部车型
+        if category and category not in known:
+            return _result({"success": False, "error": f"未知车型分类：{category}"})
+        self._cat = category
+        await self._save_view({"cat": category})
+        return _result({"success": True, "category": category or "全部"})
+
+    async def api_trade_pick(self, request: TradePickRequest) -> ApiResult:
+        """
+        车市卡片「以旧换新」的第一步：记下要换成哪辆车，页面随即列出可用的空闲车。
+
+        和游戏一致：卡片上只有一个「以旧换新」入口，具体拿哪辆空闲车去换交给
+        下一步 —— 名下可能同时有好几辆空闲车，替用户猜一辆就是替他花钱。
+        传空 car_id 表示放弃这次换新。
+        """
+        car_key = str(getattr(request, "car_id", "") or "").strip()
+        if not car_key:
+            self._trade_for = ""
+            await self._save_view({"trade_for": ""})
+            return _result({"success": True, "canceled": True})
+        snapshot = (self._page_cache or {}).get("snapshot") or {}
+        level = self._to_int(snapshot.get("level"), 1, minimum=1)
+        target = next((c for c in (snapshot.get("catalog") or [])
+                       if str(c.get("id")) == car_key
+                       and self._to_int(c.get("level"), 1, minimum=1) <= level), None)
+        if not target:
+            return _result({"success": False, "error": "该车型不可换（不存在或等级不足）"})
+        self._trade_for = car_key
+        await self._save_view({"trade_for": car_key})
+        return _result({"success": True, "name": target.get("name", "")})
+
+    async def api_buy_car(self, request: CarBuyRequest) -> ApiResult:
         """
         购买车辆。
 
         等级、金币、车辆上限三项都在后端复核一遍。页面上的置灰只是提示，
         真正的规则必须由后端把关，否则绕过界面就能买超限的车。
         """
+        car_id = getattr(request, "car_id", None)
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
         client, state, cars_map, err = await self._load_game_context()
@@ -2558,12 +2626,14 @@ class ParkingBot(_PluginBase):
         return _result({"success": True, "name": name, "price": price,
                 "expGained": self._to_int(result.get("expGained"), 0)})
 
-    async def api_trade_in(self, old_car_id: Any, new_car_id: Any) -> ApiResult:
+    async def api_trade_in(self, request: CarTradeRequest) -> ApiResult:
         """
         以旧换新。
 
         与买车同理，等级、补价、旧车归属与状态都在后端校验。
         """
+        old_car_id = getattr(request, "old_car_id", None)
+        new_car_id = getattr(request, "new_car_id", None)
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
         old_key = str(old_car_id if old_car_id is not None else "").strip()
