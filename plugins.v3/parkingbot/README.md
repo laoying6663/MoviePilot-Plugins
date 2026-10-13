@@ -82,17 +82,25 @@ Telegram / Slack 上发 `/车库` 会直接收到**可点的按钮**。
 
 ## 插件图标
 
-市场页的图标取自**仓库根目录的 `icons/` 文件夹**，走 `/plugin_icon/<文件名>`，
-取不到就显示 MoviePilot 自带的拼图图标。所以必须同时满足两条：
+市场页的图标取法在前端 `MoviePilot-Frontend/src/components/cards/PluginCard.vue` 里写死了，
+只有两条路：
 
-1. `package.v3.json` 的 `icon` 与代码里的 `plugin_icon` **都等于文件名本身**（不带路径）—— 现在都是 `Parking_A.png`
-2. 该文件实际存在于仓库根目录的 **`icons/Parking_A.png`** —— 放在 `plugins.v3/parkingbot/` 里是**取不到的**
+```js
+if (plugin_icon?.startsWith('http'))  return getProxyImageUrl(plugin_icon, ...)  // 后端代拉
+return `./plugin_icon/${plugin_icon}`                                                // nginx 本机静态目录
+```
 
-这是实测出来的：同仓库的「动态企微可信IP（自用版）」图标是 `icons/Wecom_A.png`，
-`/plugin_icon/Wecom_A.png` 返回 200；而放在插件目录里的图标一律 404。
-所以跟格式、跟大小都没关系，**纯粹是目录位置**。
+所以：
 
-`Parking_A.jpg`（原始设计稿，1024×1024）作为存档留在仓库里，不作图标用。
+- **写完整 URL**（本插件现在的做法）→ 走 MoviePilot 后端的图片代理
+  `/api/v1/system/img/{proxy}?imgurl=…`，由后端去拉这个地址。图标跟着仓库走，
+  不用往 MoviePilot 主机上放任何文件
+- **只写文件名** → 拼成 `./plugin_icon/<文件名>`，由 **nginx 直接读本机静态目录**
+  （响应头 `Server: nginx/1.26.3` + `ETag` + `Last-Modified` 就是本地静态文件的特征）。
+  这个目录**不会**从 GitHub 仓库自动同步，把文件传到仓库 `icons/` 对它没有任何作用
+
+仓库里的 `icons/Parking_A.png` 是给第二种方式准备的存档（原始设计稿 `Parking_A.jpg` 同理）；
+第一种方式靠的也是这个地址，只是由后端去拉。
 
 ## 车库里的「立即停到他人车位」
 
