@@ -2934,7 +2934,7 @@ class ParkingBot(_PluginBase):
         """
         车型表里出现过的分类，去重且保持原顺序。
 
-        不写死「代步车 / 普通私家车 / …」那六個名字：分类是游戏侧下发的，
+        不写死「代步车 / 普通私家车 / …」那六个名字：分类是游戏侧下发的，
         照抄一份常量只会和真实车型表对不上。车型表按价格升序，价格从低到高
         正好是代步车 → 普通 → 精致 → 高级，胶囊顺序自然也就对了。
         """
@@ -3068,18 +3068,101 @@ class ParkingBot(_PluginBase):
         }))
         return {"component": "div", "props": {"style": {}}, "content": content}
 
+    def _trade_picker(self, target: dict, idle_cars: List[dict],
+                      price_by_id: Dict[str, int], cash: int,
+                      trade_api: str, pick_api: str) -> dict:
+        """
+        以旧换新的第二步：挑一辆空闲车换。
+
+        游戏点「以旧换新」会弹列表让你选旧车，这里照做 —— 名下可能同时有好几辆
+        空闲车，替用户挑一辆就是替他花钱。只有比目标车便宜的空闲车才列得出来：
+        接口本身也只接受「换更贵的车」，列出来一堆按不动的选项反而误导。
+        """
+        target_name = str(target.get("name") or "目标车型")
+        target_price = self._to_int(target.get("price"), 0)
+        rows = []
+        for car in idle_cars:
+            old_price = price_by_id.get(str(car.get("carId")), 0)
+            if old_price >= target_price:
+                continue
+            diff = target_price - old_price
+            rows.append({
+                "component": "div",
+                "props": {"style": {
+                    "display": "flex", "alignItems": "center", "gap": "10px",
+                    "padding": "10px", "marginBottom": "6px", "borderRadius": "10px",
+                    "backgroundColor": "rgba(255,255,255,0.04)",
+                }},
+                "content": [
+                    ParkingBot._pic(str(car.get("image") or ""),
+                                    str(car.get("name") or "车")[:1], 40),
+                    {"component": "div",
+                     "props": {"style": {"flex": "1 1 auto", "minWidth": "0"}},
+                     "content": [
+                         ParkingBot._text(str(car.get("name") or "车辆"),
+                                          {"fontSize": "13px", "fontWeight": "bold"}),
+                         ParkingBot._text(f"{self._to_int(car.get('rate'), 0)}金/分钟",
+                                          {"fontSize": "11px", "color": _SHOP_EARN}),
+                     ]},
+                    ParkingBot._text(f"补 {ParkingBot._fmt_num(diff)} 金",
+                                     {"fontSize": "13px", "fontWeight": "bold",
+                                      "color": _GOLD, "whiteSpace": "nowrap"}),
+                    self._action_btn("换这辆", trade_api,
+                                     {"old_car_id": car.get("id"),
+                                      "new_car_id": target.get("id")},
+                                     disabled=diff > cash),
+                ],
+            })
+        content: List[dict] = [
+            self._text(f"选择要用以旧换新的车辆 → {target_name}",
+                       {"fontSize": "13px", "color": "#AAAAAA", "marginBottom": "8px"}),
+        ]
+        if rows:
+            content.append({"component": "div", "props": {"style": {}}, "content": rows})
+        else:
+            content.append(self._text(
+                "名下没有比它便宜的空闲车辆，暂时换不了",
+                {"fontSize": "12px", "color": _AMBER}))
+        content.append(self._action_btn("取消", pick_api, {"car_id": ""}, kind="trade"))
+        return self._card(
+            "以旧换新",
+            "旧车必须是空闲车，且要换成更贵的车型；金币不够的那辆按钮会置灰",
+            content)
+
     def _build_shop(self, snapshot: dict) -> List[dict]:
         """
-        构建车市区块：限时特卖 → 常规车市 → 以旧换新。
+        构建车市区块：选旧车面板 → 限时特卖 → 分类胶囊 + 车型卡片。
 
-        所有按钮是否可点在服务端还会再校验一遍，这里只是提前给出直观提示。
+        卡片上的「购买 / 以旧换新」是真按钮，直接 POST 到插件接口。能不能点由
+        现金、等级、车辆上限、空闲车四项决定，真正的规则校验在后端还会再做
+        一遍 —— 页面上点得动不代表一定买得成。
         """
         cash = self._to_int(snapshot.get("cash"), 0)
         level = self._to_int(snapshot.get("level"), 1, minimum=1)
         owned_count = self._to_int(snapshot.get("car_total"), 0)
         car_max = self._to_int(snapshot.get("car_max"), 10, minimum=1)
-        cars = snapshot.get("cars") or []
+        cars = [c for c in (snapshot.get("cars") or []) if isinstance(c, dict)]
+        catalog = [c for c in (snapshot.get("catalog") or []) if isinstance(c, dict)]
         blocks: List[dict] = []
+
+        pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        buy_api = f"plugin/{pid}/buy_car"
+        trade_api = f"plugin/{pid}/trade_in"
+        flash_api = f"plugin/{pid}/buy_flash"
+        pick_api = f"plugin/{pid}/trade_pick"
+        filter_api = f"plugin/{pid}/shop_filter"
+
+        price_by_id = {str(c.get("id")): self._to_int(c.get("price"), 0) for c in catalog}
+        idle_cars = [c for c in cars if c.get("status") == "空闲"]
+        full = owned_count >= car_max
+
+        # ---------- 以旧换新：正在挑旧车 ----------
+        wanted = str(getattr(self, "_trade_for", "") or "")
+        target = next((c for c in catalog if str(c.get("id")) == wanted
+                       and self._to_int(c.get("level"), 1, minimum=1) <= level), None)
+        if target:
+            blocks.append(self._trade_picker(target, idle_cars, price_by_id,
+                                             cash, trade_api, pick_api))
 
         # ---------- 限时 / 限量特卖 ----------
         flash = snapshot.get("flash") or []
@@ -3088,113 +3171,90 @@ class ParkingBot(_PluginBase):
             for sale in flash:
                 price = self._to_int(sale.get("price"), 0)
                 original = self._to_int(sale.get("original"), 0)
-                locked = self._to_int(sale.get("level"), 1) > level
+                need_level = self._to_int(sale.get("level"), 1)
+                locked = need_level > level
                 sold_out = (not sale.get("timed")) and self._to_int(sale.get("stock"), 0) > 0 \
                     and self._to_int(sale.get("sold"), 0) >= self._to_int(sale.get("stock"), 0)
-                lines = [(f"{price} 金", _GOLD), (f"{sale.get('earn', 0)} 金/分钟", _GREEN)]
+                lines = [(f"🪙 {ParkingBot._fmt_num(price)}", _GOLD),
+                         (f"{self._to_int(sale.get('earn'), 0)}金/分钟", _SHOP_EARN)]
                 if original > price:
-                    lines.insert(0, (f"原价 {original} 金", "#9E9E9E"))
+                    lines.insert(0, (f"原价 {ParkingBot._fmt_num(original)} 金", "#9E9E9E"))
                 if locked:
-                    lines.append((f"需要 Lv.{sale.get('level')}", _AMBER))
+                    lines.append((f"需要 Lv.{need_level}", _SHOP_LOCK))
+                    actions = None
                 elif sold_out:
-                    lines.append(("已售罄", _AMBER))
+                    lines.append(("已售罄", _SHOP_LOCK))
+                    actions = [self._action_btn("已售罄", flash_api,
+                                                {"sale_id": sale.get("id")}, disabled=True)]
                 else:
-                    lines.append((("限时特卖" if sale.get("timed") else f"仅剩 {self._to_int(sale.get('stock'), 0) - self._to_int(sale.get('sold'), 0)} 辆"), _PURPLE))
+                    lines.append((("限时特卖" if sale.get("timed") else
+                                   f"仅剩 {self._to_int(sale.get('stock'), 0) - self._to_int(sale.get('sold'), 0)} 辆"),
+                                  _PURPLE))
+                    actions = [self._action_btn("抢购", flash_api,
+                                                {"sale_id": sale.get("id")},
+                                                disabled=price > cash or full)]
+                    if price > cash:
+                        lines.append((f"还差 {ParkingBot._fmt_num(price - cash)} 金", _AMBER))
+                    elif full:
+                        lines.append((f"车辆已满（{car_max} 辆）", _AMBER))
                 items.append(self._item(
-                    str(sale.get("name", "特卖车型")), lines,
-                    self._command_hint(
-                        f"/抢购 {sale.get('id')}",
-                        not locked and not sold_out and price <= cash and owned_count < car_max,
-                        "等级不足" if locked else ("已售罄" if sold_out else ("金币不足" if price > cash else "")),
-                    ),
-                    accent="#FFD700",
-                    image=self._asset_url(sale.get("image")),
-                ))
+                    str(sale.get("name", "特卖车型")), lines, actions,
+                    accent=_GOLD, image=self._asset_url(sale.get("image")),
+                    locked=locked))
             blocks.append(self._card(
-                "限时 / 限量特卖", "折扣车辆，按场次限购或限时，过期失效；等级不足或金币不够则指令标灰",
-                [{"component": "div",
-                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
-                  "content": items}],
+                "限时 / 限量特卖",
+                "折扣车辆，按场次限购或限时，过期失效；等级不足或金币不够则按钮置灰",
+                [self._grid(items)],
             ))
 
-        # ---------- 常规车市 ----------
-        catalog = snapshot.get("catalog") or []
+        # ---------- 车市 ----------
         if catalog:
+            categories = self._shop_categories(catalog)
+            # 游戏默认停在第一个分类（代步车）；记住的分类不在表里就退回第一个
+            current = self._cat if self._cat in categories else (categories[0] if categories else "")
+            visible = [c for c in catalog
+                       if not current or str(c.get("category") or "") == current]
+            if not visible:
+                visible = catalog
             items = []
-            for car in catalog:
+            for car in visible:
                 price = self._to_int(car.get("price"), 0)
                 need_level = self._to_int(car.get("level"), 1, minimum=1)
                 locked = need_level > level
                 mine_count = sum(1 for c in cars
                                  if str(c.get("carId")) == str(car.get("id")))
-                lines = [
-                    (f"{price} 金", _GOLD),
-                    (f"{car.get('earn', 0)} 金/分钟", _GREEN),
-                ]
-                if car.get("category"):
-                    lines.append((str(car["category"]), "#9E9E9E"))
+                lines = [(f"🪙 {ParkingBot._fmt_num(price)}", _GOLD),
+                         (f"{self._to_int(car.get('earn'), 0)}金/分钟", _SHOP_EARN)]
                 if mine_count:
-                    lines.append((f"已拥有 {mine_count} 辆", _CYAN))
+                    lines.append((f"✓ 已拥有{mine_count}辆", _SHOP_OWNED))
                 if locked:
-                    lines.append((f"需要 Lv.{need_level}", _AMBER))
-                hint = ""
-                if locked:
-                    hint = f"需要 Lv.{need_level}"
-                elif price > cash:
-                    hint = f"还差 {price - cash} 金"
-                elif owned_count >= car_max:
-                    hint = f"车辆已满（{car_max} 辆）"
+                    lines.append((f"需要 Lv.{need_level}", _SHOP_LOCK))
+                    actions = None
+                else:
+                    upgradable = [c for c in idle_cars
+                                  if price_by_id.get(str(c.get("carId")), 0) < price]
+                    actions = [
+                        self._action_btn("购买", buy_api, {"car_id": car.get("id")},
+                                         disabled=full or price > cash),
+                        self._action_btn("以旧换新", pick_api, {"car_id": car.get("id")},
+                                         kind="trade", disabled=not upgradable),
+                    ]
+                    if full:
+                        lines.append((f"车辆已满（{car_max} 辆）", _AMBER))
+                    elif price > cash:
+                        lines.append((f"还差 {ParkingBot._fmt_num(price - cash)} 金", _AMBER))
+                    elif not upgradable:
+                        lines.append(("没有更便宜的空闲车可换", _AMBER))
                 items.append(self._item(
-                    str(car.get("name", "未知车型")), lines,
-                    self._command_hint(f"/买车 {car.get('id')}", not hint, hint),
-                    image=car.get("image") or "",
-                ))
+                    str(car.get("name", "未知车型")), lines, actions,
+                    image=car.get("image") or "", locked=locked))
             blocks.append(self._card(
-                "车市", f"当前金币 {cash}，车辆 {owned_count}/{car_max} 辆，购买需等级与金币均达标；指令已填好",
-                [{"component": "div",
-                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
-                  "content": items}],
+                "车市",
+                f"当前金币 {ParkingBot._fmt_num(cash)}，车辆 {owned_count}/{car_max} 辆；"
+                f"按钮直接扣金币，可用性在后端还会再校验一次",
+                [self._cat_pills(categories, current, filter_api), self._grid(items)],
             ))
-
-        # ---------- 以旧换新 ----------
-        price_by_id = {str(c.get("id")): self._to_int(c.get("price"), 0) for c in catalog}
-        idle_cars = [c for c in cars if c.get("status") == "空闲"]
-        if idle_cars:
-            items = []
-            for car in idle_cars:
-                old_price = price_by_id.get(str(car.get("carId")), 0)
-                upgrades = [
-                    c for c in catalog
-                    if self._to_int(c.get("price"), 0) > old_price
-                    and self._to_int(c.get("level"), 1) <= level
-                ][:3]  # 最多列 3 个升级目标，手机上不至于刷屏
-                buttons = []
-                for target in upgrades:
-                    diff = self._to_int(target.get("price"), 0) - old_price
-                    afford = diff <= cash
-                    buttons.append(self._command_hint(
-                        f"/换车 {car.get('id')} {target.get('id')}", afford,
-                        "" if afford else f"还差 {diff - cash} 金（换成 {target.get('name','')}）",
-                    ))
-                if not buttons:
-                    buttons = [ParkingBot._text(
-                        "当前等级/金币下暂无可换的更贵车型",
-                        {"fontSize": "11px", "opacity": "0.6", "marginTop": "6px"})]
-                items.append(self._item(
-                    str(car.get("name", "车辆")),
-                    [(f"当前价值 {old_price} 金", _GOLD),
-                     (f"{car.get('rate', 0)} 金/分钟", _GREEN)],
-                    {"component": "div", "props": {"style": {}}, "content": buttons},
-                    accent="#00E676",
-                    image=car.get("image") or "",
-                ))
-            blocks.append(self._card(
-                "以旧换新", "只有空闲车辆能作为旧车；只能换更贵的车型，按补价从低到高列出前 3 个目标（指令已填好）",
-                [{"component": "div",
-                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
-                  "content": items}],
-            ))
-        # 车型表拿不到（game_data.php 失败）且名下没有空闲车时，上面三段都不会产出。
+        # 车型表拿不到（game_data.php 失败）时上面两段都不会产出。
         # 仍然要给出这张卡：顶部「② 车市」的锚点指向这里，缺了锚点就点不动了。
         if not blocks:
             blocks.append(self._card(
