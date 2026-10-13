@@ -28,7 +28,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -90,6 +90,10 @@ class ParkingBot(_PluginBase):
     def get_state(self) -> bool:
         """返回插件是否启用。"""
         return self._enabled
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        """本插件不对外暴露后端 API，返回空列表。"""
+        return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         """按配置周期注册定时服务，每轮先挪车再停车。"""
@@ -399,7 +403,8 @@ class ParkingBot(_PluginBase):
             return
         self._auth_warned = True
         try:
-            self.post_message(message)
+            # post_message 的首个位置参数是 channel，正文必须走 text 关键字
+            self.post_message(title=self.plugin_name, text=message)
         except Exception as err:
             logger.error(f"[不可躺自动抢车位] 发送通知失败：{err}")
 
