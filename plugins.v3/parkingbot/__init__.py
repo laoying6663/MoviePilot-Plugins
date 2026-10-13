@@ -30,7 +30,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.4.2"
+    plugin_version = "1.5.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -350,6 +350,71 @@ class ParkingBot(_PluginBase):
         except (TypeError, ValueError):
             return cars_map.get(str(car_id))
 
+    async def _load_flash_sales(self, client: AsyncRequestUtils) -> List[dict]:
+        """
+        拉取限时/限量特卖列表。
+
+        这是一个锦上添花的功能，接口挂了或返回结构异常都不该影响停车挪车主流程，
+        所以整段都兜住异常并返回空列表 —— 解析部分必须放在 try 内部，
+        只包住请求那一行的话，返回非字典时仍会抛 AttributeError 打断主流程。
+        """
+        try:
+            data = await client.get_json(f"{self.API_BASE}/flash_sale.php")
+            if not isinstance(data, dict) or not data.get("success"):
+                return []
+            raw_sales = data.get("sales") or []
+            if not isinstance(raw_sales, list):
+                return []
+            sales = []
+            for item in raw_sales:
+                if not isinstance(item, dict):
+                    continue
+                sales.append({
+                    "id": item.get("id"),
+                    "name": str(item.get("carName") or "特卖车型"),
+                    "price": self._to_int(item.get("price"), 0, minimum=0),
+                    "original": self._to_int(item.get("originalPrice"), 0, minimum=0),
+                    "earn": self._to_int(item.get("earnPerMin"), 0, minimum=0),
+                    "level": self._to_int(item.get("levelReq"), 1, minimum=1),
+                    "timed": str(item.get("saleType") or "") == "timed",
+                    "endsAt": item.get("endsAt"),
+                    "stock": self._to_int(item.get("totalStock"), 0, minimum=0),
+                    "sold": self._to_int(item.get("soldCount"), 0, minimum=0),
+                })
+            return sales
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] 读取特卖列表失败，已忽略：{err}")
+            return []
+
+    async def _load_game_context(self) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
+        """
+        取出「HTTP 客户端 + 游戏状态 + 车型表」。
+
+        停车、买车、换车、抢购四个动作共用，避免四处各写一遍鉴权与错误处理。
+        第三个返回值非空即表示出错，此时前两项不可用。
+        """
+        cookie = await self._resolve_cookie()
+        if not cookie:
+            return None, None, {}, self._sso_error or "未取到登录 Cookie"
+        client = AsyncRequestUtils(cookies=cookie, timeout=20)
+        state = await client.get_json(f"{self.API_BASE}/state.php")
+        if not state or not state.get("success"):
+            await self._drop_cached_cookie()
+            return client, None, {}, f"登录状态失效：{(state or {}).get('error') or '游戏接口无响应'}"
+        return client, state, await self._load_cars_map(client), ""
+
+    async def _refresh_snapshot(self, client: Any, note: str) -> None:
+        """动作成功后重新取状态刷新快照；取不到就跳过，不影响已成功的动作。"""
+        try:
+            fresh = await client.get_json(f"{self.API_BASE}/state.php")
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] {note} 后刷新状态失败：{err}")
+            return
+        if fresh and fresh.get("success"):
+            await self._record_round(
+                client, fresh, fresh.get("userId"), 0, 0, 0, record_history=False,
+            )
+
     # ================================================================
     # 辅助方法
     # ================================================================
@@ -631,15 +696,20 @@ class ParkingBot(_PluginBase):
         new_parked: int,
         moved: int,
         earned: int,
+        record_history: bool = True,
     ) -> None:
         """
         记录本轮结果：账户快照 + 执行历史，供插件详情页展示。
 
         快照保存的是已经算好的展示字段，不再依赖游戏接口 —— 页面渲染走同步读，
         不会每次打开详情页都去打一次游戏。
+
+        :param record_history: 买卖类操作只是刷新展示，不该在执行历史里
+            留下一条「0 停车 / 0 挪车 / 0 收益」的噪声记录，传 False 跳过。
         """
         try:
             cars_map = await self._load_cars_map(client)
+            flash = await self._load_flash_sales(client)
             rules = state.get("gameSettings") or {}
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
@@ -657,6 +727,7 @@ class ParkingBot(_PluginBase):
                 status = car.get("status")
                 cars.append({
                     "id": car.get("id"),
+                    "carId": car.get("carId"),
                     "name": self._car_name(car, cars_map),
                     "rate": rate,
                     "status": "空闲" if status == "idle" else ("爱心停车" if status == "charity" else "停车中"),
@@ -686,8 +757,30 @@ class ParkingBot(_PluginBase):
                 "min_duration": min_duration,
                 "cars": cars,
                 "spots": spots,
+                # 车市需要的车型目录：价格、每分钟收益、等级门槛。
+                # 只带展示字段，避免把 image 之类的无用数据塞进快照。
+                "catalog": [
+                    {
+                        "id": item.get("id"),
+                        "name": str(item.get("name") or "未知车型"),
+                        "price": self._to_int(item.get("price"), 0, minimum=0),
+                        "earn": self._to_int(item.get("earnPerMin"), 0, minimum=0),
+                        "level": self._to_int(item.get("levelReq"), 1, minimum=1),
+                        "category": str(item.get("category") or ""),
+                    }
+                    for item in sorted(cars_map.values(), key=lambda c: self._to_int(c.get("price"), 0))
+                ],
+                "flash": flash,
             }
             await self.async_save_data("snapshot", snapshot)
+
+            if not record_history:
+                # 买卖类操作只刷新展示，历史保持原样
+                self._page_cache = {
+                    "snapshot": snapshot,
+                    "history": (self._page_cache or {}).get("history") or [],
+                }
+                return
 
             # 历史在内存里维护一份，避免每轮都读库。但插件重载会把模块重新执行、
             # 类属性复位，此时 _page_cache 为 None；若不先从数据库把历史捞回来，
@@ -1061,7 +1154,7 @@ class ParkingBot(_PluginBase):
             return datetime.now(pytz.utc)
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """注册「立即挪车」后端接口，供插件页面的按钮调用。"""
+        """注册插件页面按钮用到的后端接口。"""
         return [
             {
                 "path": "/unpark",
@@ -1070,8 +1163,178 @@ class ParkingBot(_PluginBase):
                 "auth": "bear",
                 "summary": "立即挪车",
                 "description": "按车辆 ID 执行一次挪车结算，停车不足游戏规定时长会被拒绝",
-            }
+            },
+            {
+                "path": "/buy_car",
+                "endpoint": self.api_buy_car,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "购买车辆",
+                "description": "按车型 ID 买车，等级、金币与车辆上限由后端二次校验",
+            },
+            {
+                "path": "/trade_in",
+                "endpoint": self.api_trade_in,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "以旧换新",
+                "description": "用一辆空闲车换更贵的车型",
+            },
+            {
+                "path": "/buy_flash",
+                "endpoint": self.api_buy_flash,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "抢购特卖车",
+                "description": "按特卖场次 ID 购买限时/限量车辆",
+            },
         ]
+
+    async def api_buy_car(self, car_id: Any) -> dict:
+        """
+        购买车辆。
+
+        等级、金币、车辆上限三项都在后端复核一遍。页面上的置灰只是提示，
+        真正的规则必须由后端把关，否则绕过界面就能买超限的车。
+        """
+        if not self.get_state():
+            return {"success": False, "error": "插件未启用"}
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return {"success": False, "error": err}
+
+        definition = self._lookup_car(cars_map, car_id)
+        if not definition:
+            return {"success": False, "error": "车型不存在"}
+
+        user_id = state.get("userId")
+        mine = (state.get("users") or {}).get(user_id) or {}
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        price = self._to_int(definition.get("price"), 0, minimum=0)
+        need_level = self._to_int(definition.get("levelReq"), 1, minimum=1)
+
+        if need_level > level:
+            return {"success": False, "error": f"等级不足，需要 Lv.{need_level}（当前 Lv.{level}）"}
+        if price > cash:
+            return {"success": False, "error": f"金币不足，还差 {price - cash} 金"}
+        owned = sum(1 for c in (state.get("userCars") or [])
+                    if str(c.get("userId")) == str(user_id))
+        max_cars = self._to_int((state.get("gameSettings") or {}).get("MAX_CARS"), 10, minimum=1)
+        if owned >= max_cars:
+            return {"success": False, "error": f"车辆已满（上限 {max_cars} 辆）"}
+
+        result = await client.post_json(
+            f"{self.API_BASE}/buy_car.php",
+            json={"carId": definition.get("id")},
+        )
+        if not result or not result.get("success"):
+            return {"success": False, "error": (result or {}).get("error") or "购买失败"}
+        name = definition.get("name") or "车辆"
+        await self._refresh_snapshot(client, "买车")
+        self._set_result(f"购买 {name}，花费 {price} 金币")
+        logger.info(f"[不可躺自动抢车位] 已购买 {name}，花费 {price} 金币")
+        return {"success": True, "name": name, "price": price,
+                "expGained": self._to_int(result.get("expGained"), 0)}
+
+    async def api_trade_in(self, old_car_id: Any, new_car_id: Any) -> dict:
+        """
+        以旧换新。
+
+        与买车同理，等级、补价、旧车归属与状态都在后端校验。
+        """
+        if not self.get_state():
+            return {"success": False, "error": "插件未启用"}
+        old_key = str(old_car_id if old_car_id is not None else "").strip()
+        if not old_key:
+            return {"success": False, "error": "缺少旧车 ID"}
+
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return {"success": False, "error": err}
+
+        # 旧车必须是我的车，且处于空闲状态（停着的车不能拿去换）
+        user_id = state.get("userId")
+        old_car = next((c for c in (state.get("userCars") or [])
+                        if str(c.get("id")) == old_key
+                        and str(c.get("userId")) == str(user_id)), None)
+        if not old_car:
+            return {"success": False, "error": "旧车不存在或不属于当前账号"}
+        if old_car.get("status") != "idle":
+            return {"success": False, "error": "只有空闲车辆能用来以旧换新"}
+
+        new_def = self._lookup_car(cars_map, new_car_id)
+        if not new_def:
+            return {"success": False, "error": "新车型不存在"}
+        old_def = self._lookup_car(cars_map, old_car.get("carId")) or {}
+        new_price = self._to_int(new_def.get("price"), 0, minimum=0)
+        old_price = self._to_int(old_def.get("price"), 0, minimum=0)
+        diff = new_price - old_price
+
+        if diff <= 0:
+            return {"success": False, "error": "只能换更贵的车"}
+        mine = (state.get("users") or {}).get(user_id) or {}
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        need_level = self._to_int(new_def.get("levelReq"), 1, minimum=1)
+        if need_level > level:
+            return {"success": False, "error": f"等级不足，需要 Lv.{need_level}（当前 Lv.{level}）"}
+        if diff > cash:
+            return {"success": False, "error": f"金币不足，还差 {diff - cash} 金"}
+
+        result = await client.post_json(
+            f"{self.API_BASE}/trade_in.php",
+            json={"oldCarInstanceId": old_car.get("id"), "newCarId": new_def.get("id")},
+        )
+        if not result or not result.get("success"):
+            return {"success": False, "error": (result or {}).get("error") or "换车失败"}
+        old_name = old_def.get("name") or "旧车"
+        new_name = new_def.get("name") or "新车"
+        await self._refresh_snapshot(client, "换车")
+        self._set_result(f"以旧换新 {old_name} → {new_name}，补价 {diff} 金币")
+        logger.info(f"[不可躺自动抢车位] 以旧换新 {old_name} → {new_name}，补价 {diff} 金币")
+        return {"success": True, "old": old_name, "new": new_name, "price": diff,
+                "expGained": self._to_int(result.get("expGained"), 0)}
+
+    async def api_buy_flash(self, sale_id: Any) -> dict:
+        """购买限时/限量特卖车辆。"""
+        if not self.get_state():
+            return {"success": False, "error": "插件未启用"}
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return {"success": False, "error": err}
+
+        sales = await self._load_flash_sales(client)
+        sale = next((s for s in sales
+                     if str(s.get("id")) == str(sale_id).strip()), None)
+        if not sale:
+            return {"success": False, "error": "特卖场次不存在或已结束"}
+
+        user_id = state.get("userId")
+        mine = (state.get("users") or {}).get(user_id) or {}
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        if sale.get("level", 1) > level:
+            return {"success": False, "error": f"等级不足，需要 Lv.{sale.get('level')}"}
+        if sale.get("price", 0) > cash:
+            return {"success": False, "error": f"金币不足，还差 {sale.get('price', 0) - cash} 金"}
+        owned = sum(1 for c in (state.get("userCars") or [])
+                    if str(c.get("userId")) == str(user_id))
+        max_cars = self._to_int((state.get("gameSettings") or {}).get("MAX_CARS"), 10, minimum=1)
+        if owned >= max_cars:
+            return {"success": False, "error": f"车辆已满（上限 {max_cars} 辆）"}
+
+        result = await client.post_json(
+            f"{self.API_BASE}/flash_sale.php",
+            json={"action": "buy", "saleId": sale.get("id")},
+        )
+        if not result or not result.get("success"):
+            return {"success": False, "error": (result or {}).get("error") or "抢购失败"}
+        await self._refresh_snapshot(client, "抢购")
+        name = sale.get("name") or "特卖车型"
+        self._set_result(f"抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
+        logger.info(f"[不可躺自动抢车位] 抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
+        return {"success": True, "name": name, "price": sale.get("price", 0)}
 
     async def api_unpark(self, car_id: Any) -> dict:
         """
@@ -1201,6 +1464,186 @@ class ParkingBot(_PluginBase):
             "content": cards,
         }
 
+    @staticmethod
+    def _item(title: str, lines: List[Tuple[str, str]], button: Optional[dict],
+              accent: str = "#4FC3F7") -> dict:
+        """车市里的一条：标题 + 若干「文本/颜色」行 + 一个按钮（可为 None）。"""
+        content = [ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold"})]
+        for text, color in lines:
+            content.append(ParkingBot._text(
+                text, {"fontSize": "12px", "color": color, "marginTop": "2px"}))
+        if button:
+            button = dict(button)
+            button["props"] = dict(button.get("props") or {})
+            button["props"]["style"] = {"marginTop": "8px"}
+            content.append(button)
+        return {
+            "component": "div",
+            "props": {"style": {
+                "flex": "1 1 260px",
+                "minWidth": "240px",
+                "margin": "0 8px 8px 0",
+                "border": "1px solid rgba(128,128,128,0.3)",
+                "borderLeft": f"3px solid {accent}",
+                "borderRadius": "8px",
+                "padding": "12px",
+            }},
+            "content": content,
+        }
+
+    @staticmethod
+    def _action_button(label: str, action: str, enabled: bool, hint: str = "") -> dict:
+        """
+        一个操作按钮。enabled 为 False 时置灰，并把原因显示在按钮上方。
+
+        onClick 用的是「动作:参数」约定，能否生效取决于 MoviePilot 前端
+        是否支持页面事件绑定 —— 后端接口本身是独立可用的。
+        """
+        content = []
+        if not enabled and hint:
+            content.append(ParkingBot._text(hint, {"fontSize": "11px", "color": "#FFB300"}))
+        button = {
+            "component": "VBtn",
+            "props": {
+                "block": True,
+                "size": "small",
+                "variant": "tonal",
+                "color": "primary" if enabled else "grey",
+                "disabled": not enabled,
+                "onClick": action,
+            },
+            "text": label,
+        }
+        return {"component": "div", "props": {"style": {"marginTop": "8px"}}, "content": content + [button]}
+
+    def _build_shop(self, snapshot: dict) -> List[dict]:
+        """
+        构建车市区块：限时特卖 → 常规车市 → 以旧换新。
+
+        所有按钮是否可点在服务端还会再校验一遍，这里只是提前给出直观提示。
+        """
+        cash = self._to_int(snapshot.get("cash"), 0)
+        level = self._to_int(snapshot.get("level"), 1, minimum=1)
+        owned_count = self._to_int(snapshot.get("car_total"), 0)
+        car_max = self._to_int(snapshot.get("car_max"), 10, minimum=1)
+        cars = snapshot.get("cars") or []
+        blocks: List[dict] = []
+
+        # ---------- 限时 / 限量特卖 ----------
+        flash = snapshot.get("flash") or []
+        if flash:
+            items = []
+            for sale in flash:
+                price = self._to_int(sale.get("price"), 0)
+                original = self._to_int(sale.get("original"), 0)
+                locked = self._to_int(sale.get("level"), 1) > level
+                sold_out = (not sale.get("timed")) and self._to_int(sale.get("stock"), 0) > 0 \
+                    and self._to_int(sale.get("sold"), 0) >= self._to_int(sale.get("stock"), 0)
+                lines = [(f"{price} 金", "#FFD700"), (f"{sale.get('earn', 0)} 金/分钟", "#00E676")]
+                if original > price:
+                    lines.insert(0, (f"原价 {original} 金", "#9E9E9E"))
+                if locked:
+                    lines.append((f"需要 Lv.{sale.get('level')}", "#FFB300"))
+                elif sold_out:
+                    lines.append(("已售罄", "#FFB300"))
+                else:
+                    lines.append((("限时特卖" if sale.get("timed") else f"仅剩 {self._to_int(sale.get('stock'), 0) - self._to_int(sale.get('sold'), 0)} 辆"), "#B388FF"))
+                items.append(self._item(
+                    str(sale.get("name", "特卖车型")), lines,
+                    self._action_button(
+                        "抢购", f"flash:{sale.get('id')}",
+                        enabled=not locked and not sold_out and price <= cash and owned_count < car_max,
+                        hint="等级不足" if locked else ("金币不足" if price > cash else ""),
+                    ),
+                    accent="#FFD700",
+                ))
+            blocks.append(self._card(
+                "限时 / 限量特卖", "折扣车辆，按场次限购或限时，过期失效",
+                [{"component": "div",
+                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
+                  "content": items}],
+            ))
+
+        # ---------- 常规车市 ----------
+        catalog = snapshot.get("catalog") or []
+        if catalog:
+            items = []
+            for car in catalog:
+                price = self._to_int(car.get("price"), 0)
+                need_level = self._to_int(car.get("level"), 1, minimum=1)
+                locked = need_level > level
+                mine_count = sum(1 for c in cars
+                                 if str(c.get("carId")) == str(car.get("id")))
+                lines = [
+                    (f"{price} 金", "#FFD700"),
+                    (f"{car.get('earn', 0)} 金/分钟", "#00E676"),
+                ]
+                if car.get("category"):
+                    lines.append((str(car["category"]), "#9E9E9E"))
+                if mine_count:
+                    lines.append((f"已拥有 {mine_count} 辆", "#4FC3F7"))
+                if locked:
+                    lines.append((f"需要 Lv.{need_level}", "#FFB300"))
+                hint = ""
+                if locked:
+                    hint = f"需要 Lv.{need_level}"
+                elif price > cash:
+                    hint = f"还差 {price - cash} 金"
+                elif owned_count >= car_max:
+                    hint = f"车辆已满（{car_max} 辆）"
+                items.append(self._item(
+                    str(car.get("name", "未知车型")), lines,
+                    self._action_button("购买", f"buy:{car.get('id')}",
+                                        enabled=not hint, hint=hint),
+                ))
+            blocks.append(self._card(
+                "车市", f"当前金币 {cash}，车辆 {owned_count}/{car_max} 辆，购买需等级与金币均达标",
+                [{"component": "div",
+                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
+                  "content": items}],
+            ))
+
+        # ---------- 以旧换新 ----------
+        price_by_id = {str(c.get("id")): self._to_int(c.get("price"), 0) for c in catalog}
+        idle_cars = [c for c in cars if c.get("status") == "空闲"]
+        if idle_cars:
+            items = []
+            for car in idle_cars:
+                old_price = price_by_id.get(str(car.get("carId")), 0)
+                upgrades = [
+                    c for c in catalog
+                    if self._to_int(c.get("price"), 0) > old_price
+                    and self._to_int(c.get("level"), 1) <= level
+                ][:3]  # 最多列 3 个升级目标，手机上不至于刷屏
+                buttons = []
+                for target in upgrades:
+                    diff = self._to_int(target.get("price"), 0) - old_price
+                    afford = diff <= cash
+                    buttons.append(self._action_button(
+                        f"换 {target.get('name', '')}（补 {diff} 金）",
+                        f"trade:{car.get('id')}:{target.get('id')}",
+                        enabled=afford,
+                        hint="" if afford else f"还差 {diff - cash} 金",
+                    ))
+                if not buttons:
+                    buttons = [ParkingBot._text(
+                        "当前等级/金币下暂无可换的更贵车型",
+                        {"fontSize": "11px", "opacity": "0.6", "marginTop": "6px"})]
+                items.append(self._item(
+                    str(car.get("name", "车辆")),
+                    [(f"当前价值 {old_price} 金", "#FFD700"),
+                     (f"{car.get('rate', 0)} 金/分钟", "#00E676")],
+                    {"component": "div", "props": {"style": {}}, "content": buttons},
+                    accent="#00E676",
+                ))
+            blocks.append(self._card(
+                "以旧换新", "只有空闲车辆能作为旧车；只能换更贵的车型，按补价从低到高列出前 3 个目标",
+                [{"component": "div",
+                  "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
+                  "content": items}],
+            ))
+        return blocks
+
     def get_page(self) -> List[dict]:
         """返回插件详情页：今日收益、下次运行倒计时、车库、我的车位与执行历史。"""
         snapshot, history = self._page_data()
@@ -1265,6 +1708,7 @@ class ParkingBot(_PluginBase):
                 f"数据来自游戏车库；停车不足 {min_duration} 分钟的车不能挪走，按钮置灰",
                 [self._garage(snapshot.get("cars") or [], min_duration)],
             ),
+            *self._build_shop(snapshot),
             self._card(
                 "我的车位",
                 "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
