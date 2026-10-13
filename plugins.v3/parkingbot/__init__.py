@@ -172,7 +172,9 @@ _MEDAL_SVG = ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@">'
 # 游戏站点的静态资源根目录。游戏把头像/车图存成相对路径（如 assets/avatars/a.png），
 # 插件页在 MoviePilot 里渲染，相对路径会指到 MoviePilot 自己身上，所以要补全成绝对地址。
 _GAME_BASE = "https://qcw.tangpt.top/"
-# 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图
+# 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图。
+# 走 backgroundImage 而不是 backgroundColor：插件页的渲染器只把 backgroundColor
+# 交给 CSS 的 background-color，渐变值会被丢掉，所以底色另外用实色兜住。
 _HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
           " rgba(255,255,255,0.015) 10px 20px)")
 
@@ -1751,7 +1753,10 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _stat(label: str, value: Any, color: str) -> dict:
-        """单个数字指标块。紫渐变底 + 小灰标签 + 大号彩值，对齐游戏车库页。"""
+        """单个数字指标块。紫色淡底 + 小灰标签 + 大号彩值，对齐游戏车库页。
+
+        底色是实色 rgba：渐变在插件页渲染不出来，原来那层紫色渐变底等于没写。
+        """
         return {
             "component": "div",
             "props": {"style": {
@@ -1761,7 +1766,7 @@ class ParkingBot(_PluginBase):
                 "padding": "12px 14px",
                 "borderRadius": "14px",
                 "border": "1px solid rgba(167,139,250,0.28)",
-                "backgroundColor": f"linear-gradient(135deg, rgba(167,139,250,0.20), rgba(34,211,238,0.08))",
+                "backgroundColor": "rgba(167,139,250,0.14)",
             }},
             "content": [
                 ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.72",
@@ -2129,7 +2134,10 @@ class ParkingBot(_PluginBase):
                         "borderRadius": "14px",
                         "border": ("1px solid rgba(255,77,109,0.28)" if charity
                                    else "1px solid rgba(34,211,238,0.24)"),
-                        "backgroundColor": _HATCH,
+                        # 底色用实色打底：插件页的渲染器不吃渐变，只写斜纹的话
+                        # 空闲位会退化成和被占用位几乎一样的背景，一眼看不出能不能停。
+                        "backgroundColor": "rgba(255,255,255,0.035)",
+                        "backgroundImage": _HATCH,
                     }},
                     "content": [
                         badge,
