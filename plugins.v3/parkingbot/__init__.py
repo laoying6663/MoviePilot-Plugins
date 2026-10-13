@@ -2398,7 +2398,7 @@ class ParkingBot(_PluginBase):
             self._reply_data(sender, "用法：/买车 车型ID",
                              "车型 ID 见插件详情页的车市区块。")
             return
-        result = await self.api_buy_car(args[0])
+        result = await self.api_buy_car(CarBuyRequest(car_id=args[0]))
         await self._after_action(result, sender, "买车")
 
     async def _cmd_trade(self, args: List[str], sender: dict) -> None:
@@ -2407,7 +2407,7 @@ class ParkingBot(_PluginBase):
             self._reply_data(sender, "用法：/换车 旧车ID 新车型ID",
                              "旧车必须是空闲车辆；两个 ID 见插件详情页。")
             return
-        result = await self.api_trade_in(args[0], args[1])
+        result = await self.api_trade_in(CarTradeRequest(old_car_id=args[0], new_car_id=args[1]))
         await self._after_action(result, sender, "换车")
 
     async def _cmd_flash(self, args: List[str], sender: dict) -> None:
@@ -2416,7 +2416,7 @@ class ParkingBot(_PluginBase):
             self._reply_data(sender, "用法：/抢购 场次ID",
                              "场次 ID 见插件详情页的「限时 / 限量特卖」区块。")
             return
-        result = await self.api_buy_flash(args[0])
+        result = await self.api_buy_flash(FlashBuyRequest(sale_id=args[0]))
         await self._after_action(result, sender, "抢购")
 
     async def _after_action(self, result: ApiResult, sender: dict, label: str) -> None:
@@ -2682,13 +2682,17 @@ class ParkingBot(_PluginBase):
         old_name = old_def.get("name") or "旧车"
         new_name = new_def.get("name") or "新车"
         await self._refresh_snapshot(client, "换车")
+        # 换完了就把选旧车的面板收掉，否则页面刷新后它还杵在最上面
+        self._trade_for = ""
+        await self._save_view({"trade_for": ""})
         self._set_result(f"以旧换新 {old_name} → {new_name}，补价 {diff} 金币")
         logger.info(f"[不可躺自动抢车位] 以旧换新 {old_name} → {new_name}，补价 {diff} 金币")
         return _result({"success": True, "old": old_name, "new": new_name, "price": diff,
                 "expGained": self._to_int(result.get("expGained"), 0)})
 
-    async def api_buy_flash(self, sale_id: Any) -> ApiResult:
+    async def api_buy_flash(self, request: FlashBuyRequest) -> ApiResult:
         """购买限时/限量特卖车辆。"""
+        sale_id = getattr(request, "sale_id", None)
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
         client, state, cars_map, err = await self._load_game_context()
