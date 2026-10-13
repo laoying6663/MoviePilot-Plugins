@@ -172,6 +172,12 @@ class ParkingBot(_PluginBase):
              ("garage", "③ 我的车库"), ("stats", "④ 金币统计"))
     _tab = "spots"
     _day = ""
+    # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
+    # 只在内存里跨这一轮传递，不单独落盘。
+    _shop_spent = 0
+    _shop_bought = 0
+    _shop_diff = 0
+    _shop_traded = 0
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -464,6 +470,9 @@ class ParkingBot(_PluginBase):
                     logger.warning(f"[不可躺自动抢车位] 自动以旧换新失败：{(result or {}).get('error') or '未知原因'}")
                     break
                 cash -= diff
+                # 记账给「数据统计」页用：换车补的差价是真金白银的支出
+                self._shop_diff += diff
+                self._shop_traded += 1
                 notes.append(
                     f"自动以旧换新：{self._car_name(car, cars_map)} → {target.get('name')}，"
                     f"补 {diff} 金，每分钟收益 +{gain}"
