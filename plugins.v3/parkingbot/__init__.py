@@ -74,6 +74,38 @@ class TabSwitch(BaseModel):
     day: Optional[str] = Field(default=None, description="要查看的日期 YYYY-MM-DD，留空取最新")
 
 
+class CarBuyRequest(BaseModel):
+    """车市卡片「购买」按钮的请求体。"""
+
+    car_id: Any = Field(description="要买的车型 ID")
+
+
+class CarTradeRequest(BaseModel):
+    """以旧换新确认后的请求体（旧车是车辆实例 ID，新车是车型 ID）。"""
+
+    old_car_id: Any = Field(description="拿去做旧车的车辆实例 ID")
+    new_car_id: Any = Field(description="换成的目标车型 ID")
+
+
+class FlashBuyRequest(BaseModel):
+    """特卖卡片「抢购」按钮的请求体。"""
+
+    sale_id: Any = Field(description="特卖场次 ID")
+
+
+class ShopFilterRequest(BaseModel):
+    """车市顶部分类胶囊的请求体。"""
+
+    category: str = Field(default="", description="只看该分类；留空表示看全部车型")
+
+
+class TradePickRequest(BaseModel):
+    """车市卡片「以旧换新」按钮的请求体：先选旧车，再确认换。"""
+
+    car_id: Optional[Any] = Field(
+        default=None, description="要换成的目标车型 ID；留空表示退出选车模式")
+
+
 def _result(payload: Dict[str, Any]) -> ApiResult:
     """
     把接口内部构造的字典收敛成宿主要求的三键响应信封。
@@ -99,6 +131,12 @@ _GREEN = "#00E676"
 _PINK = "#FF4D6D"
 _AMBER = "#FFB300"
 _MUTED = "rgba(255,255,255,0.62)"
+# 车市卡片单独用游戏 style.css 里的原始值，不跟通用配色混：卡片价格是 #ffd700、
+# 收益是纯绿 #0f0、「已拥有 N 辆」是青色 #0df、等级不足是玫红 #e94560。
+# 这几个值是从 qcw.tangpt.top/style.css 的 .car-card / .category-tab 抄的。
+_SHOP_EARN = "#00FF00"
+_SHOP_OWNED = "#00DDFF"
+_SHOP_LOCK = "#E94560"
 # 游戏站点的静态资源根目录。游戏把头像/车图存成相对路径（如 assets/avatars/a.png），
 # 插件页在 MoviePilot 里渲染，相对路径会指到 MoviePilot 自己身上，所以要补全成绝对地址。
 _GAME_BASE = "https://qcw.tangpt.top/"
