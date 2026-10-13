@@ -10,6 +10,7 @@ import random
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
 
 import pytz
 from apscheduler.triggers.cron import CronTrigger
@@ -29,7 +30,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.0.2"
+    plugin_version = "1.1.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -40,6 +41,12 @@ class ParkingBot(_PluginBase):
     API_BASE = "https://qcw.tangpt.top/api"
     # 「站点管理」中用于定位目标站点的域名关键字
     SITE_KEYWORD = "tangpt.top"
+    # 主站 SSO：生成一次性票据后经跳转链把游戏会话 Cookie 下发下来。
+    # app_id 取自游戏前端登出逻辑里的跳转地址，即该游戏在主站注册的应用标识。
+    SSO_URL = "https://www.tangpt.top/tp-open-connect/sso/generate"
+    SSO_APP_ID = "app_DapZ0NZ28EFu"
+    # 游戏 Cookie 缓存有效期（秒）。票据是一次性的，缓存后不必每个周期都去主站打接口。
+    COOKIE_TTL = 3600
     # 一次性任务的 job id，停用时据此取消
     ONCE_JOB_ID = "parkingbot_run_once"
 
@@ -156,8 +163,8 @@ class ParkingBot(_PluginBase):
         if not cookie:
             self._set_result("缺少登录 Cookie")
             self._notify_once(
-                "未取到登录 Cookie：请确认 MoviePilot「站点管理」中已添加并登录 tangpt.top，"
-                "或在插件配置里手动填写游戏 Cookie。"
+                "未取到登录 Cookie：请确认「站点管理」中已添加并成功登录 tangpt.top"
+                "（插件会用它自动换取游戏会话），或在本插件配置里手动填写游戏 Cookie。"
             )
             return
 
@@ -165,10 +172,12 @@ class ParkingBot(_PluginBase):
         state = await client.get_json(f"{self.API_BASE}/state.php")
         if not state or not state.get("success"):
             reason = (state or {}).get("error") or "游戏接口无响应"
+            # 缓存的游戏会话可能已失效，清掉让下一轮重新走主站 SSO 换取
+            await self._drop_cached_cookie()
             self._set_result(f"获取状态失败：{reason}")
             self._notify_once(
-                f"登录状态失效：{reason}。请到「站点管理」重新登录 tangpt.top，"
-                "或更新插件配置中的游戏 Cookie。"
+                f"登录状态失效：{reason}。请确认「站点管理」中 tangpt.top 的 Cookie 仍然有效；"
+                "若主站已掉线需重新登录，或在插件配置里手动填写游戏 Cookie。"
             )
             return
 
@@ -302,12 +311,89 @@ class ParkingBot(_PluginBase):
         """
         取得游戏所需的登录 Cookie。
 
-        优先使用配置中手填的 Cookie；留空时回落到 MoviePilot「站点管理」里
-        tangpt.top 站点已保存的 Cookie。用子串而非精确域名匹配，是因为站点
-        在库里的 key 可能是 tangpt.top，也可能是 www.tangpt.top。
+        优先级：配置中手填的 Cookie > 上次 SSO 换到且未过期的缓存 > 现走一次主站 SSO。
         """
         if self._cookie:
             return self._cookie
+        cached = await self._load_cached_cookie()
+        if cached:
+            return cached
+        return await self._exchange_cookie_via_sso()
+
+    async def _load_cached_cookie(self) -> str:
+        """读取缓存的游戏会话 Cookie，未记录或已过期返回空串。"""
+        try:
+            state = await self.async_get_data("game_cookie") or {}
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] 读取 Cookie 缓存失败：{err}")
+            return ""
+        cookie = str(state.get("cookie") or "")
+        try:
+            age = datetime.now().timestamp() - float(state.get("at") or 0)
+        except (TypeError, ValueError):
+            return ""
+        return cookie if cookie and age < self.COOKIE_TTL else ""
+
+    async def _drop_cached_cookie(self) -> None:
+        """确认 Cookie 失效后清掉缓存，让下一轮重新走 SSO 换取。"""
+        try:
+            await self.async_save_data("game_cookie", {})
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] 清除 Cookie 缓存失败：{err}")
+
+    async def _exchange_cookie_via_sso(self) -> str:
+        """
+        用主站 Cookie 走一次 SSO，换取游戏站会话 Cookie。
+
+        游戏站是独立子域，主站的登录 Cookie 不足以通过 /api/state.php 鉴权，
+        必须先由主站 SSO 生成票据，再经跳转链把游戏会话下发下来。
+
+        这里逐跳手动跟随跳转并自行收集 Set-Cookie：交给 httpx 自动跟随时，
+        会话 Cookie 留在内部 client 上，调用方取不出来。
+        """
+        site_cookie = await self._site_cookie()
+        if not site_cookie:
+            return ""
+
+        jar = self._parse_cookie_header(site_cookie)
+        client = AsyncRequestUtils(cookies=jar, timeout=20)
+        url = f"{self.SSO_URL}?app_id={self.SSO_APP_ID}"
+        try:
+            for _ in range(6):  # 跳转链通常 2~3 跳，留足冗余即可
+                resp = await client.get_res(url, allow_redirects=False)
+                if resp is None:
+                    logger.error(f"[不可躺自动抢车位] 主站 SSO 请求失败：{url}")
+                    return ""
+                for name, value in resp.cookies.items():
+                    jar[name] = value
+                if resp.status_code not in (301, 302, 303, 307, 308):
+                    break
+                location = resp.headers.get("location")
+                if not location:
+                    break
+                url = urljoin(url, location)
+        except Exception as err:
+            logger.error(f"[不可躺自动抢车位] 主站 SSO 换取 Cookie 异常：{err}")
+            return ""
+
+        cookie = "; ".join(f"{name}={value}" for name, value in jar.items())
+        try:
+            await self.async_save_data(
+                "game_cookie",
+                {"cookie": cookie, "at": datetime.now().timestamp()},
+            )
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] Cookie 缓存落盘失败：{err}")
+        logger.info("[不可躺自动抢车位] 已通过主站 SSO 获取游戏会话 Cookie")
+        return cookie
+
+    async def _site_cookie(self) -> str:
+        """
+        读取 MoviePilot「站点管理」中 tangpt.top 站点已保存的 Cookie。
+
+        用子串而非精确域名匹配，是因为站点在库里的 key 可能是 tangpt.top，
+        也可能是 www.tangpt.top。
+        """
         try:
             oper = SiteOper()
             # 站点查询走异步入口，避免在事件循环里执行同步数据库调用
@@ -320,6 +406,16 @@ class ParkingBot(_PluginBase):
         except Exception as err:
             logger.error(f"[不可躺自动抢车位] 读取「站点管理」Cookie 失败：{err}")
         return ""
+
+    @staticmethod
+    def _parse_cookie_header(header: str) -> Dict[str, str]:
+        """把 Cookie 请求头字符串拆成字典，只取第一个等号前的键名。"""
+        jar: Dict[str, str] = {}
+        for part in str(header or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name:
+                jar[name] = value
+        return jar
 
     def _parked_minutes(self, car: dict) -> float:
         """
@@ -521,8 +617,9 @@ class ParkingBot(_PluginBase):
                                          "model": "cookie",
                                          "label": "[可选] 游戏 Cookie",
                                          "rows": 2,
-                                         "hint": "留空则自动复用「站点管理」中 tangpt.top 的 Cookie。"
-                                                 "若主站 Cookie 无法登录游戏，可在此粘贴 qcw.tangpt.top 的 Cookie。",
+                                         "hint": "一般无需填写。留空时插件会自动用「站点管理」中 tangpt.top 的"
+                                                 "主站 Cookie 走 SSO 换取游戏会话；仅当主站 SSO 不可用时，"
+                                                 "才需要在此粘贴 qcw.tangpt.top 的 Cookie。",
                                      }}
                                 ],
                             }
