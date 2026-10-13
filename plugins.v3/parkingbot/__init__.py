@@ -258,6 +258,10 @@ class ParkingBot(_PluginBase):
             saved_view = {}
         saved_tab = str(saved_view.get("tab") or "").strip()
         self._tab = saved_tab if saved_tab in dict(self._TABS) else "spots"
+        # 车市页的两个临时状态：选中的车型分类、以及正在「选旧车换新」的目标车型。
+        # 分类直接取快照里真实存在的分类名，不认任何外部输入。
+        self._cat = str(saved_view.get("cat") or "").strip()
+        self._trade_for = str(saved_view.get("trade_for") or "").strip()
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
