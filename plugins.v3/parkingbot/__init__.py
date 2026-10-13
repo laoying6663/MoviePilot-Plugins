@@ -230,7 +230,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.24.0"
+    plugin_version = "1.25.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -666,6 +666,46 @@ class ParkingBot(_PluginBase):
             return note
         return ""
 
+    def _disable_auto_buy_if_full(self, owned: int, max_cars: int) -> str:
+        """
+        车队满员时，把「自动买车」这个开关自己关掉。
+
+        满员之后游戏必然拒绝买车，每轮再撞一次只是白费一次请求；更别扭的是
+        设置里那个开关还亮着，看着像还在买，实际一辆都进不来。关掉是对现状的
+        如实反映，比留一个永远失败的开关强。
+
+        只关不自动打开：车位数是靠卖车、换新、被动事件变化的，什么时候重新开
+        交给用户自己判断 —— 插件擅自打开一个会真花钱的开关，风险比关掉大得多。
+
+        返回一句摘要供详情页展示；已经是关的则返回空串（每轮都会被问到，
+        但只有第一次会产生实际动作和通知）。
+        """
+        if not self._auto_buy:
+            return ""
+        # 基类 update_config 走的是 save_config_data(config_data=config)，
+        # 属于**整体覆盖**而不是合并。所以必须先取回完整配置再改这一个字段，
+        # 否则 enabled / cron / max_cars 等其它项会被一起抹掉。
+        config = self.get_config() or {}
+        if not isinstance(config, dict):
+            config = {}
+        config["auto_buy"] = False
+        try:
+            self.update_config(config)
+        except Exception as err:
+            # 写配置失败也不能影响本轮停车的正常流程
+            logger.error(f"[不可躺自动抢车位] 关闭自动买车失败：{err}")
+            return ""
+        self._auto_buy = False
+        note = f"车辆已满（{owned}/{max_cars}），已自动关闭「自动买车」"
+        logger.info(f"[不可躺自动抢车位] {note}")
+        if self._notify:
+            try:
+                # post_message 的首个位置参数是 channel，正文必须走 text 关键字
+                self.post_message(title=self.plugin_name, text=note)
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 发送通知失败：{err}")
+        return note
+
     async def _auto_buy_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
                             user_id: Any) -> str:
         """
@@ -683,7 +723,8 @@ class ParkingBot(_PluginBase):
         my_cars = [c for c in (state.get("userCars") or [])
                    if str(c.get("userId")) == str(user_id)]
         if len(my_cars) >= max_cars:
-            return ""
+            # 满员就顺手把「自动买车」关掉，别让一个必然失败的开关一直亮着
+            return self._disable_auto_buy_if_full(len(my_cars), max_cars)
         if not my_cars:
             logger.info("[不可躺自动抢车位] 名下没有车辆，自动买车将补上第一辆")
 
