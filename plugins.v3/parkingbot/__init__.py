@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.28.0"
+    plugin_version = "1.29.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -893,7 +893,7 @@ class ParkingBot(_PluginBase):
                 # run_once 没有兜底 try，一个异常就会让整轮停车挪车全部中断。
                 try:
                     cars[int(car_id)] = item
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     cars[str(car_id)] = item
             self._cars_cache = cars
         return self._cars_cache or {}
@@ -907,7 +907,7 @@ class ParkingBot(_PluginBase):
             return cars_map[car_id]
         try:
             return cars_map.get(int(car_id))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return cars_map.get(str(car_id))
 
     async def _load_flash_sales(self, client: AsyncRequestUtils) -> List[dict]:
@@ -1297,13 +1297,17 @@ class ParkingBot(_PluginBase):
         JSON 里的浮点数（1000.0）和字符串小数（"12.7"）int(str(...)) 会直接抛，
         旧写法一律回落默认值 —— 页面于是把金币显示成 0，而 _fmt_num 又显示 1000，
         同一份数据两个数。所以这里先试浮点、再截断取整。
+
+        OverflowError 必须一起捕获：int(float("inf")) 抛的是它而不是 ValueError，
+        而 json.loads 默认接受 Infinity / 1e400 这类非标准写法并解析成 inf，
+        只捕 (TypeError, ValueError) 会让一个坏数字把整个插件页打成 500。
         """
         try:
             number = int(str(value).strip())
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             try:
                 number = int(float(str(value).strip()))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         if number < minimum:
             return minimum
@@ -2120,7 +2124,13 @@ class ParkingBot(_PluginBase):
 
         current = self._day if self._day in daily else days[0]
         bucket = daily.get(current) or {}
-        hours = bucket.get("hours") or {}
+        # bucket 本身和 bucket["hours"] 都得校验类型：落盘数据被改坏时
+        # "坏字符串" 是真值，`or {}` 兜不住，后面 hours.get() 直接 AttributeError。
+        if not isinstance(bucket, dict):
+            bucket = {}
+        hours = bucket.get("hours")
+        if not isinstance(hours, dict):
+            hours = {}
         day_earned, day_cost, day_net = day_row(current)
         month_prefix = current[:7]
         month_days = [d for d in days if str(d).startswith(month_prefix)]
@@ -2497,7 +2507,7 @@ class ParkingBot(_PluginBase):
                 continue
             try:
                 total += int(item.get("earned") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         return total
 
@@ -3229,7 +3239,7 @@ class ParkingBot(_PluginBase):
             return _result({"success": True, "canceled": True})
         snapshot = (self._page_cache or {}).get("snapshot") or {}
         level = self._to_int(snapshot.get("level"), 1, minimum=1)
-        target = next((c for c in (snapshot.get("catalog") or [])
+        target = next((c for c in self._dict_rows(snapshot.get("catalog"))
                        if str(c.get("id")) == car_key
                        and self._to_int(c.get("level"), 1, minimum=1) <= level), None)
         if not target:
@@ -3621,7 +3631,7 @@ class ParkingBot(_PluginBase):
         cards = []
         for position, item in enumerate(cars, start=1):
             idle = item.get("status") == "空闲"
-            minutes = int(item.get("mins") or 0)
+            minutes = ParkingBot._to_int(item.get("mins"), 0)
             can_unpark = (not idle) and minutes >= min_duration
             if idle:
                 button_text, status_color = "空闲中", "#9E9E9E"
@@ -3819,10 +3829,13 @@ class ParkingBot(_PluginBase):
 
         车市价格必须用这个 —— 网页版上 3000 金显示成「3,000」，插件里再显示成
         「3000」就等于没复刻。
+
+        OverflowError 与 _to_int 同理必须捕获：int(float("inf")) 抛的不是
+        ValueError，一个 Infinity 就会让整页渲染失败。
         """
         try:
             number = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             # None / 空串是「这个字段没有」，按 0 显示。直接回落 str(value)
             # 会让页面上出现字面量 None —— 老版本快照缺 gain 字段时，
             # 车库卡片就会显示「累计收益 $ None」。
@@ -4139,7 +4152,9 @@ class ParkingBot(_PluginBase):
                                              cash, trade_api, pick_api))
 
         # ---------- 限时 / 限量特卖 ----------
-        flash = snapshot.get("flash") or []
+        # 必须过 _dict_rows：快照是落盘数据，列表里混进 None 时下面 sale.get()
+        # 直接 AttributeError，三个页签一起挂。
+        flash = self._dict_rows(snapshot.get("flash"))
         if flash:
             items = []
             for sale in flash:
