@@ -88,9 +88,18 @@ def _result(payload: Dict[str, Any]) -> ApiResult:
     )
 
 # ---------- 详情页配色与图标 ----------
-# 与 MoviePilot 自身主题保持一致：主色用紫，强调色统一用它，页签高亮也就更醒目。
-_ACCENT = "#B388FF"
-_MUTED = "rgba(255,255,255,0.60)"
+# 取自游戏本体（qcw.tangpt.top）的配色：青为主色、紫为强调、金币金、
+# 收益绿、爱心位粉、警示琥珀。插件页跟着游戏走，看起来才像同一个东西。
+_CYAN = "#22D3EE"
+_PURPLE = "#A78BFA"
+_GOLD = "#FFD700"
+_GREEN = "#00E676"
+_PINK = "#FF4D6D"
+_AMBER = "#FFB300"
+_MUTED = "rgba(255,255,255,0.62)"
+# 空闲车位在游戏里是斜纹网格底，这里用纯 CSS 斜纹还原，不额外拉图
+_HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
+          " rgba(255,255,255,0.015) 10px 20px)")
 
 _ICONS = {
     "spots": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
@@ -1005,7 +1014,8 @@ class ParkingBot(_PluginBase):
             spots = []
             for index, spot in enumerate(my_spots, start=1):
                 kind = "爱心车位" if spot.get("spotType") == "charity" else "私家车位"
-                spots.append({"label": f"{kind} {index}", "occupant": self._spot_occupant(spot, state, cars_map)})
+                spots.append({"label": f"{kind} {index}", "kind": kind,
+                              "occupant": self._spot_occupant(spot, state, cars_map)})
 
             snapshot = {
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
