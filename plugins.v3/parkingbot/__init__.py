@@ -59,7 +59,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.6.1"
+    plugin_version = "1.7.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -90,6 +90,10 @@ class ParkingBot(_PluginBase):
     _max_cars = _default_max_cars
     _cookie = ""
     _notify = True
+    # 金币足够时自动买车（默认关闭：涉及真实支出，必须用户主动开启）
+    _auto_buy = False
+    # 差价足够时自动以旧换新（默认关闭，同上）
+    _auto_trade = False
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -121,6 +125,8 @@ class ParkingBot(_PluginBase):
                                       self._default_max_cars, minimum=1, maximum=10)
         self._cookie = str(config.get("cookie") or "").strip()
         self._notify = bool(config.get("notify", True))
+        self._auto_buy = self._as_switch(config.get("auto_buy"))
+        self._auto_trade = self._as_switch(config.get("auto_trade"))
         self._auth_warned = False
         self._cars_cache = {}
 
@@ -226,10 +232,14 @@ class ParkingBot(_PluginBase):
         target_minutes = max(self._park_minutes, min_duration)
 
         my_cars = [c for c in (state.get("userCars") or []) if c.get("userId") == user_id]
-        if not my_cars:
+        # 名下一辆车都没有时先看能不能自己买一辆 —— 否则「自动买车」开关对
+        # 新账号永远是死开关，因为这里会先一步 return 掉。
+        if not my_cars and not self._auto_buy:
             self._set_result("账号下没有车辆")
             logger.warning("[不可躺自动抢车位] 该账号名下没有任何车辆，无法执行自动停车")
             return
+        if not my_cars:
+            logger.info("[不可躺自动抢车位] 账号下没有车辆，尝试由自动买车补一辆")
 
         # 状态分三类：idle 空闲、charity 爱心停车、其余为普通停车。
         # 爱心车位是玩家主动做的公益停车，结算的是经验而非金币，
@@ -239,6 +249,43 @@ class ParkingBot(_PluginBase):
         charity = [c for c in my_cars if c.get("status") == "charity"]
         if charity:
             logger.debug(f"[不可躺自动抢车位] {len(charity)} 辆车停在爱心车位，不参与自动挪车")
+
+        # 自动买卖排在挪车/停车之前：新买的车、刚换上的车能在同一轮就停出去。
+        # 买卖会改变服务端状态，所以之后重新取一次状态，避免用到过期快照。
+        shop_note = ""
+        stale_after_shop = False
+        if self._auto_buy or self._auto_trade:
+            try:
+                shop_note = await self._auto_shop(
+                    client, state, await self._load_cars_map(client), user_id)
+                if shop_note:
+                    fresh = await client.get_json(f"{self.API_BASE}/state.php")
+                    if fresh and fresh.get("success"):
+                        state = fresh
+                        settings_map = state.get("gameSettings") or {}
+                        min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"),
+                                                    10, minimum=1)
+                        target_minutes = max(self._park_minutes, min_duration)
+                        my_cars = [c for c in (state.get("userCars") or [])
+                                   if c.get("userId") == user_id]
+                        parked = [c for c in my_cars if c.get("status") not in ("idle", "charity")]
+                        idle = [c for c in my_cars if c.get("status") == "idle"]
+                        charity = [c for c in my_cars if c.get("status") == "charity"]
+                    else:
+                        # 买卖已经改动了服务端状态，但状态没刷新回来。此时 parked/idle
+                        # 里还是旧的车实例 ID（以旧换新吃掉的那辆已经不存在了），
+                        # 继续挪车/停车就是拿废 ID 发请求。本轮到此为止，下一轮重来。
+                        stale_after_shop = True
+                        logger.warning(
+                            "[不可躺自动抢车位] 自动买卖后刷新状态失败，本轮跳过挪车与停车，"
+                            "避免用过期的车辆 ID 继续操作")
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 自动买卖异常：{err}")
+
+        if stale_after_shop:
+            self._set_result(shop_note or "状态刷新失败，本轮未挪车")
+            await self._record_round(client, state, user_id, 0, 0, 0, note=shop_note)
+            return
 
         earned_total, moved = await self._unpark_due_cars(client, parked, idle, target_minutes)
         new_parked = await self._park_idle_cars(
@@ -257,8 +304,112 @@ class ParkingBot(_PluginBase):
                 snapshot_state = fresh
         await self._record_round(
             client, snapshot_state, snapshot_state.get("userId") or user_id,
-            new_parked, moved, earned_total,
+            new_parked, moved, earned_total, note=shop_note,
         )
+
+    async def _auto_shop(self, client: Any, state: dict, cars_map: Dict[Any, dict],
+                         user_id: Any) -> str:
+        """
+        自动买车 / 自动以旧换新。
+
+        两个开关默认关闭，这里只在用户主动打开后才动真金白银。
+        每轮最多换一辆、买一辆：一次把金币抽干既不必要，也会让后续几轮
+        因为没钱而停摆。返回一句执行摘要，供详情页展示。
+        """
+        notes: List[str] = []
+        rules = state.get("gameSettings") or {}
+        mine = (state.get("users") or {}).get(user_id) or {}
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        max_cars = self._to_int(rules.get("MAX_CARS"), 10, minimum=1)
+        my_cars = [c for c in (state.get("userCars") or [])
+                   if str(c.get("userId")) == str(user_id)]
+
+        def affordable(price: int, need: int) -> bool:
+            return need <= level and price <= cash
+
+        # ---- 自动以旧换新：优先把每分钟收益最低的空闲车往上换 ----
+        if self._auto_trade:
+            idle_cars = sorted((c for c in my_cars if c.get("status") == "idle"),
+                               key=lambda c: self._earn_per_min(c, cars_map))
+            for car in idle_cars:
+                # 限时/限量车（carId 为 0）不可再生，换掉就再也买不回来了，
+                # 不拿它当自动换新的「旧车」，需要的话用 /换车 手动处理。
+                if car.get("carId") == 0:
+                    logger.debug("[不可躺自动抢车位] 限时车型不参与自动以旧换新")
+                    continue
+                old_rate = self._earn_per_min(car, cars_map)
+                old_def = self._lookup_car(cars_map, car.get("carId"))
+                if not old_def:
+                    # 车型表里查不到的车同样不碰：算不出旧价，差价无从谈起，
+                    # 贸然换掉有可能白扔一辆好车。
+                    logger.debug(
+                        "[不可躺自动抢车位] 车型 %s 不在车型表中，跳过自动以旧换新",
+                        car.get("carId"))
+                    continue
+                old_price = self._to_int(old_def.get("price"), 0, minimum=0)
+                best = None
+                for definition in cars_map.values():
+                    if not isinstance(definition, dict):
+                        continue
+                    price = self._to_int(definition.get("price"), 0, minimum=0)
+                    diff = price - old_price
+                    # 以旧换新只扣「差价」，不是新车的全价：旧车已经折价抵掉了大半。
+                    # 所以这里按差价卡金币门槛，全价高的车型也能换得起。
+                    if diff <= 0:
+                        continue
+                    if self._to_int(definition.get("levelReq"), 1, minimum=1) > level:
+                        continue
+                    if diff > cash:
+                        continue
+                    gain = self._to_int(definition.get("earnPerMin"), 0) - old_rate
+                    if gain <= 0:
+                        continue
+                    if best is None or gain > best[0]:
+                        best = (gain, definition, diff)
+                if best is None:
+                    continue
+                gain, target, diff = best
+                result = await self._post(client, "trade_in.php", {
+                    "oldCarInstanceId": car.get("id"),
+                    "newCarId": target.get("id"),
+                })
+                if not (result and result.get("success")):
+                    logger.warning(f"[不可躺自动抢车位] 自动以旧换新失败：{(result or {}).get('error') or '未知原因'}")
+                    break
+                cash -= diff
+                notes.append(
+                    f"自动以旧换新：{self._car_name(car, cars_map)} → {target.get('name')}，"
+                    f"补 {diff} 金，每分钟收益 +{gain}"
+                )
+                logger.info(f"[不可躺自动抢车位] {notes[-1]}")
+                break  # 每轮最多换一辆
+
+        # ---- 自动买车：买当前等级下、金币买得起、每分钟收益最高的那辆 ----
+        if self._auto_buy and len(my_cars) < max_cars:
+            best = None
+            for definition in cars_map.values():
+                if not isinstance(definition, dict):
+                    continue
+                price = self._to_int(definition.get("price"), 0, minimum=0)
+                if not affordable(price, self._to_int(definition.get("levelReq"), 1, minimum=1)):
+                    continue
+                earn = self._to_int(definition.get("earnPerMin"), 0)
+                if earn <= 0:
+                    continue
+                if best is None or earn > best[0]:
+                    best = (earn, definition, price)
+            if best is not None:
+                earn, target, price = best
+                result = await self._post(client, "buy_car.php", {"carId": target.get("id")})
+                if result and result.get("success"):
+                    notes.append(f"自动买车：{target.get('name')}，花费 {price} 金，每分钟收益 {earn}")
+                    logger.info(f"[不可躺自动抢车位] {notes[-1]}")
+                else:
+                    logger.warning(
+                        f"[不可躺自动抢车位] 自动买车失败：{(result or {}).get('error') or '未知原因'}")
+
+        return "；".join(notes)
 
     async def _unpark_due_cars(
         self,
@@ -691,6 +842,20 @@ class ParkingBot(_PluginBase):
         return re.sub(r"\s*([/,-])\s*", r"\1", text).strip()
 
     @staticmethod
+    def _as_switch(value: Any) -> bool:
+        """
+        严格解析开关型配置。
+
+        自动买车 / 自动以旧换新会真实扣金币，所以不能直接 bool(value)：
+        字符串 "false"、"0"、"no"、"off" 都会被 bool() 判成 True，等于把
+        「默认关闭」的承诺悄悄作废。除这些明确的否定写法外，一律按「没配」处理，
+        只有真正的 True / 1 才算开。
+        """
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return value is True or value == 1
+
+    @staticmethod
     def _to_int(value: Any, default: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
         """把配置值安全转成整数；非法值回落到默认值，越界值收敛到边界。"""
         try:
@@ -726,6 +891,7 @@ class ParkingBot(_PluginBase):
         moved: int,
         earned: int,
         record_history: bool = True,
+        note: str = "",
     ) -> None:
         """
         记录本轮结果：账户快照 + 执行历史，供插件详情页展示。
@@ -787,6 +953,7 @@ class ParkingBot(_PluginBase):
                 "parked_total": sum(1 for c in cars if c["status"] != "空闲"),
                 "pending_gain": sum(item["gain"] for item in cars),
                 "min_duration": min_duration,
+                "note": note,
                 "cars": cars,
                 "spots": spots,
                 # 车市需要的车型目录：价格、每分钟收益、等级门槛。
@@ -927,6 +1094,39 @@ class ParkingBot(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {
+                                         "model": "auto_buy",
+                                         "label": "金币足够时自动买车",
+                                         "hint": "默认关闭。打开后每轮最多买一辆："
+                                                 "当前等级下、金币买得起、每分钟收益最高的车型。"
+                                                 "会真实扣除金币，谨慎开启。",
+                                     }}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {
+                                         "model": "auto_trade",
+                                         "label": "差价足够时自动以旧换新",
+                                         "hint": "默认关闭。打开后每轮最多换一辆："
+                                                 "从每分钟收益最低的空闲车开始，换成差价付得起且收益更高的车型。"
+                                                 "只能换空闲车，停车中的车不参与。",
+                                     }}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {"component": "VTextField",
@@ -1011,6 +1211,8 @@ class ParkingBot(_PluginBase):
             "enabled": False,
             "onlyonce": False,
             "notify": True,
+            "auto_buy": False,
+            "auto_trade": False,
             "cron": "",
             "park_minutes": "",
             "max_cars": "",
@@ -1128,6 +1330,11 @@ class ParkingBot(_PluginBase):
             return self._page_cache.get("snapshot") or {}, self._page_cache.get("history") or []
         snapshot = self.get_data("snapshot") or {}
         history = self.get_data("history") or []
+        # 存档被写坏时（比如历史升级后结构变了）不能让整个详情页崩成 500，
+        # 退化成空数据即可，页面仍能看到框架和区块。
+        if not isinstance(snapshot, dict):
+            logger.warning("[不可躺自动抢车位] 账户快照格式异常，已按空数据展示")
+            snapshot = {}
         if not isinstance(history, list):
             history = []
         self._page_cache = {"snapshot": snapshot, "history": history}
@@ -1967,15 +2174,72 @@ class ParkingBot(_PluginBase):
                   "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
                   "content": items}],
             ))
+        # 车型表拿不到（game_data.php 失败）且名下没有空闲车时，上面三段都不会产出。
+        # 仍然要给出这张卡：顶部「② 车市」的锚点指向这里，缺了锚点就点不动了。
+        if not blocks:
+            blocks.append(self._card(
+                "② 车市",
+                "车型表与特卖列表暂时拿不到，下一轮执行成功后会自动补上",
+                [self._text("车市数据未加载",
+                            {"fontSize": "13px", "opacity": "0.8"})],
+            ))
         return blocks
 
+    @staticmethod
+    def _nav_row(items: List[Tuple[str, str]]) -> dict:
+        """
+        顶部切换栏。
+
+        插件页面是声明式 JSON，渲染器不绑定事件，做不了真正的 Tab 切换。
+        这里退而用锚点跳转：<a href="#id"> 是浏览器原生行为，不经过任何框架的
+        事件绑定，所以在「按钮点不动」的环境里依然可用。
+        三个区块本来就全部渲染出来，顶栏只是快速跳转，不是真正的互斥 Tab。
+        """
+        links = []
+        for label, anchor in items:
+            links.append({
+                "component": "a",
+                "props": {
+                    "href": f"#{anchor}",
+                    "style": {
+                        "display": "block",
+                        "flex": "1 1 90px",
+                        "margin": "0 6px 6px 0",
+                        "padding": "11px 8px",
+                        "textAlign": "center",
+                        "borderRadius": "8px",
+                        "border": "1px solid rgba(128,128,128,0.45)",
+                        "backgroundColor": "rgba(79,195,247,0.12)",
+                        "color": "#4FC3F7",
+                        "fontSize": "14px",
+                        "textDecoration": "none",
+                    },
+                },
+                "text": label,
+            })
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-6px"}},
+            "content": links,
+        }
+
+    @staticmethod
+    def _section(anchor: str, card: dict) -> dict:
+        """给区块套一层带锚点 id 的外壳，供顶部切换栏跳转。"""
+        return {
+            "component": "div",
+            "props": {"id": anchor, "style": {"scrollMarginTop": "12px"}},
+            "content": [card],
+        }
+
     def get_page(self) -> List[dict]:
-        """返回插件详情页：今日收益、下次运行倒计时、车库、我的车位与执行历史。"""
+        """返回插件详情页：顶部切换栏 + 我的车位 / 车市 / 我的车库三个区块。"""
         snapshot, history = self._page_data()
         today_earned = self._today_earned(history)
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
+        note = str(snapshot.get("note") or "")
 
-        # ---------- 概览指标 ----------
+        # ---------- 概览 ----------
         if snapshot:
             stats = [
                 self._stat("今日收益", today_earned, "#00E676"),
@@ -1985,7 +2249,7 @@ class ParkingBot(_PluginBase):
             ]
             header = f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
             subtitle = (f"执行周期 {self._cron or '未启用'}"
-                        f" · 停车中 {snapshot.get('parked_total', 0)}/{snapshot.get('car_total', 0)} 辆"
+                        f" · 车辆 {snapshot.get('car_total', 0)}/{snapshot.get('car_max', 10)} 辆"
                         f" · 数据时间 {snapshot.get('time', '-')}")
         else:
             stats = [
@@ -2001,70 +2265,104 @@ class ParkingBot(_PluginBase):
         if self._last_run_ts:
             last_run = f"{last_run}（{datetime.fromtimestamp(self._last_run_ts):%Y-%m-%d %H:%M:%S}）"
 
-        spot_rows = [[item.get("label", ""), item.get("occupant", "")]
-                     for item in (snapshot.get("spots") or [])]
-        history_rows = [[item.get("time", ""), str(item.get("parked", 0)),
-                         str(item.get("moved", 0)), str(item.get("earned", 0))]
-                        for item in history[:10]]
+        head_lines = [
+            self._text(header, {"fontSize": "18px", "fontWeight": "bold"}),
+            self._text(subtitle, {"fontSize": "12px", "opacity": "0.8", "marginBottom": "6px"}),
+            self._text(f"最近一轮：{last_run}",
+                       {"fontSize": "13px", "opacity": "0.85", "marginBottom": "2px"}),
+            self._text(f"本次进程累计挪车收益：{self._total_earned} 金币",
+                       {"fontSize": "13px", "opacity": "0.85"}),
+        ]
+        if note:
+            head_lines.append(self._text(
+                f"自动操作：{note}",
+                {"fontSize": "13px", "color": "#FFD700", "marginTop": "6px"}))
+
+        # 开关开着但这一轮没花钱（比如没找到划算的车型）时也给个提示，
+        # 否则用户会以为开关没生效。
+        shop_cards = self._build_shop(snapshot)
+        turned_on = [label for flag, label in ((self._auto_buy, "自动买车"),
+                                                (self._auto_trade, "自动以旧换新")) if flag]
+        if turned_on and not note:
+            head_lines.append(self._text(
+                f"{'、'.join(turned_on)}已开启，本轮没有满足条件的操作",
+                {"fontSize": "13px", "opacity": "0.85", "marginTop": "6px"}))
+
+        head_card = {
+            "component": "VCard",
+            "props": {"variant": "tonal", "color": "primary",
+                      "style": {"marginBottom": "12px"}},
+            "content": [{"component": "VCardText", "content": head_lines}],
+        }
+
+        howto_card = {
+            "component": "VCard",
+            "props": {"variant": "outlined", "color": "info",
+                      "style": {"marginBottom": "12px"}},
+            "content": [{"component": "VCardText", "content": [
+                self._text("怎么操作", {"fontSize": "15px", "fontWeight": "bold"}),
+                self._text("插件页面是只读展示区，点不了按钮。所有操作在聊天里发指令：",
+                           {"fontSize": "12px", "marginTop": "4px"}),
+                self._text("/车库　查看车库与可操作项　　/挪车 序号　立即结算",
+                           {"fontSize": "12px", "fontFamily": "monospace", "marginTop": "4px"}),
+                self._text("/买车 车型ID　　/换车 旧车ID 新车型ID　　/抢购 场次ID",
+                           {"fontSize": "12px", "fontFamily": "monospace"}),
+                self._text("在 Telegram / Slack 这类支持按钮回调的渠道上，发 /车库 会直接收到可点的按钮。",
+                           {"fontSize": "11px", "opacity": "0.75", "marginTop": "6px"}),
+            ]}],
+        }
+
+        garage_card = self._card(
+            "③ 我的车库",
+            f"数据来自游戏车库；停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
+            [self._garage(snapshot.get("cars") or [], min_duration)],
+        )
+
+        spots_card = self._card(
+            "① 我的车位",
+            "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
+            [self._table(["车位", "当前占用"],
+                         [[i.get("label", ""), i.get("occupant", "")] for i in (snapshot.get("spots") or [])],
+                         ["1", "3"], ["left", "left"])],
+        )
+
+        history_card = self._card(
+            "执行历史",
+            "最近 10 轮定时或手动执行的记录（最多保留 50 轮）",
+            [self._table(["时间", "新停放", "挪走", "收益(金币)"],
+                         [[i.get("time", ""), str(i.get("parked", 0)),
+                           str(i.get("moved", 0)), str(i.get("earned", 0))] for i in history[:10]],
+                         ["2", "1", "1", "1"],
+                         ["left", "center", "center", "right"])],
+        )
+
+        # 车市是若干张卡片（特卖 / 车市 / 以旧换新），但顶部只给一个「② 车市」按钮，
+        # 所以整组套一个固定锚点。按卡片序号分配锚点会让「车市」按钮在有特卖时
+        # 跳到特卖卡上，所以这里不再按序号编号。
+        shop_section = self._section("pb-shop", {
+            "component": "div",
+            "props": {"style": {"display": "block", "width": "100%"}},
+            "content": shop_cards,
+        })
 
         return [
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal", "color": "primary", "style": {"marginBottom": "12px"}},
-                "content": [
-                    {"component": "VCardText", "content": [
-                        self._text(header, {"fontSize": "18px", "fontWeight": "bold"}),
-                        self._text(subtitle, {"fontSize": "12px", "opacity": "0.8", "marginBottom": "6px"}),
-                        self._text(f"最近一轮：{last_run}",
-                                   {"fontSize": "13px", "opacity": "0.85", "marginBottom": "2px"}),
-                        self._text(f"本次进程累计挪车收益：{self._total_earned} 金币",
-                                   {"fontSize": "13px", "opacity": "0.85"}),
-                    ]},
-                ],
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "color": "info",
-                          "style": {"marginBottom": "12px"}},
-                "content": [
-                    {"component": "VCardText", "content": [
-                        self._text("怎么操作", {"fontSize": "15px", "fontWeight": "bold"}),
-                        self._text("插件页面是只读的展示区，点不了按钮。所有操作在聊天里发指令：",
-                                   {"fontSize": "12px", "marginTop": "4px"}),
-                        self._text("/车库　查看车库与可操作项　　/挪车 序号　立即结算",
-                                   {"fontSize": "12px", "fontFamily": "monospace", "marginTop": "4px"}),
-                        self._text("/买车 车型ID　　/换车 旧车ID 新车型ID　　/抢购 场次ID",
-                                   {"fontSize": "12px", "fontFamily": "monospace"}),
-                        self._text("在 Telegram / Slack 这类支持按钮回调的渠道上，发 /车库 会直接收到可点的按钮。",
-                                   {"fontSize": "11px", "opacity": "0.75", "marginTop": "6px"}),
-                    ]},
-                ],
-            },
+            head_card,
             {"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[0]]},
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[1]]},
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[2]]},
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[3]]},
             ]},
-            self._card(
-                "我的车库",
-                f"数据直接来自游戏车库；停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
-                [self._garage(snapshot.get("cars") or [], min_duration)],
-            ),
-            *self._build_shop(snapshot),
-            self._card(
-                "我的车位",
-                "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
-                [self._table(["车位", "当前占用"], spot_rows, ["1", "3"], ["left", "left"])],
-            ),
-            self._card(
-                "执行历史",
-                "最近 10 轮定时或手动执行的记录（最多保留 50 轮）",
-                [self._table(["时间", "新停放", "挪走", "收益(金币)"],
-                             history_rows,
-                             ["2", "1", "1", "1"],
-                             ["left", "center", "center", "right"])],
-            ),
+            self._nav_row([
+                ("① 我的车位", "pb-spots"),
+                ("② 车市", "pb-shop"),
+                ("③ 我的车库", "pb-garage"),
+            ]),
+            howto_card,
+            self._section("pb-spots", spots_card),
+            shop_section,
+            self._section("pb-garage", garage_card),
+            history_card,
         ]
 
     def get_dashboard_meta(self) -> List[Dict[str, str]]:
