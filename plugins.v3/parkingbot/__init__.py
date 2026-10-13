@@ -203,12 +203,12 @@ class ParkingBot(_PluginBase):
     plugin_name = "不可躺自动抢车位"
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
-    # 必须是 .png：MoviePilot 的插件市场把图标当 /plugin_icon/<文件名> 取，
-    # 实测同一个仓库里的 Wecom_A.png 能取到，而 Parking_A.jpg 一律 404
-    # （原来那张是 1024×1024 的 383KB 大 JPEG）。Parking_A.png 是同一张设计图
-    # 缩到 256×256 的版本，68KB，市场卡片里只显示约 40px，足够清晰。
-    plugin_icon = "Parking_A.png"
-    plugin_version = "1.19.0"
+    # 图标声明要和仓库里真实存在的文件同名。市场页把图标当
+    # /plugin_icon/<文件名> 取；这个名字取不到时卡片会退回 MoviePilot
+    # 自带的拼图图标。改成 .png 需要真正把二进制文件推上仓库，
+    # 文本通道只能推字符串，详见 README 的「图标」一节。
+    plugin_icon = "Parking_A.jpg"
+    plugin_version = "1.18.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
