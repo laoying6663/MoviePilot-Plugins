@@ -113,6 +113,12 @@ class TradePickRequest(BaseModel):
         default=None, description="要换成的目标车型 ID；留空表示退出选车模式")
 
 
+class ParkRequest(BaseModel):
+    """车库「立即停到他人车位」按钮的请求体。"""
+
+    car_id: Any = Field(description="要停出去的车辆：车库序号或车辆实例 ID")
+
+
 class TicketRequest(BaseModel):
     """车位卡片「贴条」按钮的请求体。"""
 
@@ -219,7 +225,7 @@ class ParkingBot(_PluginBase):
     # 拼图图标。仓库里的图标文件必须叫 Parking_A.png —— 原来的
     # Parking_A.jpg 取不到（404）。.jpg 原图仍留在仓库里作为存档。
     plugin_icon = "Parking_A.png"
-    plugin_version = "1.20.0"
+    plugin_version = "1.21.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1331,6 +1337,13 @@ class ParkingBot(_PluginBase):
                 "titles": titles["owned"],
                 "cars": cars,
                 "spots": spots,
+                # 他人空余私家车位数。车库页的「立即停到他人车位」按钮靠它决定
+                # 亮不亮 —— 没有可停的车位时按钮该是灰的，而不是让用户点了吃一个错。
+                "free_spots": sum(
+                    1 for s in self._dict_rows(state.get("parkingSpots"))
+                    if not s.get("carInSpot")
+                    and s.get("spotType") != "charity"
+                    and str(s.get("ownerId")) != str(user_id)),
                 # 车市需要的车型目录：价格、每分钟收益、等级门槛。
                 # 只带展示字段，避免把 image 之类的无用数据塞进快照。
                 "catalog": [
@@ -2291,7 +2304,9 @@ class ParkingBot(_PluginBase):
                                      {"fontSize": "12px", "opacity": "0.72",
                                       "marginTop": "6px"}),
                     detail,
-                    ticket_row,
+                    # 贴条区只在该有的时候才拼进去：直接塞 None 会让渲染器
+                    # 在卡片底部吐出一行字面量 "None"。
+                    *([ticket_row] if ticket_row else []),
                 ],
             })
         if not cards:
@@ -2827,6 +2842,16 @@ class ParkingBot(_PluginBase):
                 "description": "记下要换成的目标车型，页面据此列出可用的空闲车；传空 car_id 表示取消",
             },
             {
+                "path": "/park",
+                "endpoint": self.api_park,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即把空闲车停到他人车位",
+                "response_model": ApiResult,
+                "description": "按车辆序号或实例 ID 调用游戏 park.php 停车；"
+                              "车位自动在他人空余私家车位里挑一个",
+            },
+            {
                 "path": "/ticket",
                 "endpoint": self.api_ticket,
                 "methods": ["POST"],
@@ -2925,6 +2950,65 @@ class ParkingBot(_PluginBase):
             # 落盘失败只影响下次打开时的显示，本次的返回值照样是成功
             logger.warning(f"[不可躺自动抢车位] 保存称号快照失败：{err}")
         return True
+
+    async def api_park(self, request: ParkRequest) -> ApiResult:
+        """
+        手动把一辆空闲车停到他人车位。
+
+        和定时停车共用游戏接口 park.php {userCarId, spotId}（游戏里也是这个）。
+        车位的挑法沿用 _park_idle_cars：只在「别人的、空着的、私家车位」里随机挑，
+        避免长期压在同一个车位主人身上被针对；爱心车位不选，那儿不产生金币。
+
+        刻意不受「最多同时停放车辆数」限制 —— 那是定时任务的风险刹车，
+        手动点一下是明确操作，由用户自己判断。按钮旁边会显示当前已停/上限。
+        """
+        if not self.get_state():
+            return _result({"success": False, "error": "插件未启用"})
+        token = str(getattr(request, "car_id", "") or "").strip()
+        if not token:
+            return _result({"success": False, "error": "缺少车辆 ID"})
+
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
+
+        user_id = state.get("userId")
+        # 与 _resolve_car_ref 同一套口径：先按游戏车库顺序排出我的车，
+        # 序号对不上再当实例 ID 用。它返回的是车辆 ID，再回表取车辆本身。
+        # state.php 返回的是全服车辆，取用时必须按 userId 过滤。
+        ordered = self._ordered_my_cars(state, cars_map)
+        car_id = self._resolve_car_ref(token, ordered)
+        if not car_id:
+            return _result({"success": False, "error": "车辆不存在或不属于当前账号"})
+        car = next((c for c in self._dict_rows(state.get("userCars"))
+                    if str(c.get("id")) == str(car_id)
+                    and str(c.get("userId")) == str(user_id)), None)
+        if not car:
+            return _result({"success": False, "error": "车辆不存在或不属于当前账号"})
+        if str(car.get("status")) != "idle":
+            return _result({"success": False, "error": "只有空闲车辆能停出去"})
+
+        spots = [s for s in self._dict_rows(state.get("parkingSpots"))
+                 if not s.get("carInSpot")
+                 and s.get("spotType") != "charity"
+                 and str(s.get("ownerId")) != str(user_id)]
+        if not spots:
+            return _result({"success": False, "error": "当前没有可停的他人空余私家车位"})
+        spot = random.choice(spots)
+
+        result = await self._post(client, "park.php",
+                                  {"userCarId": car.get("id"), "spotId": spot.get("id")})
+        if not result or not result.get("success"):
+            return _result({"success": False,
+                            "error": (result or {}).get("error") or "停车失败"})
+        rate = self._earn_per_min(car, cars_map)
+        await self._refresh_snapshot(client, "手动停车")
+        note = (f"{self._car_name(car, cars_map)} 已停到他人车位，"
+                f"每分钟收益 {rate} 金")
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "car": self._car_name(car, cars_map),
+                        "rate": rate, "spotId": spot.get("id")})
 
     async def api_ticket(self, request: TicketRequest) -> ApiResult:
         """
@@ -3300,11 +3384,47 @@ class ParkingBot(_PluginBase):
         return _result({"success": True, "earned": earned})
 
     @staticmethod
-    def _garage(cars: List[dict], min_duration: int) -> dict:
+    def _park_btn(number: Any, free_spots: int, api: str) -> dict:
+        """
+        空闲车的「立即停到他人车位」按钮。
+
+        没有可停车位时压暗且不挂事件 —— 页面上的灰按钮是真点不动的，
+        好过按下去被服务端驳回再弹一句错误。
+        """
+        can = free_spots > 0
+        btn = {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "alignItems": "center", "gap": "4px",
+                "padding": "5px 12px", "fontSize": "11px", "fontWeight": "bold",
+                "borderRadius": "14px", "whiteSpace": "nowrap",
+                "userSelect": "none", "border": "none",
+                "cursor": "pointer" if can else "not-allowed",
+                "color": "#04222B" if can else "rgba(255,255,255,0.45)",
+                "backgroundColor": ("#FFFFFF" if can
+                                    else "rgba(255,255,255,0.10)"),
+            }},
+            "content": [
+                {"component": "span",
+                 "props": {"style": {"display": "flex", "flexShrink": "0"}},
+                 "html": _COIN_SVG.replace("@SIZE@", "12px")},
+                ParkingBot._text("立即停到他人车位" if can else "暂无可停车位", {}),
+            ],
+        }
+        if can:
+            btn["events"] = {"click": {"api": api, "method": "post",
+                                       "params": {"car_id": number}}}
+        return btn
+
+    @staticmethod
+    def _garage(cars: List[dict], min_duration: int, free_spots: int = 0,
+                parked_count: int = 0, max_cars: int = 1, api: str = "") -> dict:
         """
         车库视图：照游戏车库页的排版，左图右信息，字段在上、值在下。
 
         停够最短时长的车才给「立即挪车」指令，其余置灰并显示还差几分钟。
+        空闲的车另给一个「立即停到他人车位」按钮 —— 手动操作不受「最多同时停放
+        车辆数」限制，旁边会把当前已停/上限写出来，由用户自己判断。
         车牌、每分钟收益、状态、已停时长都直接来自游戏车库数据（state.php 的 userCars）。
         """
         cards = []
@@ -3350,12 +3470,16 @@ class ParkingBot(_PluginBase):
                         f"{minutes} 分钟" if not idle else "可立即停到他人车位",
                         "rgba(255,255,255,0.75)"),
                     {"component": "div",
-                     "props": {"style": {"marginTop": "10px"}},
+                     "props": {"style": {"marginTop": "10px",
+                                         "display": "flex", "alignItems": "center",
+                                         "gap": "8px", "flexWrap": "wrap"}},
                      "content": [
                          ParkingBot._badge(str(item.get("status", "")), status_color),
                          ParkingBot._command_hint(
                              f"/挪车 {number}", can_unpark,
                              "" if can_unpark else button_text),
+                         *([ParkingBot._park_btn(number, free_spots, api)]
+                           if idle else []),
                      ]},
                 ],
             }
@@ -3509,6 +3633,11 @@ class ParkingBot(_PluginBase):
         try:
             number = int(value)
         except (TypeError, ValueError):
+            # None / 空串是「这个字段没有」，按 0 显示。直接回落 str(value)
+            # 会让页面上出现字面量 None —— 老版本快照缺 gain 字段时，
+            # 车库卡片就会显示「累计收益 $ None」。
+            if value is None or str(value).strip() == "":
+                return "0"
             return str(value)
         if number >= 10000000:
             return f"{number / 1000000:.1f}M"
@@ -4080,8 +4209,9 @@ class ParkingBot(_PluginBase):
         #
         # 执行历史已挪到「金币统计」页，车库页不再夹带。
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
-        ticket_api = (f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}"
-                      f"/ticket")
+        pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        ticket_api = f"plugin/{pid}/ticket"
+        park_api = f"plugin/{pid}/park"
         howto_card = self._card(
             "怎么操作",
             "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
@@ -4106,8 +4236,15 @@ class ParkingBot(_PluginBase):
         elif tab == "garage":
             sections = [self._card(
                 "我的车库",
-                f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
-                [self._garage(self._dict_rows(snapshot.get("cars")), min_duration)])]
+                f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰；"
+                f"当前已停 {self._to_int(snapshot.get('parked_total'), 0)}"
+                f"/{self._to_int(snapshot.get('car_max'), 1)}"
+                f"（手动停车不受这个上限限制）",
+                [self._garage(self._dict_rows(snapshot.get("cars")), min_duration,
+                              self._to_int(snapshot.get("free_spots"), 0),
+                              self._to_int(snapshot.get("parked_total"), 0),
+                              self._to_int(snapshot.get("car_max"), 1),
+                              park_api)])]
         else:
             sections = [self._stats_page(daily, history, today_earned)]
 
