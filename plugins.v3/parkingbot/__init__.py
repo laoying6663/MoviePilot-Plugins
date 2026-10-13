@@ -230,7 +230,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.23.0"
+    plugin_version = "1.24.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -4015,10 +4015,11 @@ class ParkingBot(_PluginBase):
                     actions = [self._action_btn("抢购", flash_api,
                                                 {"sale_id": sale.get("id")},
                                                 disabled=price > cash or full)]
+                    # 同上：钱不够和没空位是两回事，同时成立时要都说出来
                     if price > cash:
                         lines.append((f"还差 {ParkingBot._fmt_num(price - cash)} 金", _AMBER))
-                    elif full:
-                        lines.append((f"车辆已满（{car_max} 辆）", _AMBER))
+                    if full:
+                        lines.append((f"抢购需有空位（已满 {car_max} 辆）", _AMBER))
                 items.append(self._item(
                     str(sale.get("name", "特卖车型")), lines, actions,
                     accent=_GOLD, image=self._asset_url(sale.get("image")),
@@ -4064,12 +4065,22 @@ class ParkingBot(_PluginBase):
                         self._action_btn("以旧换新", pick_api, {"car_id": car.get("id")},
                                          kind="trade", disabled=not upgradable),
                     ]
-                    if full:
-                        lines.append((f"车辆已满（{car_max} 辆）", _AMBER))
-                    elif price > cash:
+                    # 购买和换新的禁用原因互不相干，各说各的，不能用 elif 串成一条：
+                    # 「购买」要的是一个空车位，满员就买不了；「以旧换新」是 1 换 1、
+                    # 不占车位（游戏侧 showSelectTradeCar 也只过滤 status==='idle'，
+                    # 从头到尾不看车辆上限），它灰掉只因为没有更便宜的空闲车。
+                    # 以前满员时只显示「车辆已满」，把真正的原因吞掉了，
+                    # 看着就成了「满员导致换不了」——那是错觉。
+                    if price > cash:
                         lines.append((f"还差 {ParkingBot._fmt_num(price - cash)} 金", _AMBER))
-                    elif not upgradable:
-                        lines.append(("没有更便宜的空闲车可换", _AMBER))
+                    if full:
+                        lines.append((f"购买需有空位（已满 {car_max} 辆）", _AMBER))
+                    if not upgradable:
+                        # 区分「一辆空闲的都没有」和「有但都不比它便宜」：
+                        # 前者只要挪一辆车出来就能换，指出来用户才知道下一步做什么。
+                        lines.append((
+                            "所有车都停着，先挪一辆出来就能换" if not idle_cars
+                            else "没有更便宜的空闲车可换", _AMBER))
                 items.append(self._item(
                     str(car.get("name", "未知车型")), lines, actions,
                     image=car.get("image") or "", locked=locked))
