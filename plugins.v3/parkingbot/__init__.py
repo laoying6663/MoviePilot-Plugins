@@ -2352,32 +2352,44 @@ class ParkingBot(_PluginBase):
                 "component": "div",
                 "props": {
                     "style": {
+                        "display": "flex",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "gap": "6px",
                         "flex": "1 1 0",
-                        "minWidth": "88px",
-                        "padding": "10px 6px 0",
-                        "textAlign": "center",
+                        "minWidth": "96px",
+                        "padding": "9px 10px",
+                        "borderRadius": "10px",
+                        "fontSize": "13px",
                         "cursor": "pointer",
                         "userSelect": "none",
-                        # 图标用 currentColor，父级改 color 就能一起变
-                        "color": _ACCENT if active else _MUTED,
-                        "borderBottom": (f"3px solid {_ACCENT}" if active
-                                         else "3px solid transparent"),
-                        "transition": "color .15s ease, border-color .15s ease",
+                        "whiteSpace": "nowrap",
+                        # 当前页签是实心青底，未选中的是半透明描边 —— 和游戏顶部那排一致
+                        "color": "#04222B" if active else "rgba(255,255,255,0.82)",
+                        "backgroundColor": (
+                            f"linear-gradient(135deg, {_CYAN}, #38BDF8)"
+                            if active else "rgba(255,255,255,0.07)"),
+                        "border": ("none" if active
+                                   else "1px solid rgba(255,255,255,0.14)"),
+                        "boxShadow": ("0 4px 14px rgba(34,211,238,0.28)"
+                                      if active else "none"),
+                        "transition": "background-color .15s ease, color .15s ease",
                     },
                 },
                 "content": [
-                    self._icon(key, 21),
-                    self._text(label, {"fontSize": "13px", "marginTop": "6px",
-                                       "fontWeight": "bold" if active else "normal",
-                                       "letterSpacing": "0.3px",
-                                       "whiteSpace": "nowrap"}),
+                    # 图标是 currentColor 描边，跟着外层 color 走：选中时深色压青底，
+                    # 未选中时浅色，跟文字一个颜色
+                    {"component": "span",
+                     "props": {"style": {"display": "flex"}},
+                     "html": _ICONS[key].replace("@SIZE@", "16px")},
+                    self._text(label, {"fontWeight": "bold" if active else "normal"}),
                 ],
                 "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
             })
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "marginBottom": "16px",
-                                "borderBottom": "1px solid rgba(128,128,128,0.22)"}},
+            "props": {"style": {"display": "flex", "gap": "8px", "marginBottom": "14px",
+                                "flexWrap": "wrap"}},
             "content": buttons,
         }
 
