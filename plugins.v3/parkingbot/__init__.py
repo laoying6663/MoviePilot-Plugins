@@ -87,14 +87,35 @@ def _result(payload: Dict[str, Any]) -> ApiResult:
         data=data,
     )
 
+# ---------- 详情页配色与图标 ----------
+# 与 MoviePilot 自身主题保持一致：主色用紫，强调色统一用它，页签高亮也就更醒目。
+_ACCENT = "#B388FF"
+_MUTED = "rgba(255,255,255,0.60)"
+
+_ICONS = {
+    "spots": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
+              'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
+              'stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="4.5"/>'
+              '<path d="M9.6 17.6V6.4h3.4a3.3 3.3 0 0 1 0 6.6H9.6"/></svg>'),
+    "shop": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
+             'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
+             'stroke-linejoin="round"><path d="M5.3 8h13.4l-1 12.4H6.3L5.3 8Z"/>'
+             '<path d="M9 8V6.2a3 3 0 0 1 6 0V8"/></svg>'),
+    "garage": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
+               'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
+               'stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="17" rx="3"/>'
+               '<path d="M7 20.5v-11h10v11"/><path d="M7 13.4h10M7 16.9h10"/></svg>'),
+}
+
+
 class ParkingBot(_PluginBase):
     """自动停车 + 自动挪车。"""
 
     plugin_name = "不可躺自动抢车位"
-    plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
-                   "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
+    plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
+                   "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.8.1"
+    plugin_version = "1.9.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1275,16 +1296,41 @@ class ParkingBot(_PluginBase):
         return {"component": "div", "text": str(value), "props": {"style": style}}
 
     @staticmethod
-    def _stat(label: str, value: Any, color: str) -> dict:
-        """单个数字指标块。"""
+    def _icon(name: str, size: int = 20) -> dict:
+        """
+        内联 SVG 图标。
+
+        不用 VIcon：宿主的图标组件在插件页里解析不出图标名，会渲染出
+        一个 <path> 为空的空 svg，等于没有图标。内联 SVG 不依赖宿主的图标集，
+        颜色跟着外层的 color 走（stroke="currentColor"）。
+        """
+        svg = _ICONS.get(name, "")
         return {
-            "component": "VCard",
-            "props": {"variant": "tonal", "style": {"marginBottom": "8px"}},
+            "component": "span",
+            "props": {"style": {"display": "block", "lineHeight": "0"}},
+            "html": svg.replace("@SIZE@", f"{size}px"),
+        }
+
+    @staticmethod
+    def _stat(label: str, value: Any, color: str) -> dict:
+        """单个数字指标块。用 div 拼而不是 VCard：少两层组件，样式也更好控。"""
+        return {
+            "component": "div",
+            "props": {"style": {
+                "flex": "1 1 0",
+                "minWidth": "128px",
+                "margin": "0 8px 8px 0",
+                "padding": "10px 12px",
+                "borderRadius": "12px",
+                "border": "1px solid rgba(128,128,128,0.20)",
+                "backgroundColor": "rgba(255,255,255,0.04)",
+            }},
             "content": [
-                {"component": "VCardText", "content": [
-                    ParkingBot._text(label, {"fontSize": "12px", "opacity": "0.75"}),
-                    ParkingBot._text(value, {"fontSize": "22px", "fontWeight": "bold", "color": color}),
-                ]},
+                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.68",
+                                         "letterSpacing": "0.6px"}),
+                ParkingBot._text(value, {"fontSize": "22px", "fontWeight": "bold",
+                                         "color": color, "lineHeight": "1.3",
+                                         "marginTop": "2px"}),
             ],
         }
 
@@ -1293,18 +1339,26 @@ class ParkingBot(_PluginBase):
         """
         统一的信息卡片外壳。
 
-        标题也用 div 渲染而不依赖 VCardTitle 插槽：Vuetify 这类组件在本插件
-        页面里只渲染出空壳，内容并不会填进去。
+        标题用 div 渲染而不依赖 VCardTitle 插槽：Vuetify 这类组件在本插件
+        页面里只渲染出空壳，内容并不会填进去。卡片外壳同理改用 div，
+        少一层 VCard + VCardText，样式也更可控。
         """
         return {
-            "component": "VCard",
-            "props": {"variant": "outlined", "style": {"marginBottom": "12px"}},
+            "component": "div",
+            "props": {"style": {
+                "marginBottom": "12px",
+                "padding": "14px 14px 4px",
+                "borderRadius": "14px",
+                "border": "1px solid rgba(128,128,128,0.20)",
+                "backgroundColor": "rgba(255,255,255,0.035)",
+            }},
             "content": [
-                {"component": "VCardText", "content": [
-                    ParkingBot._text(title, {"fontSize": "16px", "fontWeight": "bold", "marginBottom": "2px"}),
-                    ParkingBot._text(subtitle, {"fontSize": "12px", "opacity": "0.7", "marginBottom": "10px"}),
-                    *content,
-                ]},
+                ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
+                                         "color": _ACCENT, "marginBottom": "3px",
+                                         "letterSpacing": "0.3px"}),
+                ParkingBot._text(subtitle, {"fontSize": "12px", "opacity": "0.62",
+                                            "lineHeight": "1.55", "marginBottom": "10px"}),
+                *content,
             ],
         }
 
@@ -2051,18 +2105,21 @@ class ParkingBot(_PluginBase):
                     "flex": "1 1 250px",
                     "minWidth": "230px",
                     "margin": "0 8px 8px 0",
-                    "border": "1px solid rgba(128,128,128,0.3)",
-                    "borderRadius": "8px",
-                    "padding": "12px",
+                    "border": "1px solid rgba(128,128,128,0.20)",
+                    "borderRadius": "12px",
+                    "padding": "12px 12px 10px",
+                    "backgroundColor": "rgba(255,255,255,0.03)",
                 }},
                 "content": [
                     ParkingBot._text(item.get("name", ""),
                                      {"fontSize": "15px", "fontWeight": "bold"}),
                     ParkingBot._text(f"{item.get('rate', 0)} 金/分钟",
-                                     {"fontSize": "12px", "color": "#4FC3F7"}),
+                                     {"fontSize": "12px", "color": "#4FC3F7",
+                                      "marginTop": "2px"}),
                     ParkingBot._text(detail,
                                      {"fontSize": "12px", "color": status_color,
-                                      "marginTop": "4px", "marginBottom": "10px"}),
+                                      "marginTop": "4px", "lineHeight": "1.5",
+                                      "marginBottom": "10px"}),
                     ParkingBot._command_hint(
                         f"/挪车 {number}", can_unpark,
                         "" if can_unpark else button_text,
@@ -2095,10 +2152,11 @@ class ParkingBot(_PluginBase):
                 "flex": "1 1 260px",
                 "minWidth": "240px",
                 "margin": "0 8px 8px 0",
-                "border": "1px solid rgba(128,128,128,0.3)",
+                "border": "1px solid rgba(128,128,128,0.20)",
                 "borderLeft": f"3px solid {accent}",
-                "borderRadius": "8px",
-                "padding": "12px",
+                "borderRadius": "12px",
+                "padding": "12px 12px 10px",
+                "backgroundColor": "rgba(255,255,255,0.03)",
             }},
             "content": content,
         }
@@ -2108,10 +2166,11 @@ class ParkingBot(_PluginBase):
         """
         显示一条可复制的指令。
 
-        插件详情页是声明式 JSON，渲染器不绑定事件，页面上的按钮点不动，
+        页面上的业务操作点不动（渲染器只给 events 绑请求，没有前端状态），
         所以这里给聊天指令而不是假按钮。支持按钮回调的通知渠道上，
         发 /车库 会拿到真正可点的按钮。
         """
+        color = "#4FC3F7" if enabled else "#9E9E9E"
         content = []
         if not enabled and reason:
             content.append(ParkingBot._text(f"⛔ {reason}",
@@ -2120,7 +2179,11 @@ class ParkingBot(_PluginBase):
             "fontSize": "12px",
             "marginTop": "6px",
             "fontFamily": "monospace",
-            "color": "#4FC3F7" if enabled else "#9E9E9E",
+            "color": color,
+            "backgroundColor": "rgba(128,128,128,0.14)",
+            "borderRadius": "6px",
+            "padding": "4px 8px",
+            "display": "inline-block",
         }))
         return {"component": "div", "props": {"style": {}}, "content": content}
 
@@ -2272,42 +2335,39 @@ class ParkingBot(_PluginBase):
         表现为「点一下页面就没了」。
         """
         api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
-        active_color, idle_color = "#B388FF", "rgba(255,255,255,0.62)"
         buttons = []
-        for (key, label), icon in zip(self._TABS, ("mdi-parking", "mdi-store", "mdi-garage")):
+        for key, label in self._TABS:
             active = (key == current)
-            color = active_color if active else idle_color
             buttons.append({
                 "component": "div",
                 "props": {
                     "style": {
                         "flex": "1 1 0",
-                        "minWidth": "84px",
-                        "padding": "4px 4px 0",
+                        "minWidth": "88px",
+                        "padding": "10px 6px 0",
                         "textAlign": "center",
                         "cursor": "pointer",
                         "userSelect": "none",
-                        # 当前页签用一条紫色下划线标出，样式对齐 MoviePilot 自带页签
-                        "borderBottom": (f"3px solid {active_color}" if active
+                        # 图标用 currentColor，父级改 color 就能一起变
+                        "color": _ACCENT if active else _MUTED,
+                        "borderBottom": (f"3px solid {_ACCENT}" if active
                                          else "3px solid transparent"),
+                        "transition": "color .15s ease, border-color .15s ease",
                     },
                 },
                 "content": [
-                    {"component": "VIcon", "props": {"icon": icon, "size": "22px", "color": color}},
-                    {"component": "div", "text": label, "props": {"style": {
-                        "fontSize": "13px",
-                        "color": color,
-                        "fontWeight": "bold" if active else "normal",
-                        "marginTop": "2px",
-                        "whiteSpace": "nowrap",
-                    }}},
+                    self._icon(key, 21),
+                    self._text(label, {"fontSize": "13px", "marginTop": "6px",
+                                       "fontWeight": "bold" if active else "normal",
+                                       "letterSpacing": "0.3px",
+                                       "whiteSpace": "nowrap"}),
                 ],
                 "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
             })
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "marginBottom": "14px",
-                                "borderBottom": "1px solid rgba(128,128,128,0.25)"}},
+            "props": {"style": {"display": "flex", "marginBottom": "16px",
+                                "borderBottom": "1px solid rgba(128,128,128,0.22)"}},
             "content": buttons,
         }
 
@@ -2346,17 +2406,20 @@ class ParkingBot(_PluginBase):
             last_run = f"{last_run}（{datetime.fromtimestamp(self._last_run_ts):%Y-%m-%d %H:%M:%S}）"
 
         head_lines = [
-            self._text(header, {"fontSize": "18px", "fontWeight": "bold"}),
-            self._text(subtitle, {"fontSize": "12px", "opacity": "0.8", "marginBottom": "6px"}),
-            self._text(f"最近一轮：{last_run}",
-                       {"fontSize": "13px", "opacity": "0.85", "marginBottom": "2px"}),
-            self._text(f"本次进程累计挪车收益：{self._total_earned} 金币",
-                       {"fontSize": "13px", "opacity": "0.85"}),
+            self._text(header, {"fontSize": "19px", "fontWeight": "bold",
+                                "letterSpacing": "0.3px"}),
+            self._text(subtitle, {"fontSize": "12px", "opacity": "0.62",
+                                  "marginTop": "4px", "lineHeight": "1.6"}),
+            self._text(f"最近一轮　{last_run}",
+                       {"fontSize": "12px", "opacity": "0.78", "marginTop": "8px"}),
+            self._text(f"本次进程累计挪车收益　{self._total_earned} 金币",
+                       {"fontSize": "12px", "opacity": "0.78"}),
         ]
         if note:
             head_lines.append(self._text(
-                f"自动操作：{note}",
-                {"fontSize": "13px", "color": "#FFD700", "marginTop": "6px"}))
+                f"自动操作　{note}",
+                {"fontSize": "12px", "color": "#FFD700", "marginTop": "6px",
+                 "lineHeight": "1.6"}))
 
         # 开关开着但这一轮没花钱（比如没找到划算的车型）时也给个提示，
         # 否则用户会以为开关没生效。
@@ -2366,31 +2429,33 @@ class ParkingBot(_PluginBase):
         if turned_on and not note:
             head_lines.append(self._text(
                 f"{'、'.join(turned_on)}已开启，本轮没有满足条件的操作",
-                {"fontSize": "13px", "opacity": "0.85", "marginTop": "6px"}))
+                {"fontSize": "12px", "opacity": "0.78", "marginTop": "6px"}))
 
         head_card = {
-            "component": "VCard",
-            "props": {"variant": "tonal", "color": "primary",
-                      "style": {"marginBottom": "12px"}},
-            "content": [{"component": "VCardText", "content": head_lines}],
+            "component": "div",
+            "props": {"style": {
+                "marginBottom": "12px",
+                "padding": "14px",
+                "borderRadius": "14px",
+                "border": "1px solid rgba(128,128,128,0.20)",
+                "backgroundColor": "rgba(255,255,255,0.05)",
+            }},
+            "content": head_lines,
         }
 
-        howto_card = {
-            "component": "VCard",
-            "props": {"variant": "outlined", "color": "info",
-                      "style": {"marginBottom": "12px"}},
-            "content": [{"component": "VCardText", "content": [
-                self._text("怎么操作", {"fontSize": "15px", "fontWeight": "bold"}),
-                self._text("插件页面是只读展示区，点不了按钮。所有操作在聊天里发指令：",
-                           {"fontSize": "12px", "marginTop": "4px"}),
-                self._text("/车库　查看车库与可操作项　　/挪车 序号　立即结算",
-                           {"fontSize": "12px", "fontFamily": "monospace", "marginTop": "4px"}),
-                self._text("/买车 车型ID　　/换车 旧车ID 新车型ID　　/抢购 场次ID",
-                           {"fontSize": "12px", "fontFamily": "monospace"}),
-                self._text("在 Telegram / Slack 这类支持按钮回调的渠道上，发 /车库 会直接收到可点的按钮。",
-                           {"fontSize": "11px", "opacity": "0.75", "marginTop": "6px"}),
-            ]}],
-        }
+        howto_card = self._card(
+            "怎么操作",
+            "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
+            [
+                self._text("/车库　　　查看车库与可操作项",
+                           {"fontSize": "13px", "fontFamily": "monospace"}),
+                self._text("/挪车 序号　立即结算并收取收益",
+                           {"fontSize": "13px", "fontFamily": "monospace"}),
+                self._text("/买车 车型ID　/换车 旧车ID 新车型ID　/抢购 场次ID",
+                           {"fontSize": "13px", "fontFamily": "monospace"}),
+                self._text("Telegram / Slack 上发 /车库 会直接收到可点的按钮。",
+                           {"fontSize": "11px", "opacity": "0.6", "marginTop": "8px"}),
+            ])
 
         garage_card = self._card(
             "③ 我的车库",
@@ -2426,12 +2491,12 @@ class ParkingBot(_PluginBase):
 
         return [
             head_card,
-            {"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[0]]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[1]]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[2]]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[3]]},
-            ]},
+            # 四个指标块：手机上一行两个、宽屏一行四个。用单个 flex 容器而不是
+            # VRow/VCol，少 8 层组件，宽度也能自己说了算。
+            {"component": "div",
+             "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                 "marginRight": "-8px", "marginBottom": "4px"}},
+             "content": stats},
             self._nav_row(tab),
             *sections[tab],
         ]
