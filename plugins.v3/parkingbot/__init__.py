@@ -221,11 +221,16 @@ class ParkingBot(_PluginBase):
     plugin_name = "不可躺自动抢车位"
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
-    # 市场页把图标当 /plugin_icon/<文件名> 取，取不到就退回 MoviePilot 自带的
-    # 拼图图标。仓库里的图标文件必须叫 Parking_A.png —— 原来的
-    # Parking_A.jpg 取不到（404）。.jpg 原图仍留在仓库里作为存档。
-    plugin_icon = "Parking_A.png"
-    plugin_version = "1.21.0"
+    # 市场页图标有两条完全不同的取法（见 MoviePilot-Frontend PluginCard.vue）：
+    #   1) 值以 http 开头 → 走后端图片代理 /api/v1/system/img/{proxy}?imgurl=…
+    #      由 MoviePilot 后端去拉这个 URL
+    #   2) 否则当文件名 → 拼成 ./plugin_icon/<值>，由 nginx 直接读**本机**静态目录
+    # 仓库里的 icons/ 只对「方式 2 且该文件已被放进 MoviePilot 主机」的情形有效，
+    # 单纯把文件传到 GitHub 并不会让它出现在方式 2 的目录里。
+    # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
+    plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
+                   "MoviePilot-Plugins/main/icons/Parking_A.png")
+    plugin_version = "1.22.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
