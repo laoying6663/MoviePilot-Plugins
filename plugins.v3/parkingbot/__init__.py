@@ -46,6 +46,17 @@ class ActionResult(BaseModel):
     expGained: Optional[int] = Field(default=None, description="本次操作获得的经验")
 
 
+class TabSwitch(BaseModel):
+    """
+    详情页区块切换请求体。
+
+    页面上声明的 events 会以 POST + JSON body 打过来，所以参数必须收成
+    Pydantic 模型；写成 `tab: str` 会被 FastAPI 当成查询参数，body 就丢了。
+    """
+
+    tab: str = Field(default="spots", description="区块标识：spots / shop / garage")
+
+
 
 
 def _result(payload: Dict[str, Any]) -> ActionResult:
@@ -59,7 +70,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够设定时长后自动挪车结算。"
                    "登录身份复用「站点管理」里 tangpt.top 站点的 Cookie。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -95,6 +106,12 @@ class ParkingBot(_PluginBase):
     # 差价足够时自动以旧换新（默认关闭，同上）
     _auto_trade = False
 
+    # ---------- 详情页区块 ----------
+    # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
+    _PLUGIN_ID = "ParkingBot"
+    _TABS = (("spots", "① 我的车位"), ("shop", "② 车市"), ("garage", "③ 我的车库"))
+    _tab = "spots"
+
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
     _last_run_ts = 0
@@ -127,6 +144,9 @@ class ParkingBot(_PluginBase):
         self._notify = bool(config.get("notify", True))
         self._auto_buy = self._as_switch(config.get("auto_buy"))
         self._auto_trade = self._as_switch(config.get("auto_trade"))
+        # 记住上次停留的区块；插件重载、MoviePilot 重启后仍回到原来那一页
+        saved_tab = str(self.get_data("tab") or "").strip()
+        self._tab = saved_tab if saved_tab in dict(self._TABS) else "spots"
         self._auth_warned = False
         self._cars_cache = {}
 
@@ -1730,7 +1750,34 @@ class ParkingBot(_PluginBase):
                 "response_model": ActionResult,
                 "description": "按特卖场次 ID 购买限时/限量车辆",
             },
+            {
+                "path": "/tab",
+                "endpoint": self.api_set_tab,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换详情页区块",
+                "response_model": ActionResult,
+                "description": "记录详情页当前展示的区块；渲染器随后会重新拉取页面，只下发这一块",
+            },
         ]
+
+    async def api_set_tab(self, request: TabSwitch) -> ActionResult:
+        """
+        记住详情页当前停留的区块。
+
+        页面渲染器在执行完事件后会重新拉一次 plugin/page/{id}，
+        所以这里只要把选择记下来，get_page() 自然就只渲染选中的那一个区块。
+        """
+        tab = str(getattr(request, "tab", "") or "").strip().lower()
+        if tab not in dict(self._TABS):
+            return _result({"success": False, "error": f"未知区块：{tab}"})
+        self._tab = tab
+        try:
+            await self.async_save_data("tab", tab)
+        except Exception as err:
+            # 记不住只影响下次打开时回到默认页签，不该让点击直接失败
+            logger.warning(f"[不可躺自动抢车位] 保存详情页页签失败：{err}")
+        return _result({"success": True, "name": dict(self._TABS)[tab]})
 
     async def api_buy_car(self, car_id: Any) -> ActionResult:
         """
@@ -2185,22 +2232,22 @@ class ParkingBot(_PluginBase):
             ))
         return blocks
 
-    @staticmethod
-    def _nav_row(items: List[Tuple[str, str]]) -> dict:
+    def _nav_row(self, current: str) -> dict:
         """
-        顶部切换栏。
+        顶部区块切换栏。
 
-        插件页面是声明式 JSON，渲染器不绑定事件，做不了真正的 Tab 切换。
-        这里退而用锚点跳转：<a href="#id"> 是浏览器原生行为，不经过任何框架的
-        事件绑定，所以在「按钮点不动」的环境里依然可用。
-        三个区块本来就全部渲染出来，顶栏只是快速跳转，不是真正的互斥 Tab。
+        MoviePilot 的页面渲染器（PageRender）会把节点上的 events 展开成
+        on<事件名> 绑到组件上：点击 → POST 指定 api → 渲染器随即重新拉取
+        plugin/page/{id}。所以切换是真正的「只显示当前区块」，靠服务端记住
+        当前页签实现的，不是前端动画，也不需要任何 JS。
         """
-        links = []
-        for label, anchor in items:
-            links.append({
-                "component": "a",
+        api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
+        buttons = []
+        for key, label in self._TABS:
+            active = (key == current)
+            buttons.append({
+                "component": "div",
                 "props": {
-                    "href": f"#{anchor}",
                     "style": {
                         "display": "block",
                         "flex": "1 1 90px",
@@ -2209,35 +2256,33 @@ class ParkingBot(_PluginBase):
                         "textAlign": "center",
                         "borderRadius": "8px",
                         "border": "1px solid rgba(128,128,128,0.45)",
-                        "backgroundColor": "rgba(79,195,247,0.12)",
-                        "color": "#4FC3F7",
+                        # 当前页签高亮，一眼能看出当前在看哪一块
+                        "backgroundColor": (
+                            "rgba(79,195,247,0.45)" if active else "rgba(79,195,247,0.12)"),
+                        "color": "#FFFFFF" if active else "#4FC3F7",
                         "fontSize": "14px",
-                        "textDecoration": "none",
+                        "fontWeight": "bold" if active else "normal",
+                        "cursor": "pointer",
+                        "userSelect": "none",
                     },
                 },
                 "text": label,
+                "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
             })
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-6px"}},
-            "content": links,
-        }
-
-    @staticmethod
-    def _section(anchor: str, card: dict) -> dict:
-        """给区块套一层带锚点 id 的外壳，供顶部切换栏跳转。"""
-        return {
-            "component": "div",
-            "props": {"id": anchor, "style": {"scrollMarginTop": "12px"}},
-            "content": [card],
+            "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-6px",
+                                "marginBottom": "12px"}},
+            "content": buttons,
         }
 
     def get_page(self) -> List[dict]:
-        """返回插件详情页：顶部切换栏 + 我的车位 / 车市 / 我的车库三个区块。"""
+        """返回插件详情页：顶部切换栏 + 当前选中的那一个区块。"""
         snapshot, history = self._page_data()
         today_earned = self._today_earned(history)
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
         note = str(snapshot.get("note") or "")
+        tab = self._tab if self._tab in dict(self._TABS) else "spots"
 
         # ---------- 概览 ----------
         if snapshot:
@@ -2336,14 +2381,13 @@ class ParkingBot(_PluginBase):
                          ["left", "center", "center", "right"])],
         )
 
-        # 车市是若干张卡片（特卖 / 车市 / 以旧换新），但顶部只给一个「② 车市」按钮，
-        # 所以整组套一个固定锚点。按卡片序号分配锚点会让「车市」按钮在有特卖时
-        # 跳到特卖卡上，所以这里不再按序号编号。
-        shop_section = self._section("pb-shop", {
-            "component": "div",
-            "props": {"style": {"display": "block", "width": "100%"}},
-            "content": shop_cards,
-        })
+        # 只渲染当前页签对应的那一个区块 —— 顶部按钮切换后由服务端重新下发，
+        # 所以页面上永远只有一块内容，不会再出现三个区块堆在一起。
+        sections = {
+            "spots": [spots_card, howto_card],
+            "shop": shop_cards,
+            "garage": [garage_card, history_card],
+        }
 
         return [
             head_card,
@@ -2353,16 +2397,8 @@ class ParkingBot(_PluginBase):
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[2]]},
                 {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [stats[3]]},
             ]},
-            self._nav_row([
-                ("① 我的车位", "pb-spots"),
-                ("② 车市", "pb-shop"),
-                ("③ 我的车库", "pb-garage"),
-            ]),
-            howto_card,
-            self._section("pb-spots", spots_card),
-            shop_section,
-            self._section("pb-garage", garage_card),
-            history_card,
+            self._nav_row(tab),
+            *sections[tab],
         ]
 
     def get_dashboard_meta(self) -> List[Dict[str, str]]:
