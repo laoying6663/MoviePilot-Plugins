@@ -67,9 +67,11 @@ class TabSwitch(BaseModel):
 
     页面上声明的 events 会以 POST + JSON body 打过来，所以参数必须收成
     Pydantic 模型；写成 `tab: str` 会被 FastAPI 当成查询参数，body 就丢了。
+    day 用来在「金币统计」页选择查看哪一天，留空表示看最新一天。
     """
 
-    tab: str = Field(default="spots", description="区块标识：spots / shop / garage")
+    tab: str = Field(default="spots", description="区块标识：spots / shop / garage / stats")
+    day: Optional[str] = Field(default=None, description="要查看的日期 YYYY-MM-DD，留空取最新")
 
 
 def _result(payload: Dict[str, Any]) -> ApiResult:
@@ -114,6 +116,9 @@ _ICONS = {
                'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
                'stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="17" rx="3"/>'
                '<path d="M7 20.5v-11h10v11"/><path d="M7 13.4h10M7 16.9h10"/></svg>'),
+    "stats": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
+              'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
+              'stroke-linejoin="round"><path d="M4 20V9.5M10 20V4M16 20v-7M22 20H2"/></svg>'),
 }
 
 
@@ -124,7 +129,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.10.0"
+    plugin_version = "1.11.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -163,8 +168,10 @@ class ParkingBot(_PluginBase):
     # ---------- 详情页区块 ----------
     # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
     _PLUGIN_ID = "ParkingBot"
-    _TABS = (("spots", "① 我的车位"), ("shop", "② 车市"), ("garage", "③ 我的车库"))
+    _TABS = (("spots", "① 我的车位"), ("shop", "② 车市"),
+             ("garage", "③ 我的车库"), ("stats", "④ 金币统计"))
     _tab = "spots"
+    _day = ""
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -198,9 +205,14 @@ class ParkingBot(_PluginBase):
         self._notify = bool(config.get("notify", True))
         self._auto_buy = self._as_switch(config.get("auto_buy"))
         self._auto_trade = self._as_switch(config.get("auto_trade"))
-        # 记住上次停留的区块；插件重载、MoviePilot 重启后仍回到原来那一页
-        saved_tab = str(self.get_data("tab") or "").strip()
+        # 记住上次停留的区块与查看的日期；插件重载、MoviePilot 重启后仍回到原来那一页
+        saved_view = self.get_data("view") or {}
+        if not isinstance(saved_view, dict):
+            saved_view = {}
+        saved_tab = str(saved_view.get("tab") or "").strip()
         self._tab = saved_tab if saved_tab in dict(self._TABS) else "spots"
+        saved_day = str(saved_view.get("day") or "").strip()
+        self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
         self._cars_cache = {}
 
@@ -1053,6 +1065,7 @@ class ParkingBot(_PluginBase):
                 self._page_cache = {
                     "snapshot": snapshot,
                     "history": (self._page_cache or {}).get("history") or [],
+                    "daily": (self._page_cache or {}).get("daily") or {},
                 }
                 return
 
@@ -1073,8 +1086,34 @@ class ParkingBot(_PluginBase):
             })
             history = history[:50]
             await self.async_save_data("history", history)
+
+            # 执行历史只有 50 轮（约 4 小时），撑不起「每天金币统计」。
+            # 这里另存一份按天累计：日期 → 当日收益/停放/挪走/轮次 + 24 小时分桶，
+            # 长期保留，「金币统计」页的柱状图与日汇总都从这里出。
+            day_key = now.strftime("%Y-%m-%d")
+            hour_key = str(now.hour)
+            if self._page_cache is not None:
+                daily = dict(self._page_cache.get("daily") or {})
+            else:
+                stored_daily = await self.async_get_data("daily") or {}
+                daily = dict(stored_daily) if isinstance(stored_daily, dict) else {}
+            bucket = dict(daily.get(day_key) or {})
+            bucket["earned"] = self._to_int(bucket.get("earned"), 0) + earned
+            bucket["parked"] = self._to_int(bucket.get("parked"), 0) + new_parked
+            bucket["moved"] = self._to_int(bucket.get("moved"), 0) + moved
+            bucket["rounds"] = self._to_int(bucket.get("rounds"), 0) + 1
+            hours = dict(bucket.get("hours") or {})
+            hours[hour_key] = self._to_int(hours.get(hour_key), 0) + earned
+            bucket["hours"] = hours
+            daily[day_key] = bucket
+            # 只留最近 60 天，防止无限增长
+            if len(daily) > 60:
+                for old in sorted(daily)[:-60]:
+                    daily.pop(old, None)
+            await self.async_save_data("daily", daily)
+
             # 同步刷新内存缓存：页面渲染与之后的插件重载都直接读它
-            self._page_cache = {"snapshot": snapshot, "history": history}
+            self._page_cache = {"snapshot": snapshot, "history": history, "daily": daily}
         except Exception as err:
             logger.warning(f"[不可躺自动抢车位] 记录本轮结果失败：{err}")
             # 兜底给缓存一个确定值。否则 _page_cache 一直是 None，
@@ -1410,6 +1449,175 @@ class ParkingBot(_PluginBase):
         }
 
     @staticmethod
+    def _day_chips(days: List[Tuple[str, int]], current: str, api: str) -> dict:
+        """
+        参考图那种横向日期卡片：一天一张，点一下切到那天。
+
+        每张卡直接带上「切到 stats 页并选中该日」的事件，所以点卡片会同时
+        切换页签和日期 —— 否则人在别的页签上点了卡片，日期改了却看不见。
+        """
+        cards = []
+        for day, total in days:
+            active = (day == current)
+            cards.append({
+                "component": "div",
+                "props": {"style": {
+                    "flex": "0 0 auto",
+                    "minWidth": "118px",
+                    "margin": "0 8px 8px 0",
+                    "padding": "10px 14px",
+                    "borderRadius": "12px",
+                    "cursor": "pointer",
+                    "userSelect": "none",
+                    "border": (f"1px solid {_PURPLE}" if active
+                               else "1px solid rgba(255,255,255,0.12)"),
+                    "backgroundColor": (
+                        "rgba(167,139,250,0.16)" if active else "rgba(255,255,255,0.04)"),
+                }},
+                "content": [
+                    ParkingBot._text(day, {"fontSize": "13px", "fontWeight": "bold"}),
+                    ParkingBot._text(f"🪙 {total}", {"fontSize": "14px", "color": _GOLD,
+                                                     "marginTop": "3px"}),
+                ],
+                "events": {"click": {"api": api, "method": "post",
+                                     "params": {"tab": "stats", "day": day}}},
+            })
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "overflowX": "auto",
+                                "marginRight": "-8px", "paddingBottom": "2px"}},
+            "content": cards,
+        }
+
+    @staticmethod
+    def _hour_chart(hours: Dict[str, Any]) -> dict:
+        """
+        24 小时收益柱状图。
+
+        用 div 高度画，不用图表库：插件页是声明式 JSON，引不了 ApexCharts，
+        而纯 CSS 柱子在任何宿主上都能出来。有收益的小时用金色，零收益压平。
+        """
+        values = [ParkingBot._to_int(hours.get(str(h)), 0) for h in range(24)]
+        peak = max(values) or 1
+        bars = []
+        for hour, value in enumerate(values):
+            ratio = value / peak if peak else 0
+            height = max(2, round(ratio * 78))
+            bars.append({
+                "component": "div",
+                "props": {"style": {
+                    "flex": "1 1 0",
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "alignItems": "center",
+                    "justifyContent": "flex-end",
+                    "margin": "0 1px",
+                }},
+                "content": [
+                    {"component": "div", "props": {"style": {
+                        "width": "100%",
+                        "height": f"{height}px",
+                        "borderRadius": "3px 3px 0 0",
+                        "backgroundColor": (_GOLD if value else "rgba(255,255,255,0.10)"),
+                        "opacity": "1" if value else "0.5",
+                    }}},
+                ],
+            })
+        # 横轴标签每小时一个太挤，2 小时一个
+        axis = [{"component": "div", "props": {"style": {
+            "flex": "1 1 0", "textAlign": "center", "fontSize": "10px",
+            "opacity": "0.55"}}, "text": f"{h:02d}" if h % 2 == 0 else ""}
+            for h in range(24)]
+        return {
+            "component": "div",
+            "props": {"style": {"marginTop": "4px"}},
+            "content": [
+                {"component": "div",
+                 "props": {"style": {"display": "flex", "alignItems": "flex-end",
+                                     "height": "80px",
+                                     "borderBottom": "1px solid rgba(255,255,255,0.14)"}},
+                 "content": bars},
+                {"component": "div",
+                 "props": {"style": {"display": "flex", "marginTop": "4px"}},
+                 "content": axis},
+            ],
+        }
+
+    def _stats_page(self, daily: Dict[str, Any], history: List[dict],
+                    today_earned: int) -> dict:
+        """
+        金币统计页：日期卡片行 + 当日汇总 + 24 小时柱状图 + 每日明细表。
+
+        执行历史只有 50 轮（约 4 小时），做不了按天统计，所以另有一份按天累计
+        的存档 daily 在每轮结束时累加，这里只是把它画出来。
+        """
+        api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
+        days = sorted(daily.keys(), reverse=True)
+        if not days:
+            return self._card(
+                "金币统计",
+                "从下一轮执行开始累积数据",
+                [self._text("还没有统计数据，插件执行一轮后就会出现。",
+                            {"fontSize": "13px", "opacity": "0.7"})])
+
+        current = self._day if self._day in daily else days[0]
+        bucket = daily.get(current) or {}
+        hours = bucket.get("hours") or {}
+        day_total = self._to_int(bucket.get("earned"), 0)
+        month_prefix = current[:7]
+        month_total = sum(self._to_int((v or {}).get("earned"), 0)
+                          for k, v in daily.items() if str(k).startswith(month_prefix))
+        avg = round(month_total / max(1, sum(1 for k in daily
+                                             if str(k).startswith(month_prefix))))
+
+        blocks = [
+            # 最近 7 天日期卡片
+            self._card("", "", [self._day_chips(
+                [(d, self._to_int((daily[d] or {}).get("earned"), 0)) for d in days[:7]],
+                current, api)]),
+            # 当日汇总
+            {"component": "div",
+             "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                 "marginRight": "-8px", "marginBottom": "12px"}},
+             "content": [
+                 self._stat("当日收益", day_total, _GOLD),
+                 self._stat("本月累计", month_total, _GREEN),
+                 self._stat("本月日均", avg, _CYAN),
+                 self._stat("挪走次数", self._to_int(bucket.get("moved"), 0), _PURPLE),
+             ]},
+            # 小时柱状图
+            self._card(f"{current} · 每小时收益",
+                       f"当日共 {self._to_int(bucket.get('rounds'), 0)} 轮执行",
+                       [self._hour_chart(hours)]),
+            # 每日明细
+            self._card(
+                "每日明细",
+                f"共 {len(days)} 天记录，最多保留 60 天",
+                [self._table(
+                    ["日期", "收益", "新停放", "挪走", "轮次"],
+                    [[d,
+                      str(self._to_int((daily[d] or {}).get("earned"), 0)),
+                      str(self._to_int((daily[d] or {}).get("parked"), 0)),
+                      str(self._to_int((daily[d] or {}).get("moved"), 0)),
+                      str(self._to_int((daily[d] or {}).get("rounds"), 0))]
+                     for d in days[:30]],
+                    ["3", "2", "2", "2", "2"],
+                    ["left", "right", "center", "center", "center"])]),
+        ]
+        # 最近几轮明细放在最下面，保留原来的执行历史能力
+        if history:
+            blocks.append(self._card(
+                "最近 10 轮",
+                "单轮执行明细（最多保留 50 轮）",
+                [self._table(["时间", "新停放", "挪走", "收益(金币)"],
+                             [[i.get("time", ""), str(i.get("parked", 0)),
+                               str(i.get("moved", 0)), str(i.get("earned", 0))]
+                              for i in history[:10]],
+                             ["2", "1", "1", "1"],
+                             ["left", "center", "center", "right"])]))
+        return {"component": "div", "props": {"style": {}}, "content": blocks}
+
+    @staticmethod
     def _spot_grid(spots: List[dict]) -> dict:
         """
         我的车位：照游戏本体的画法，两列网格，空车位是斜纹底 + 角标。
@@ -1517,9 +1725,12 @@ class ParkingBot(_PluginBase):
         若投影函数每次都查库，保存就会被数据库往返次数拖住。
         """
         if self._page_cache is not None:
-            return self._page_cache.get("snapshot") or {}, self._page_cache.get("history") or []
+            return (self._page_cache.get("snapshot") or {},
+                    self._page_cache.get("history") or [],
+                    self._page_cache.get("daily") or {})
         snapshot = self.get_data("snapshot") or {}
         history = self.get_data("history") or []
+        daily = self.get_data("daily") or {}
         # 存档被写坏时（比如历史升级后结构变了）不能让整个详情页崩成 500，
         # 退化成空数据即可，页面仍能看到框架和区块。
         if not isinstance(snapshot, dict):
@@ -1527,8 +1738,10 @@ class ParkingBot(_PluginBase):
             snapshot = {}
         if not isinstance(history, list):
             history = []
-        self._page_cache = {"snapshot": snapshot, "history": history}
-        return snapshot, history
+        if not isinstance(daily, dict):
+            daily = {}
+        self._page_cache = {"snapshot": snapshot, "history": history, "daily": daily}
+        return snapshot, history, daily
 
     @staticmethod
     def _today_earned(history: List[dict]) -> int:
@@ -1935,7 +2148,7 @@ class ParkingBot(_PluginBase):
 
     async def api_set_tab(self, request: TabSwitch) -> ApiResult:
         """
-        记住详情页当前停留的区块。
+        记住详情页当前停留的区块，以及「金币统计」页正在查看哪一天。
 
         页面渲染器在执行完事件后会重新拉一次 plugin/page/{id}，
         所以这里只要把选择记下来，get_page() 自然就只渲染选中的那一个区块。
@@ -1944,8 +2157,14 @@ class ParkingBot(_PluginBase):
         if tab not in dict(self._TABS):
             return _result({"success": False, "error": f"未知区块：{tab}"})
         self._tab = tab
+        saved = {"tab": tab}
+        # day 只在「金币统计」页有意义；非空且格式合法才认
+        day = str(getattr(request, "day", "") or "").strip()
+        if day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            self._day = day
+            saved["day"] = day
         try:
-            await self.async_save_data("tab", tab)
+            await self.async_save_data("view", saved)
         except Exception as err:
             # 记不住只影响下次打开时回到默认页签，不该让点击直接失败
             logger.warning(f"[不可躺自动抢车位] 保存详情页页签失败：{err}")
@@ -2474,7 +2693,7 @@ class ParkingBot(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """返回插件详情页：顶部切换栏 + 当前选中的那一个区块。"""
-        snapshot, history = self._page_data()
+        snapshot, history, daily = self._page_data()
         today_earned = self._today_earned(history)
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
         note = str(snapshot.get("note") or "")
@@ -2580,12 +2799,16 @@ class ParkingBot(_PluginBase):
                          ["left", "center", "center", "right"])],
         )
 
+        stats_cards = [self._stats_page(daily, history, today_earned)]
+
         # 只渲染当前页签对应的那一个区块 —— 顶部按钮切换后由服务端重新下发，
         # 所以页面上永远只有一块内容，不会再出现三个区块堆在一起。
+        # 执行历史已挪到「金币统计」页，车库页不再夹带。
         sections = {
             "spots": [spots_card, howto_card],
             "shop": shop_cards,
-            "garage": [garage_card, history_card],
+            "garage": [garage_card],
+            "stats": stats_cards,
         }
 
         return [
@@ -2608,7 +2831,7 @@ class ParkingBot(_PluginBase):
         """返回主面板状态卡：账户概览 + 本进程累计收益。"""
         if key != "status":
             return None
-        snapshot, _ = self._page_data()
+        snapshot, _, _ = self._page_data()
         if snapshot:
             subtitle = (f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
                         f" · 金币 {snapshot.get('cash', 0)}"
