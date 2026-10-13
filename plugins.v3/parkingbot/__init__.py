@@ -10,6 +10,7 @@ import asyncio
 import random
 import re
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -85,6 +86,12 @@ class CarTradeRequest(BaseModel):
 
     old_car_id: Any = Field(description="拿去做旧车的车辆实例 ID")
     new_car_id: Any = Field(description="换成的目标车型 ID")
+
+
+class CarMoveRequest(BaseModel):
+    """挪车按钮的请求体。参数既可以是车库序号，也可以是车辆实例 ID。"""
+
+    car_id: Any = Field(description="要挪走的车辆：车库序号或车辆实例 ID")
 
 
 class FlashBuyRequest(BaseModel):
@@ -195,7 +202,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.16.0"
+    plugin_version = "1.17.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -245,6 +252,12 @@ class ParkingBot(_PluginBase):
     # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
     # 切页签回来还在，和 _cat / _trade_for 一个套路。
     _title_open = False
+    # 称号的进程内短缓存。游戏接口单次往返实测约 1.1 秒，而称号只在解锁或
+    # 切换时变：10 分钟 TTL 跨两个执行周期，稳定状态下每两轮才发一次请求。
+    # 特卖是限时场次，不缓存 —— 缓存后页面上会一直挂着已结束的场次。
+    _TITLES_TTL = 600.0
+    _titles_cache: List[dict] = []
+    _titles_at = 0.0
     # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
     # 只在内存里跨这一轮传递，不单独落盘。
     _shop_spent = 0
@@ -401,7 +414,13 @@ class ParkingBot(_PluginBase):
         min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"), 10, minimum=1)
         target_minutes = max(self._park_minutes, min_duration)
 
-        my_cars = [c for c in (state.get("userCars") or []) if c.get("userId") == user_id]
+        # 用户 ID 一律按字符串比较：state.userId 与 userCars[].userId 一旦一边是
+        # 数字一边是字符串，严格 == 会认定「名下没有车辆」，而聊天指令路径
+        # （_ordered_my_cars）用的是 str() 归一，两套口径会对不上。
+        # 非字典项一律滤掉：返回里混进字符串/数字时，下面 c.get() 直接抛
+        # AttributeError，整轮挪车、停车、买卖全部作废且没有任何提示。
+        my_cars = [c for c in (state.get("userCars") or [])
+                   if isinstance(c, dict) and str(c.get("userId")) == str(user_id)]
         # 名下一辆车都没有时先看能不能自己买一辆 —— 否则「自动买车」开关对
         # 新账号永远是死开关，因为这里会先一步 return 掉。
         if not my_cars and not self._auto_buy:
@@ -431,21 +450,31 @@ class ParkingBot(_PluginBase):
 
         def _recompute(state: dict) -> None:
             """按最新状态重算本轮要动的三类车辆与挪车时长门槛。"""
-            nonlocal parked, idle, charity, min_duration, target_minutes
+            nonlocal parked, idle, charity, min_duration, target_minutes, recomputed
             settings_map = state.get("gameSettings") or {}
             min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"),
                                         10, minimum=1)
             target_minutes = max(self._park_minutes, min_duration)
             mine = [c for c in (state.get("userCars") or [])
-                    if c.get("userId") == user_id]
+                    if isinstance(c, dict) and str(c.get("userId")) == str(user_id)]
             parked = [c for c in mine if c.get("status") not in ("idle", "charity")]
             idle = [c for c in mine if c.get("status") == "idle"]
             charity = [c for c in mine if c.get("status") == "charity"]
+            recomputed = True
 
         async def _refresh_state() -> bool:
-            """重新拉一次游戏状态。买卖改动了服务端，拿旧快照继续操作会用到废车 ID。"""
+            """
+            重新拉一次游戏状态。买卖改动了服务端，拿旧快照继续操作会用到废车 ID。
+
+            任何异常都吞掉并当作「刷新失败」返回 False —— 刷新失败时状态是陈旧的，
+            绝不能继续往下走：换车已经把旧车换掉了，拿废 ID 去 park 是白白发请求。
+            """
             nonlocal state
-            fresh = await client.get_json(f"{self.API_BASE}/state.php")
+            try:
+                fresh = await client.get_json(f"{self.API_BASE}/state.php")
+            except Exception as err:
+                logger.warning(f"[不可躺自动抢车位] 刷新游戏状态异常：{err}")
+                return False
             if fresh and fresh.get("success"):
                 state = fresh
                 _recompute(state)
@@ -494,15 +523,22 @@ class ParkingBot(_PluginBase):
             except Exception as err:
                 logger.error(f"[不可躺自动抢车位] 自动换新异常：{err}")
 
+        # 还能再停几辆。
+        #
+        # 买卖那几步会重新拉状态并重算 parked，被挪走的车此时已经是 idle，        # 自然不在 parked 里了 —— 这时再减一次 moved 就把同一批车扣了两遍，
+        # 「最多同时停放 N 辆」会被突破到 N+moved。只有没重算过（没做买卖）
+        # 时 parked 才还是挪车前的旧快照，才需要减掉 moved。
+        recomputed = False
         if stale_after_shop:
             self._set_result(shop_note or "状态刷新失败，本轮未停车")
             await self._record_round(client, state, user_id, 0, moved, earned_total,
                                      note=shop_note)
             return
 
+        still_parked = len(parked) - (0 if recomputed else moved)
         new_parked = await self._park_idle_cars(
-            client, idle, state.get("parkingSpots") or [], user_id,
-            max(0, self._max_cars - (len(parked) - moved)),
+            client, idle, self._dict_rows(state.get("parkingSpots")), user_id,
+            max(0, self._max_cars - still_parked),
         )
         self._summarize(new_parked, moved, earned_total)
 
@@ -737,7 +773,14 @@ class ParkingBot(_PluginBase):
         """
         if self._cars_cache:
             return self._cars_cache
-        data = await client.get_json(f"{self.API_BASE}/game_data.php")
+        # 网络异常也要兜住：run_once 主体没有 try，一次 ConnectTimeout 就会让
+        # 整轮挪车、停车、买卖全部作废，而且用户在界面上什么提示都收不到。
+        # 降级成「没有车型表」，本轮照常跑（只是收益排序退回默认）。
+        try:
+            data = await client.get_json(f"{self.API_BASE}/game_data.php")
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 读取车型表失败，本轮按无车型表继续：{err}")
+            return {}
         if data and data.get("success"):
             cars: Dict[Any, dict] = {}
             for item in (data.get("cars") or []):
@@ -771,6 +814,10 @@ class ParkingBot(_PluginBase):
     async def _load_flash_sales(self, client: AsyncRequestUtils) -> List[dict]:
         """
         拉取限时/限量特卖列表。
+
+        刻意不做缓存：特卖是限时场次，缓存几分钟后页面上仍挂着已经结束的场次，
+        抢购按钮点了只会报错。而执行周期 5 分钟，短于任何有意义�� TTL，
+        缓存在生产里根本命不中 —— 只在同一个周期内复用（与称号并行拉取）。
 
         这是一个锦上添花的功能，接口挂了或返回结构异常都不该影响停车挪车主流程，
         所以整段都兜住异常并返回空列表 —— 解析部分必须放在 try 内部，
@@ -806,7 +853,8 @@ class ParkingBot(_PluginBase):
             logger.debug(f"[不可躺自动抢车位] 读取特卖列表失败，已忽略：{err}")
             return []
 
-    async def _load_titles(self, client: AsyncRequestUtils, state: dict) -> dict:
+    async def _load_titles(self, client: AsyncRequestUtils, state: dict,
+                           force: bool = False) -> dict:
         """
         读取称号列表。
 
@@ -814,10 +862,19 @@ class ParkingBot(_PluginBase):
         titles.php。这里只留已获得的 —— 游戏的选择器同样只列 owned，列一堆
         拿不到的称号只会让人以为是自己哪里做错了。
 
+        按进程缓存 10 分钟：称号只在解锁或切换时变，而执行周期是 5 分钟，
+        这个 TTL 正好跨两个周期，稳定状态下每两轮才发一次请求。
+
         当前佩戴称号自己的颜色也一并带出来，页面上的标签要按称号的颜色显示，
         和游戏顶栏一致（currentTitleName 只在 state.php 里，颜色只有这里有）。
         """
         current = self._to_int(state.get("currentTitleId"), 0, minimum=0)
+        # 缓存命中时只需重算「当前佩戴的是哪个颜色」——列表本身不会因为
+        # 换了个称号而改变，不必重新解析。
+        cached = self._titles_cache
+        if cached and not force and time.monotonic() - self._titles_at < self._TITLES_TTL:
+            color = next((t["color"] for t in cached if t["id"] == current), _GOLD)
+            return {"owned": list(cached), "color": color}
         owned: List[dict] = []
         color = _GOLD
         try:
@@ -838,6 +895,10 @@ class ParkingBot(_PluginBase):
                           "owned": True})
             if title_id == current:
                 color = owned[-1]["color"]
+        # 请求失败时不要把空列表写进缓存，否则一次网络抖动会让接下来 10 分钟
+        # 的称号选择器都空着。
+        if data is not None:
+            self._titles_cache, self._titles_at = owned, time.monotonic()
         return {"owned": owned, "color": color}
 
     async def _load_game_context(self) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
@@ -1131,11 +1192,20 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _to_int(value: Any, default: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
-        """把配置值安全转成整数；非法值回落到默认值，越界值收敛到边界。"""
+        """
+        把配置值安全转成整数；非法值回落到默认值，越界值收敛到边界。
+
+        JSON 里的浮点数（1000.0）和字符串小数（"12.7"）int(str(...)) 会直接抛，
+        旧写法一律回落默认值 —— 页面于是把金币显示成 0，而 _fmt_num 又显示 1000，
+        同一份数据两个数。所以这里先试浮点、再截断取整。
+        """
         try:
             number = int(str(value).strip())
         except (TypeError, ValueError):
-            return default
+            try:
+                number = int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                return default
         if number < minimum:
             return minimum
         if maximum is not None and number > maximum:
@@ -1178,14 +1248,17 @@ class ParkingBot(_PluginBase):
         """
         try:
             cars_map = await self._load_cars_map(client)
-            flash = await self._load_flash_sales(client)
-            titles = await self._load_titles(client, state)
+            # 两者互不依赖，并行拉取：各要 1.1 秒，串行就是 2.2 秒
+            flash, titles = await asyncio.gather(
+                self._load_flash_sales(client), self._load_titles(client, state))
             rules = state.get("gameSettings") or {}
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
             mine = (state.get("users") or {}).get(user_id) or {}
-            my_cars = [c for c in (state.get("userCars") or []) if c.get("userId") == user_id]
-            my_spots = [s for s in (state.get("parkingSpots") or []) if s.get("ownerId") == user_id]
+            my_cars = [c for c in (state.get("userCars") or [])
+                       if isinstance(c, dict) and str(c.get("userId")) == str(user_id)]
+            my_spots = [s for s in (state.get("parkingSpots") or [])
+                        if isinstance(s, dict) and str(s.get("ownerId")) == str(user_id)]
             # 展示用时间戳与时长计算统一走 MoviePilot 时区，避免两者漂移
             now = self._now_naive()
 
@@ -1259,12 +1332,22 @@ class ParkingBot(_PluginBase):
             await self.async_save_data("snapshot", snapshot)
 
             if not record_history:
-                # 买卖类操作只刷新展示，历史保持原样
-                self._page_cache = {
-                    "snapshot": snapshot,
-                    "history": (self._page_cache or {}).get("history") or [],
-                    "daily": (self._page_cache or {}).get("daily") or {},
-                }
+                # 买卖类操作只刷新展示，历史保持原样。
+                #
+                # 这里绝不能在 _page_cache 为 None 时把 history/daily 写成空：
+                # 进程刚起（或插件重载）后还没打开过详情页，从聊天侧触发一次
+                # /买车 就会走到这里，下一轮 run_once 看到缓存非空便拿这份空值
+                # 整份覆盖回库，落盘的历史与每日统计直接清空。所以同样先捞一次库。
+                cache = self._page_cache
+                if cache is None:
+                    stored_h = await self.async_get_data("history") or []
+                    stored_d = await self.async_get_data("daily") or {}
+                    cache = {
+                        "history": list(stored_h) if isinstance(stored_h, list) else [],
+                        "daily": dict(stored_d) if isinstance(stored_d, dict) else {},
+                    }
+                cache["snapshot"] = snapshot
+                self._page_cache = cache
                 return
 
             # 历史在内存里维护一份，避免每轮都读库。但插件重载会把模块重新执行、
@@ -1995,8 +2078,11 @@ class ParkingBot(_PluginBase):
             return ParkingBot._text(fallback, {"fontSize": f"{size // 2}px",
                                                 "textAlign": "center",
                                                 "opacity": "0.45"})
+        # 地址是要拼进 src="..." 的，游戏侧一旦返回带引号的字符串就能把属性
+        # 提前闭合、把 onerror 之类的内容注进页面。这里先把引号实体化。
+        safe_url = str(url).replace('"', "&quot;").replace("'", "&#39;")
         html = (
-            f'<img src="{url}" loading="lazy" decoding="async" '
+            f'<img src="{safe_url}" loading="lazy" decoding="async" '
             f'style="width:{size}px;height:{size}px;object-fit:contain;" '
             f'onerror="this.style.display=\'none\';'
             f'this.nextElementSibling.style.display=\'flex\';">'
@@ -2192,19 +2278,29 @@ class ParkingBot(_PluginBase):
             history = []
         if not isinstance(daily, dict):
             daily = {}
+        # 元素级也一起清一遍：容器对不代表元素对。history 里混进一个字符串，
+        # 渲染路径上 i.get() 就会抛，整页 500；daily 的桶同理。
+        history = [row for row in history if isinstance(row, dict)]
+        daily = {k: v for k, v in daily.items() if isinstance(v, dict)}
         self._page_cache = {"snapshot": snapshot, "history": history, "daily": daily}
         return snapshot, history, daily
 
-    @staticmethod
-    def _today_earned(history: List[dict]) -> int:
+    @classmethod
+    def _today_earned(cls, history: List[dict]) -> int:
         """
         统计今天的挪车收益。
 
         历史条目带 day（YYYY-MM-DD），按天筛选比解析展示用的 time 字符串可靠。
+
+        「今天」必须按 MoviePilot 设定时区算：写 day 用的是 _now_naive()（设定
+        时区），这里若用 datetime.now()（系统时区），两者差几小时就会让每天有
+        大半天「今日收益」恒为 0。
         """
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = cls._now_naive().strftime("%Y-%m-%d")
         total = 0
         for item in history:
+            if not isinstance(item, dict):
+                continue
             if str(item.get("day") or "") != today:
                 continue
             try:
@@ -2275,15 +2371,28 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _spawn(coro) -> None:
-        """在事件回调里跑异步逻辑：有事件循环就建任务，否则起后台线程。"""
+        """
+        在事件回调里跑异步逻辑：有事件循环就建任务，否则起后台线程。
+
+        协程内部抛异常时必须吞掉并记日志：任务没人 await，异常只会以
+        「Task exception was never retrieved」的形式丢在事件循环里，
+        用户那边一个字都收不到，还以为指令没生效。
+        """
+        async def _guard():
+            try:
+                await coro
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 指令执行异常：{err}")
+
+        guarded = _guard()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is not None and loop.is_running():
-            loop.create_task(coro)
+            loop.create_task(guarded)
             return
-        threading.Thread(target=lambda: asyncio.run(coro), daemon=True).start()
+        threading.Thread(target=lambda: asyncio.run(guarded), daemon=True).start()
 
     def _reply_data(self, data: dict, title: str, text: str, buttons=None) -> None:
         """按事件上下文回复用户，失败只记日志不影响插件。"""
@@ -2500,7 +2609,7 @@ class ParkingBot(_PluginBase):
         if not car_id:
             self._reply_data(sender, "❌ 没找到这辆车", "先发 /车库 查看序号与车辆 ID。")
             return
-        result = await self.api_unpark(car_id)
+        result = await self.api_unpark(CarMoveRequest(car_id=car_id))
         await self._after_action(result, sender, "挪车")
 
     async def _cmd_buy(self, args: List[str], sender: dict) -> None:
@@ -2671,6 +2780,39 @@ class ParkingBot(_PluginBase):
             # 记不住只影响下次打开时回到默认状态，不该让点击直接失败
             logger.warning(f"[不可躺自动抢车位] 保存详情页状态失败：{err}")
 
+    async def _patch_snapshot_title(self, title_id: int, title_name: str) -> bool:
+        """
+        就地改掉快照里的称号字段，省掉整份重拉。
+
+        返回 False 表示快照还没进内存（进程刚起且没打开过详情页），此时该
+        退回整份重拉，否则页面会一直显示旧称号。
+        """
+        cache = self._page_cache or {}
+        snapshot = cache.get("snapshot") or {}
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False
+        color = _GOLD
+        name = title_name
+        for item in self._dict_rows(snapshot.get("titles")):
+            if self._to_int(item.get("id"), 0) != title_id:
+                continue
+            color = str(item.get("color") or _GOLD)
+            name = name or str(item.get("name") or "")
+            break
+        if not title_id:
+            name, color = "", _GOLD
+        snapshot["title_id"] = title_id
+        snapshot["title_name"] = name
+        snapshot["title_color"] = color
+        cache["snapshot"] = snapshot
+        self._page_cache = cache
+        try:
+            await self.async_save_data("snapshot", snapshot)
+        except Exception as err:
+            # 落盘失败只影响下次打开时的显示，本次的返回值照样是成功
+            logger.warning(f"[不可躺自动抢车位] 保存称号快照失败：{err}")
+        return True
+
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
         self._title_open = bool(getattr(request, "open", False))
@@ -2696,11 +2838,14 @@ class ParkingBot(_PluginBase):
         if not result or not result.get("success"):
             return _result({"success": False,
                             "error": (result or {}).get("error") or "切换称号失败"})
-        # 换完立刻拉一次快照，否则页面上还是旧称号，得等下一轮才对
-        await self._refresh_snapshot(client, "切换称号")
+        # 换称号只影响 title_id / title_name / title_color 三个字段，POST 的
+        # 返回值里已经有新称号的名字，颜色从快照里的称号列表查得到。为了这三项
+        # 整份重拉 state + 特卖 + 称号，是 4 次约 4.4 秒的往返，纯浪费。
+        name = str(result.get("titleName") or "")
+        if not await self._patch_snapshot_title(title_id, name):
+            await self._refresh_snapshot(client, "切换称号")
         self._title_open = False
         await self._save_view({"title_open": False})
-        name = str(result.get("titleName") or "")
         self._set_result(f"称号已切换为：{name}" if name else "已取消佩戴称号")
         logger.info(f"[不可躺自动抢车位] 称号切换为：{name or '无'}")
         return _result({"success": True, "titleId": title_id, "name": name})
@@ -2810,12 +2955,19 @@ class ParkingBot(_PluginBase):
         # 旧车必须是我的车，且处于空闲状态（停着的车不能拿去换）
         user_id = state.get("userId")
         old_car = next((c for c in (state.get("userCars") or [])
-                        if str(c.get("id")) == old_key
+                        if isinstance(c, dict)
+                        and str(c.get("id")) == old_key
                         and str(c.get("userId")) == str(user_id)), None)
         if not old_car:
             return _result({"success": False, "error": "旧车不存在或不属于当前账号"})
         if old_car.get("status") != "idle":
             return _result({"success": False, "error": "只有空闲车辆能用来以旧换新"})
+
+        # 限时车（carId=0）不在车型表里，旧价会被算成 0，补价就成了全款，
+        # 而且换掉之后再也买不回来。自动换新一直挡着这里，手动接口同样必须挡。
+        if not self._lookup_car(cars_map, old_car.get("carId")):
+            return _result({"success": False,
+                            "error": "限时车不在车型表里，无法估出旧价，不能用来以旧换新"})
 
         new_def = self._lookup_car(cars_map, new_car_id)
         if not new_def:
@@ -2894,7 +3046,7 @@ class ParkingBot(_PluginBase):
         logger.info(f"[不可躺自动抢车位] 抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
         return _result({"success": True, "name": name, "price": sale.get("price", 0)})
 
-    async def api_unpark(self, car_id: Any) -> ApiResult:
+    async def api_unpark(self, request: CarMoveRequest) -> ApiResult:
         """
         立即挪车接口。
 
@@ -2905,7 +3057,8 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": "插件未启用"})
         # 车辆 ID 用字符串处理：游戏侧不保证是纯数字，按数字解析会把
         # 非数字 ID 误判成「缺少车辆 ID」。筛选时同样按字符串比较。
-        target = str(car_id if car_id is not None else "").strip()
+        raw = getattr(request, "car_id", None)
+        target = str(raw if raw is not None else "").strip()
         if not target:
             return _result({"success": False, "error": "缺少车辆 ID"})
 
@@ -3140,6 +3293,19 @@ class ParkingBot(_PluginBase):
                               kind="trade")])
 
     @staticmethod
+    def _dict_rows(value: Any) -> List[dict]:
+        """
+        只留列表里的字典项。
+
+        快照是落盘的数据，跨版本、跨手动改动都可能出现非字典项。渲染路径上
+        任何一个 c.get() 撞上字符串或数字都会 AttributeError，整页 500。
+        这里统一在入口滤一次，比在每个渲染函数里各写一遍 isinstance 可靠。
+        """
+        if not isinstance(value, list):
+            return []
+        return [row for row in value if isinstance(row, dict)]
+
+    @staticmethod
     def _fmt_num(value: Any) -> str:
         """
         抄游戏 formatNum 的口径：一万以上折成 K，一千万以上折成 M，以下走千分位。
@@ -3344,6 +3510,20 @@ class ParkingBot(_PluginBase):
         }))
         return {"component": "div", "props": {"style": {}}, "content": content}
 
+    @staticmethod
+    def _is_tradeable_idle(car: dict, price_by_id: Dict[str, int]) -> bool:
+        """
+        这辆车能不能拿来以旧换新。
+
+        限时车（carId 为 0）的名字与价格挂在车辆实例上、不在车型表里，
+        按车型表查价只会得到 0：任何车型都满足「旧价 0 < 新价」，于是它会被
+        当成「补差价即可换掉」—— 而限时车换掉就再也买不回来。自动换新路径早就
+        挡了这条，页面上的手动路径必须同样挡，否则是白送一辆车。
+        """
+        if not isinstance(car, dict):
+            return False
+        return str(car.get("carId")) in price_by_id
+
     def _trade_picker(self, target: dict, idle_cars: List[dict],
                       price_by_id: Dict[str, int], cash: int,
                       trade_api: str, pick_api: str) -> dict:
@@ -3358,6 +3538,11 @@ class ParkingBot(_PluginBase):
         target_price = self._to_int(target.get("price"), 0)
         rows = []
         for car in idle_cars:
+            # 限时车（carId=0）不在车型表里，价格查出来是 0，会让任何车型都
+            # 满足「旧价 < 新价」，等于按 0 元把它换掉 —— 而它根本换不回来。
+            # 自动换新早就挡住了，这里必须同样挡住。
+            if not self._is_tradeable_idle(car, price_by_id):
+                continue
             old_price = price_by_id.get(str(car.get("carId")), 0)
             if old_price >= target_price:
                 continue
@@ -3512,7 +3697,8 @@ class ParkingBot(_PluginBase):
                     actions = None
                 else:
                     upgradable = [c for c in idle_cars
-                                  if price_by_id.get(str(c.get("carId")), 0) < price]
+                                  if self._is_tradeable_idle(c, price_by_id)
+                                  and price_by_id.get(str(c.get("carId")), 0) < price]
                     actions = [
                         self._action_btn("购买", buy_api, {"car_id": car.get("id")},
                                          disabled=full or price > cash),
@@ -3687,6 +3873,14 @@ class ParkingBot(_PluginBase):
             "content": head_lines,
         }
 
+        # 只构造当前页签对应的那一个区块。
+        #
+        # 除了省掉另外三个页签的渲染开销（实测整页 0.6ms，本来就不痛），更重要的是
+        # 隔离故障：以前四个区块无条件全构造再挑一个返回，快照里任意一处脏数据
+        # 都会让四个页签一起 500。现在脏数据只砸自己那一页。
+        #
+        # 执行历史已挪到「金币统计」页，车库页不再夹带。
+        min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
         howto_card = self._card(
             "怎么操作",
             "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
@@ -3701,39 +3895,20 @@ class ParkingBot(_PluginBase):
                            {"fontSize": "11px", "opacity": "0.6", "marginTop": "8px"}),
             ])
 
-        garage_card = self._card(
-            "我的车库",
-            f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
-            [self._garage(snapshot.get("cars") or [], min_duration)],
-        )
-
-        spots_card = self._card(
-            "我的车位",
-            "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
-            [self._spot_grid(snapshot.get("spots") or [])],
-        )
-
-        history_card = self._card(
-            "执行历史",
-            "最近 10 轮定时或手动执行的记录（最多保留 50 轮）",
-            [self._table(["时间", "新停放", "挪走", "收益(金币)"],
-                         [[i.get("time", ""), str(i.get("parked", 0)),
-                           str(i.get("moved", 0)), str(i.get("earned", 0))] for i in history[:10]],
-                         ["2", "1", "1", "1"],
-                         ["left", "center", "center", "right"])],
-        )
-
-        stats_cards = [self._stats_page(daily, history, today_earned)]
-
-        # 只渲染当前页签对应的那一个区块 —— 顶部按钮切换后由服务端重新下发，
-        # 所以页面上永远只有一块内容，不会再出现三个区块堆在一起。
-        # 执行历史已挪到「金币统计」页，车库页不再夹带。
-        sections = {
-            "spots": [spots_card, howto_card],
-            "shop": shop_cards,
-            "garage": [garage_card],
-            "stats": stats_cards,
-        }
+        if tab == "spots":
+            sections = [self._card(
+                "我的车位",
+                "私家车位被他人停用超过 5 分钟后对方才能贴条，收益按 70% / 30% 分成",
+                [self._spot_grid(self._dict_rows(snapshot.get("spots")))]), howto_card]
+        elif tab == "shop":
+            sections = self._build_shop(snapshot)
+        elif tab == "garage":
+            sections = [self._card(
+                "我的车库",
+                f"停车不足 {min_duration} 分钟的车不能挪走，指令会标灰",
+                [self._garage(self._dict_rows(snapshot.get("cars")), min_duration)])]
+        else:
+            sections = [self._stats_page(daily, history, today_earned)]
 
         title_picker = ([self._title_picker(snapshot)]
                         if snapshot and self._title_open
@@ -3749,7 +3924,7 @@ class ParkingBot(_PluginBase):
                                  "marginRight": "-8px", "marginBottom": "4px"}},
              "content": stats},
             self._nav_row(tab),
-            *sections[tab],
+            *sections,
         ]
 
     def get_dashboard_meta(self) -> List[Dict[str, str]]:
