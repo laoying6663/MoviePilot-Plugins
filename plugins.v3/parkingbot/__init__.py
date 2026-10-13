@@ -132,7 +132,7 @@ class ParkingBot(_PluginBase):
     plugin_desc = ("自动把车停到他人私家车位赚金币，停够时长后自动挪车结算，"
                    "可选自动买车与以旧换新。复用「站点管理」里 tangpt.top 的登录态。")
     plugin_icon = "Parking_A.jpg"
-    plugin_version = "1.13.0"
+    plugin_version = "1.14.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -723,6 +723,8 @@ class ParkingBot(_PluginBase):
                     "endsAt": item.get("endsAt"),
                     "stock": self._to_int(item.get("totalStock"), 0, minimum=0),
                     "sold": self._to_int(item.get("soldCount"), 0, minimum=0),
+                    "image": self._asset_url(item.get("image")
+                                            or item.get("carImage")),
                 })
             return sales
         except Exception as err:
@@ -1083,10 +1085,14 @@ class ParkingBot(_PluginBase):
                 mins = max(0, (self._now_naive() - parked_at).total_seconds() / 60) if parked_at else 0
                 rate = self._earn_per_min(car, cars_map)
                 status = car.get("status")
+                # 限时车（carId 为 0）名字与图都挂在车辆实例上，不在车型表里
+                definition = self._lookup_car(cars_map, car.get("carId")) or {}
                 cars.append({
                     "id": car.get("id"),
                     "carId": car.get("carId"),
                     "name": self._car_name(car, cars_map),
+                    "image": self._asset_url(definition.get("image")
+                                            or car.get("flashCarImage")),
                     "rate": rate,
                     "status": "空闲" if status == "idle" else ("爱心停车" if status == "charity" else "停车中"),
                     "mins": round(mins),
@@ -1829,13 +1835,19 @@ class ParkingBot(_PluginBase):
         一张图片节点，走内联 html（插件页的声明式 JSON 引不了图片组件）。
 
         游戏站的图挂了或没有图时退回占位符，所以内联 onerror 隐藏自己、显示兜底。
+
+        loading="lazy" 是这里的关键：车市一屏能有二十多辆车图，不加懒加载会
+        在打开页面时一次性全拉。游戏站本身有 Cloudflare 边缘缓存、浏览器再缓存
+        4 小时，所以同图重复打开不会重复下载 —— 没必要把图搬到本地，
+        真正浪费的是首屏把看不见的图也下下来。
         """
         if not url:
             return ParkingBot._text(fallback, {"fontSize": f"{size // 2}px",
                                                 "textAlign": "center",
                                                 "opacity": "0.45"})
         html = (
-            f'<img src="{url}" style="width:{size}px;height:{size}px;object-fit:contain;" '
+            f'<img src="{url}" loading="lazy" decoding="async" '
+            f'style="width:{size}px;height:{size}px;object-fit:contain;" '
             f'onerror="this.style.display=\'none\';'
             f'this.nextElementSibling.style.display=\'flex\';">'
             f'<span style="display:none;width:{size}px;height:{size}px;align-items:center;'
@@ -2665,7 +2677,7 @@ class ParkingBot(_PluginBase):
     @staticmethod
     def _garage(cars: List[dict], min_duration: int) -> dict:
         """
-        车库视图：照游戏车库页的排版，一辆车一张卡，字段在上、值在下。
+        车库视图：照游戏车库页的排版，左图右信息，字段在上、值在下。
 
         停够最短时长的车才给「立即挪车」指令，其余置灰并显示还差几分钟。
         车牌、每分钟收益、状态、已停时长都直接来自游戏车库数据（state.php 的 userCars）。
@@ -2686,21 +2698,21 @@ class ParkingBot(_PluginBase):
             # 那种快照没有 no 字段，直接取会渲染成「/挪车 None」。
             # 列表顺序与 _ordered_my_cars 的排序口径一致，所以位置就是指令序号。
             number = item.get("no") or position
+            name = str(item.get("name") or "")
 
-            cards.append({
+            # 左图右信息，和游戏车库卡片一致
+            picture = {
                 "component": "div",
-                "props": {"style": {
-                    "flex": "1 1 260px",
-                    "minWidth": "240px",
-                    "margin": "0 8px 8px 0",
-                    "padding": "12px 14px 10px",
-                    "borderRadius": "14px",
-                    "border": "1px solid rgba(255,255,255,0.10)",
-                    "backgroundColor": "rgba(255,255,255,0.045)",
-                }},
+                "props": {"style": {"flex": "0 0 auto", "width": "76px",
+                                    "display": "flex", "justifyContent": "center",
+                                    "alignItems": "flex-start", "paddingTop": "2px"}},
+                "content": [ParkingBot._pic(item.get("image"), name[:1] or "🚗", 68)],
+            }
+            info = {
+                "component": "div",
+                "props": {"style": {"flex": "1 1 auto", "minWidth": "0"}},
                 "content": [
-                    ParkingBot._text(item.get("name", ""),
-                                     {"fontSize": "17px", "fontWeight": "bold"}),
+                    ParkingBot._text(name, {"fontSize": "17px", "fontWeight": "bold"}),
                     ParkingBot._kv("盈利速率", f"{item.get('rate', 0)} 金/分钟", _GREEN),
                     ParkingBot._kv(
                         "累计收益" if not idle else "当前状态",
@@ -2719,23 +2731,48 @@ class ParkingBot(_PluginBase):
                              "" if can_unpark else button_text),
                      ]},
                 ],
+            }
+            cards.append({
+                "component": "div",
+                "props": {"style": {
+                    "flex": "1 1 300px",
+                    "minWidth": "270px",
+                    "margin": "0 8px 8px 0",
+                    "padding": "12px 14px 10px",
+                    "borderRadius": "14px",
+                    "border": "1px solid rgba(255,255,255,0.10)",
+                    "backgroundColor": "rgba(255,255,255,0.045)",
+                    "display": "flex",
+                    "gap": "12px",
+                }},
+                "content": [picture, info],
             })
 
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "flexWrap": "wrap", "marginRight": "-8px"}},
+            "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                "marginRight": "-8px"}},
             "content": cards,
         }
 
     @staticmethod
     def _item(title: str, lines: List[Tuple[str, str]], button: Optional[dict],
-              accent: str = _CYAN) -> dict:
-        """车市里的一条：照游戏车市页，居中排版 + 左侧色条。"""
-        content = [ParkingBot._text(title, {"fontSize": "17px", "fontWeight": "bold",
-                                           "marginBottom": "2px"})]
+              accent: str = _CYAN, image: str = "") -> dict:
+        """车市里的一条：照游戏车市页——大图居中，下面是名字与参数。"""
+        content = []
+        if image:
+            content.append({
+                "component": "div",
+                "props": {"style": {"display": "flex", "justifyContent": "center",
+                                    "marginBottom": "6px"}},
+                "content": [ParkingBot._pic(image, str(title or "🚗")[:1], 84)],
+            })
+        content.append(ParkingBot._text(title, {"fontSize": "17px", "fontWeight": "bold",
+                                                "textAlign": "center", "marginBottom": "2px"}))
         for text, color in lines:
             content.append(ParkingBot._text(
-                text, {"fontSize": "13px", "color": color, "marginTop": "3px"}))
+                text, {"fontSize": "13px", "color": color, "marginTop": "3px",
+                       "textAlign": "center"}))
         if button:
             button = dict(button)
             button["props"] = dict(button.get("props") or {})
@@ -2822,6 +2859,7 @@ class ParkingBot(_PluginBase):
                         "等级不足" if locked else ("已售罄" if sold_out else ("金币不足" if price > cash else "")),
                     ),
                     accent="#FFD700",
+                    image=self._asset_url(sale.get("image")),
                 ))
             blocks.append(self._card(
                 "限时 / 限量特卖", "折扣车辆，按场次限购或限时，过期失效；等级不足或金币不够则指令标灰",
@@ -2860,6 +2898,7 @@ class ParkingBot(_PluginBase):
                 items.append(self._item(
                     str(car.get("name", "未知车型")), lines,
                     self._command_hint(f"/买车 {car.get('id')}", not hint, hint),
+                    image=car.get("image") or "",
                 ))
             blocks.append(self._card(
                 "车市", f"当前金币 {cash}，车辆 {owned_count}/{car_max} 辆，购买需等级与金币均达标；指令已填好",
@@ -2898,6 +2937,7 @@ class ParkingBot(_PluginBase):
                      (f"{car.get('rate', 0)} 金/分钟", _GREEN)],
                     {"component": "div", "props": {"style": {}}, "content": buttons},
                     accent="#00E676",
+                    image=car.get("image") or "",
                 ))
             blocks.append(self._card(
                 "以旧换新", "只有空闲车辆能作为旧车；只能换更贵的车型，按补价从低到高列出前 3 个目标（指令已填好）",
