@@ -155,7 +155,12 @@ Vuetify 插槽类组件承载文本会渲染成空壳，之前的「立即挪车
 | `POST /buy_flash` | `sale_id` | 抢购特卖车 |
 | `POST /unpark` | `car_id` | 立即挪车 |
 
-均已声明 `response_model`（`ActionResult`），响应结构可在 `/docs` 查询。
+均已声明 `response_model`（`ApiResult`），响应结构可在 `/docs` 查询。
+**响应必须是宿主要求的三键信封** `{success: bool, message: str, data: {...}}`——
+前端 axios 拦截器会校验"恰好三个键、success 是布尔、message 是字符串"，
+少一个键或 message 为 null 都会被判成 invalid-envelope，页面直接弹
+「服务器返回了无效响应」，哪怕后端返回的是 200。
+POST 参数用 Pydantic 模型收（走 JSON body）；写成标量会被 FastAPI 当成查询参数。
 **等级、金币、车辆上限、旧车归属与空闲状态都由后端复核**，页面上的置灰只是提示。
 
 ## 注意
