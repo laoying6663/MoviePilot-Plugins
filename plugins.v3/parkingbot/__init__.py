@@ -174,6 +174,9 @@ _MUTED = "rgba(255,255,255,0.62)"
 _SHOP_EARN = "#00FF00"
 _SHOP_OWNED = "#00DDFF"
 _SHOP_LOCK = "#E94560"
+# 统计页「其中贴条」专用色：玫红偏橙，贴合处罚语义，
+# 也和金色（挪车收益）、粉色（支出）、绿色（净收）都拉得开
+_TICKET_C = "#FF7A9C"
 # 金币图标，照抄游戏 index.html 雪碧图里的 <symbol id="ico-coin">，去掉了 use 引用。
 # 为什么不用 🪙 emoji：U+1FA99 是 2019 年才进 Unicode 的，Windows 默认字体里
 # 基本没有这个字形，插件页实测直接渲染成豆腐块 □。
@@ -236,7 +239,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.32.1"
+    plugin_version = "1.33.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1678,7 +1681,11 @@ class ParkingBot(_PluginBase):
             bucket["bought"] = self._to_int(bucket.get("bought"), 0) + self._shop_bought
             bucket["diff"] = self._to_int(bucket.get("diff"), 0) + self._shop_diff
             bucket["traded"] = self._to_int(bucket.get("traded"), 0) + self._shop_traded
-            # 贴条罚款是收入，和挪车收益同一口径，一并进当日收益
+            # 贴条罚款是收入，和挪车收益同一口径，一并进当日收益。
+            # 但要另存一份 fined：统计页要单独展示「贴条收入」，
+            # 只把它并进 earned 的话，那笔钱在页面上就和挪车收益混成一坨，
+            # 用户永远看不出贴条到底赚了多少。
+            bucket["fined"] = self._to_int(bucket.get("fined"), 0) + self._shop_fined
             bucket["earned"] = self._to_int(bucket.get("earned"), 0) + self._shop_fined
             self._shop_fined = 0
             self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
@@ -2314,14 +2321,23 @@ class ParkingBot(_PluginBase):
             height = max(2, round(ratio * 78))
             bars.append({
                 "component": "div",
-                "props": {"style": {
-                    "flex": "1 1 0",
-                    "display": "flex",
-                    "flexDirection": "column",
-                    "alignItems": "center",
-                    "justifyContent": "flex-end",
-                    "margin": "0 1px",
-                }},
+                "props": {
+                    # 悬停显示这一小时的收益。
+                    # 宿主渲染器 PageRender 对 props 是 v-bind 全量透传、没有白名单，
+                    # 所以 title 会原样落成 <div title="…">，由浏览器自己弹原生提示。
+                    # JSON 模式下想不出别的办法：没有 JS 执行口，也没有注入 CSS 的口子，
+                    # 自绘 tooltip 那套做不出来。代价是提示样式跟随系统、且有约一秒延迟。
+                    "title": (f"{hour:02d}:00 — 收益 {ParkingBot._fmt_num(value)} 金币"
+                              if value else f"{hour:02d}:00 — 无收益"),
+                    "style": {
+                        "flex": "1 1 0",
+                        "display": "flex",
+                        "flexDirection": "column",
+                        "alignItems": "center",
+                        "justifyContent": "flex-end",
+                        "margin": "0 1px",
+                        "cursor": "help",
+                    }},
                 "content": [
                     {"component": "div", "props": {"style": {
                         "width": "100%",
@@ -2376,6 +2392,13 @@ class ParkingBot(_PluginBase):
             cost = (self._to_int(b.get("spent"), 0) + self._to_int(b.get("diff"), 0))
             return earned, cost, earned - cost
 
+        def day_fined(d: str) -> int:
+            """当天贴条罚款收入。老存档没有 fined 字段，一律按 0 算。"""
+            b = daily.get(d) or {}
+            if not isinstance(b, dict):
+                return 0
+            return self._to_int(b.get("fined"), 0)
+
         current = self._day if self._day in daily else days[0]
         bucket = daily.get(current) or {}
         # bucket 本身和 bucket["hours"] 都得校验类型：落盘数据被改坏时
@@ -2404,6 +2427,7 @@ class ParkingBot(_PluginBase):
                                  "marginRight": "-8px", "marginBottom": "12px"}},
              "content": [
                  self._stat("当日收益", day_earned, _GOLD),
+                 self._stat("其中贴条", day_fined(current), _TICKET_C),
                  self._stat("当日支出", day_cost, _PINK),
                  self._stat("当日净收", day_net, _GREEN),
                  self._stat("挪走次数", self._to_int(bucket.get("moved"), 0), _PURPLE),
@@ -2414,6 +2438,7 @@ class ParkingBot(_PluginBase):
                                  "marginRight": "-8px", "marginBottom": "12px"}},
              "content": [
                  self._stat("本月收益", m_earned, _GOLD),
+                 self._stat("其中贴条", sum(day_fined(d) for d in month_days), _TICKET_C),
                  self._stat("本月支出", m_cost, _PINK),
                  self._stat("本月净收", m_earned - m_cost, _GREEN),
                  self._stat("本月日均", avg, _CYAN),
