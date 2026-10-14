@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.30.0"
+    plugin_version = "1.31.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -314,6 +314,10 @@ class ParkingBot(_PluginBase):
     # 「缺少登录 Cookie」会把排查方向带偏，这里把真实原因带出去。
     _sso_error = ""
     _cars_cache: Optional[Dict[int, dict]] = None
+    # 车型表缓存的取用时刻与有效期。游戏会不定期上新车，没有失效时间的话
+    # 进程不重启就永远看不到新车（2026-10-14 一次就从 4 个分类加到 9 个）。
+    _cars_cache_at: float = 0.0
+    _CARS_TTL = 3600.0
     # 详情页数据缓存（快照 + 历史）。
     # 每轮执行结束后在内存里同步刷新，页面渲染与插件重载都直接读它，
     # 不再每次访问数据库 —— 保存配置会触发插件重载，重载又会重新收集
@@ -351,7 +355,9 @@ class ParkingBot(_PluginBase):
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
+        # 插件重载时清空车型表缓存：手动保存配置就等于用户想"按最新数据来一遍"
         self._cars_cache = {}
+        self._cars_cache_at = 0.0
 
         if config.get("onlyonce"):
             self._schedule_once(delay_seconds=3)
@@ -872,9 +878,16 @@ class ParkingBot(_PluginBase):
     async def _load_cars_map(self, client: AsyncRequestUtils) -> Dict[Any, dict]:
         """
         拉取车型定义表并按进程缓存，用于挑选每分钟收益最高的车辆。
-        车型表是静态数据，首次成功后不再重复请求。
+
+        车型表看着像静态数据，其实游戏会不定期上新（2026-10-14 就一口气从 4 个分类
+        加到了 9 个，新增传奇车这种要 Lv.15、价格 916.5K 的车）。原先这个缓存**没有
+        失效时间**，进程不重启就永远拿不到新车，车市页看起来像"游戏没更新"。
+        所以这里给一小时 TTL：到点自动重取一次，每天多 24 个请求，换来"更新了就能看到"。
+
+        网络失败或返回异常结构时**不写缓存**，下一轮还会重试，不会把一次抖动
+        固化成"没有车型表"。
         """
-        if self._cars_cache:
+        if self._cars_cache and time.monotonic() - self._cars_cache_at < self._CARS_TTL:
             return self._cars_cache
         # 网络异常也要兜住：run_once 主体没有 try，一次 ConnectTimeout 就会让
         # 整轮挪车、停车、买卖全部作废，而且用户在界面上什么提示都收不到。
@@ -900,6 +913,7 @@ class ParkingBot(_PluginBase):
                 except (TypeError, ValueError, OverflowError):
                     cars[str(car_id)] = item
             self._cars_cache = cars
+            self._cars_cache_at = time.monotonic()
         return self._cars_cache or {}
 
     @staticmethod
