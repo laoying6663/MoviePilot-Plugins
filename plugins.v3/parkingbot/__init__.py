@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.29.0"
+    plugin_version = "1.30.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -291,6 +291,10 @@ class ParkingBot(_PluginBase):
     # 特卖是限时场次，不缓存 —— 缓存后页面上会一直挂着已结束的场次。
     _TITLES_TTL = 600.0
     _titles_cache: List[dict] = []
+    # 特卖 + 称号的「在途」预取任务。挪车/停车本身不影响这两样数据，
+    # 没必要等动作做完再串行去拉：取到 state 之后就启动，让它和
+    # unpark.php / park.php 并行跑，_record_round 直接取结果，省一个往返。
+    _market_prefetch: Any = None
     _titles_at = 0.0
     # 本轮自动买卖的花费。由 _auto_shop 累加、_record_round 并入按天统计后清零。
     # 只在内存里跨这一轮传递，不单独落盘。
@@ -1004,18 +1008,76 @@ class ParkingBot(_PluginBase):
         """
         取出「HTTP 客户端 + 游戏状态 + 车型表」。
 
-        停车、买车、换车、抢购四个动作共用，避免四处各写一遍鉴权与错误处理。
-        第三个返回值非空即表示出错，此时前两项不可用。
+        停车、挪车、买车、换车、抢购、刷新状态都共用这个，避免各处各写一遍
+        鉴权与错误处理。第三个返回值非空即表示出错，此时前两项不可用。
+
+        state.php 与 game_data.php（车型表）互不依赖 —— 车型表只要 client，
+        不看 state —— 所以并行拉。串行时每个手动操作都要多等一个往返，
+        而游戏站单请求约 1.1 秒，用户点一下按钮就得多等一秒。
+        车型表有进程缓存，缓存命中时本来就不发请求，并行也不会多花钱。
         """
         cookie = await self._resolve_cookie()
         if not cookie:
             return None, None, {}, self._sso_error or "未取到登录 Cookie"
         client = AsyncRequestUtils(cookies=cookie, timeout=20)
-        state = await client.get_json(f"{self.API_BASE}/state.php")
+        # _load_cars_map 内部自己兜异常，这里 gather 不会因它而炸
+        state, cars_map = await asyncio.gather(
+            client.get_json(f"{self.API_BASE}/state.php"),
+            self._load_cars_map(client),
+        )
         if not state or not state.get("success"):
             await self._drop_cached_cookie()
             return client, None, {}, f"登录状态失效：{(state or {}).get('error') or '游戏接口无响应'}"
-        return client, state, await self._load_cars_map(client), ""
+        # 顺手把特卖/称号的预取挂上：调用方接下来要去发真正的写请求
+        #（挪车/停车/买卖），那段时间正好用来跑这两个只读接口。
+        self._start_market_prefetch(client, state)
+        return client, state, cars_map, ""
+
+    def _start_market_prefetch(self, client: Any, state: dict) -> None:
+        """
+        启动「特卖 + 称号」的并行拉取，结果留给 _record_round 取用。
+
+        不 await —— 就是为了让调用方先去做自己的事。重复启动是安全的：
+        已经在途的任务直接复用，不会连发两次请求。
+        两个被调方各自都兜住了异常，这里即使真抛了，_record_round 那边的
+        gather 结果也会退化成空列表，不影响落快照。
+        """
+        task = self._market_prefetch
+        if task is not None and not task.done():
+            return
+        task = asyncio.gather(
+            self._load_flash_sales(client), self._load_titles(client, state))
+        # 操作中途失败导致没人来取结果时，事件循环收尾会刷
+        # 「_GatheringFuture exception was never retrieved」。挂个回调把异常吃掉，
+        # 只留一条 debug，不让并发优化变成日志噪音。
+        task.add_done_callback(ParkingBot._drain_prefetch)
+        self._market_prefetch = task
+
+    @staticmethod
+    def _drain_prefetch(task: Any) -> None:
+        """预取任务无人认领时的兜底：消费掉异常，只记 debug。"""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.debug(f"[不可躺自动抢车位] 特卖/称号预取异常（已忽略）：{exc}")
+
+    async def _take_market_prefetch(self, client: Any, state: dict
+                                    ) -> Tuple[List[dict], dict]:
+        """取预取结果；没有在途任务就现场拉一次。"""
+        task, self._market_prefetch = self._market_prefetch, None
+        if task is not None:
+            try:
+                flash, titles = await task
+                return list(flash or []), (titles or {})
+            except Exception as err:
+                # 预取失败就退回到「重新拉一次」，不能让它连带影响落快照
+                logger.debug(f"[不可躺自动抢车位] 特卖/称号预取失败，改为现拉：{err}")
+        return await asyncio.gather(
+            self._load_flash_sales(client), self._load_titles(client, state))
 
     async def _refresh_snapshot(self, client: Any, note: str) -> None:
         """动作成功后重新取状态刷新快照；取不到就跳过，不影响已成功的动作。"""
@@ -1351,9 +1413,9 @@ class ParkingBot(_PluginBase):
         """
         try:
             cars_map = await self._load_cars_map(client)
-            # 两者互不依赖，并行拉取：各要 1.1 秒，串行就是 2.2 秒
-            flash, titles = await asyncio.gather(
-                self._load_flash_sales(client), self._load_titles(client, state))
+            # 两者互不依赖，并行拉取：各要 1.1 秒，串行就是 2.2 秒。
+            # _load_game_context 已经挂过预取的话，这里直接取结果不重发。
+            flash, titles = await self._take_market_prefetch(client, state)
             rules = state.get("gameSettings") or {}
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
