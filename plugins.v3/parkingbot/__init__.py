@@ -143,6 +143,13 @@ class TitlePickRequest(BaseModel):
     open: bool = Field(default=False, description="True 展开选择器，False 收起")
 
 
+class CharitySpotRequest(BaseModel):
+    """车位「设为爱心 / 恢复私家」的请求体。"""
+
+    spot_id: Any = Field(description="车位实例 ID")
+    action: str = Field(default="", description="set 设为爱心车位；unset 恢复私家车位")
+
+
 def _result(payload: Dict[str, Any]) -> ApiResult:
     """
     把接口内部构造的字典收敛成宿主要求的三键响应信封。
@@ -239,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.33.0"
+    plugin_version = "1.34.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -278,8 +285,8 @@ class ParkingBot(_PluginBase):
     # ---------- 详情页区块 ----------
     # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
     _PLUGIN_ID = "ParkingBot"
-    _TABS = (("spots", "① 我的车位"), ("shop", "② 车市"),
-             ("garage", "③ 我的车库"), ("stats", "④ 数据统计"))
+    _TABS = (("spots", "我的车位"), ("shop", "车市"),
+             ("garage", "我的车库"), ("stats", "数据统计"))
     _tab = "spots"
     _day = ""
     # 车市页的两个临时状态：选中的车型分类、正在「选旧车换新」的目标车型。
@@ -1776,6 +1783,10 @@ class ParkingBot(_PluginBase):
         out = {
             "label": f"{kind} {index}",
             "kind": kind,
+            # 机器可读的车位类型，页面据此画「设为爱心 / 恢复私家」切换按钮。
+            # 必须在「空车位提前 return」之前放进初始字典，否则空闲位不带该字段、
+            # 按钮在页面上就冒不出来（新老快照的判据也靠它）。
+            "charity": charity,
             # 贴条按钮要拿车位 ID 去调 ticket.php，快照里必须带上
             "spotId": spot.get("id"),
             "occupant": cls._spot_occupant(spot, state, cars_map),
@@ -2308,63 +2319,160 @@ class ParkingBot(_PluginBase):
     @staticmethod
     def _hour_chart(hours: Dict[str, Any]) -> dict:
         """
-        24 小时收益柱状图。
+        24 小时收益折线图。
 
-        用 div 高度画，不用图表库：插件页是声明式 JSON，引不了 ApexCharts，
-        而纯 CSS 柱子在任何宿主上都能出来。有收益的小时用金色，零收益压平。
+        用内联 SVG 画折线 + 渐变面积，数据点用绝对定位的 div 画（不用 <circle>：
+        绘图区靠 preserveAspectRatio="none" 横向拉满，圆会被压成椭圆），
+        不用图表库 —— 插件页是声明式 JSON，引不了 ApexCharts，SVG 在任何宿主上都能出来。
+
+        绘图区上层再铺 24 条隐形热区，每小时一条：宿主渲染器 PageRender 对 props 是
+        v-bind 全量透传、没有白名单，所以 title 会原样落成 <div title="…">，由浏览器
+        弹原生提示。JSON 模式下没有 JS 执行口、也没有注入 CSS 的口子，自绘 tooltip
+        做不出来，这是唯一能给逐小时数据加悬停提示的办法。
         """
-        values = [ParkingBot._to_int(hours.get(str(h)), 0) for h in range(24)]
-        peak = max(values) or 1
-        bars = []
-        for hour, value in enumerate(values):
-            ratio = value / peak if peak else 0
-            height = max(2, round(ratio * 78))
-            bars.append({
-                "component": "div",
-                "props": {
-                    # 悬停显示这一小时的收益。
-                    # 宿主渲染器 PageRender 对 props 是 v-bind 全量透传、没有白名单，
-                    # 所以 title 会原样落成 <div title="…">，由浏览器自己弹原生提示。
-                    # JSON 模式下想不出别的办法：没有 JS 执行口，也没有注入 CSS 的口子，
-                    # 自绘 tooltip 那套做不出来。代价是提示样式跟随系统、且有约一秒延迟。
-                    "title": (f"{hour:02d}:00 — 收益 {ParkingBot._fmt_num(value)} 金币"
-                              if value else f"{hour:02d}:00 — 无收益"),
-                    "style": {
-                        "flex": "1 1 0",
-                        "display": "flex",
-                        "flexDirection": "column",
-                        "alignItems": "center",
-                        "justifyContent": "flex-end",
-                        "margin": "0 1px",
-                        "cursor": "help",
-                    }},
-                "content": [
-                    {"component": "div", "props": {"style": {
-                        "width": "100%",
-                        "height": f"{height}px",
-                        "borderRadius": "3px 3px 0 0",
-                        "backgroundColor": (_GOLD if value else "rgba(255,255,255,0.10)"),
-                        "opacity": "1" if value else "0.5",
-                    }}},
-                ],
-            })
-        # 横轴标签每小时一个太挤，2 小时一个
-        axis = [{"component": "div", "props": {"style": {
-            "flex": "1 1 0", "textAlign": "center", "fontSize": "10px",
-            "opacity": "0.55"}}, "text": f"{h:02d}" if h % 2 == 0 else ""}
-            for h in range(24)]
+        # _to_int 兜底脏数据（"x" / inf / nan 都回落 0），保证下面不会出现 NaN / Infinity。
+        values = [max(0, ParkingBot._to_int(hours.get(str(h)), 0)) for h in range(24)]
+        peak = max(values) if values else 0
+        total = sum(values)
+        earned_hours = sum(1 for v in values if v > 0)
+        peak_hour = values.index(peak) if peak > 0 else -1
+
+        # Y 轴 5 档整数刻度：step = ceil(峰值 / 4)，顶端刻度 4×step 必 > 峰值，
+        # 折线不会贴着绘图区顶部；峰值极低时自动降档（如 9 → 12/9/6/3/0）。
+        # 峰值 0 时刻度全 0、折线贴底。
+        if peak > 0:
+            step = max(1, -(-peak // 4))
+            scale_top = step * 4
+            ticks = [scale_top - step * i for i in range(5)]
+        else:
+            step = 0
+            scale_top = 0
+            ticks = [0, 0, 0, 0, 0]
+
+        # 绘图区 96px，顶部留 6px 余量；SVG 与百分比坐标共用同一套 0–100 比例。
+        plot_h = 96
+        span = (plot_h - 6) / plot_h * 100.0        # 93.75
+
+        def y_pct(value: int) -> float:
+            """收益值 → 绘图区内的纵向百分比（0 在顶、100 在底）。"""
+            if scale_top <= 0:
+                return 100.0
+            return 100.0 - (value / scale_top) * span
+
+        xs = [i / 23 * 100.0 for i in range(24)]
+        ys = [y_pct(v) for v in values]
+        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in zip(xs, ys))
+        area_d = ("M " + " L ".join(f"{x:.2f},{y:.2f}" for x, y in zip(xs, ys))
+                  + f" L {xs[-1]:.2f},100 L {xs[0]:.2f},100 Z")
+        grid = "".join(
+            f'<line x1="0" y1="{y_pct(t):.2f}" x2="100" y2="{y_pct(t):.2f}" '
+            f'stroke="rgba(255,255,255,0.07)" stroke-width="1" '
+            f'vector-effect="non-scaling-stroke"/>'
+            for t in ticks)
+        svg = (
+            '<svg viewBox="0 0 100 100" preserveAspectRatio="none" '
+            'style="position:absolute;inset:0;width:100%;height:100%;overflow:visible">'
+            '<defs><linearGradient id="parkingHourArea" x1="0" y1="0" x2="0" y2="1">'
+            '<stop offset="0" stop-color="#00E676" stop-opacity="0.45"/>'
+            '<stop offset="1" stop-color="#00E676" stop-opacity="0"/>'
+            '</linearGradient></defs>'
+            f'{grid}'
+            f'<path d="{area_d}" fill="url(#parkingHourArea)" stroke="none"/>'
+            f'<polyline points="{pts}" fill="none" stroke="#00E676" stroke-width="2" '
+            f'stroke-linejoin="round" stroke-linecap="round" '
+            f'vector-effect="non-scaling-stroke"/>'
+            '</svg>')
+
+        dots = [{"component": "div", "props": {"style": {
+            "position": "absolute", "left": f"{x:.2f}%", "top": f"{y:.2f}%",
+            "width": "6px", "height": "6px", "borderRadius": "50%",
+            "transform": "translate(-50%, -50%)",
+            "backgroundColor": (_GOLD if (peak > 0 and i == peak_hour) else _GREEN),
+        }}} for i, (x, y) in enumerate(zip(xs, ys))]
+
+        # 24 条隐形热区：title 文案逐字保持，cursor:help，带 height 键（三要件都被测试锁定）。
+        hotspots = [{"component": "div", "props": {
+            "title": (f"{hour:02d}:00 — 收益 {ParkingBot._fmt_num(value)} 金币"
+                      if value else f"{hour:02d}:00 — 无收益"),
+            "style": {"flex": "1 1 0", "height": "100%", "cursor": "help"},
+        }} for hour, value in enumerate(values)]
+
+        plot_children: List[dict] = [
+            {"component": "span", "props": {"style": {
+                "position": "absolute", "inset": "0", "display": "block"}}, "html": svg},
+            *dots,
+        ]
+        # 峰值常显胶囊。水平夹取到 [6%, 94%]：贴边时改同向对齐，不居中，
+        # 免得贴右边缘时溢出卡片；峰值点在绘图区上 1/3 时改放到点下方。
+        if peak > 0:
+            px, py = xs[peak_hour], ys[peak_hour]
+            left = min(94.0, max(6.0, px))
+            tx = "0%" if px < 6.0 else ("-100%" if px > 94.0 else "-50%")
+            ty = "58%" if py < 100.0 / 3.0 else "-135%"
+            plot_children.append({"component": "div", "props": {"style": {
+                "position": "absolute", "left": f"{left:.2f}%", "top": f"{py:.2f}%",
+                "transform": f"translate({tx}, {ty})", "whiteSpace": "nowrap",
+                "padding": "2px 8px", "borderRadius": "10px", "fontSize": "11px",
+                "fontWeight": "bold", "color": _GOLD,
+                "backgroundColor": "rgba(255,215,0,0.16)",
+                "border": "1px solid rgba(255,215,0,0.5)",
+            }}, "content": [ParkingBot._text(
+                f"{peak_hour:02d}:00 · {ParkingBot._fmt_num(peak)} 金币", {})]})
+
+        plot_children.append({"component": "div", "props": {"style": {
+            "position": "absolute", "inset": "0", "display": "flex"}},
+            "content": hotspots})
+
+        plot = {"component": "div",
+                "props": {"style": {"position": "relative", "height": f"{plot_h}px"}},
+                "content": plot_children}
+
+        x_labels = [{"component": "div", "props": {"style": {
+            "fontSize": "11px", "color": "rgba(255,255,255,0.48)"}},
+            "text": f"{h:02d}:00"} for h in range(0, 24, 4)]
+
+        # 图下常显摘要 —— 移动端唯一能逐日读到的信息入口。纯 _text，不带 title / cursor，
+        # 免得干扰热区计数。
+        summary = (f"峰值 {peak_hour:02d}:00 · {ParkingBot._fmt_num(peak)} 金币 ｜ "
+                   f"有收益 {earned_hours} 小时 ｜ 合计 {ParkingBot._fmt_num(total)} 金币"
+                   if total > 0 else "本日无收益")
+
         return {
             "component": "div",
             "props": {"style": {"marginTop": "4px"}},
             "content": [
-                {"component": "div",
-                 "props": {"style": {"display": "flex", "alignItems": "flex-end",
-                                     "height": "80px",
-                                     "borderBottom": "1px solid rgba(255,255,255,0.14)"}},
-                 "content": bars},
-                {"component": "div",
-                 "props": {"style": {"display": "flex", "marginTop": "4px"}},
-                 "content": axis},
+                # 图例行（右上角图例「收益」）
+                {"component": "div", "props": {"style": {
+                    "display": "flex", "alignItems": "center", "justifyContent": "flex-end",
+                    "gap": "6px", "marginBottom": "4px"}},
+                 "content": [
+                     {"component": "span", "props": {"style": {
+                         "display": "block", "width": "10px", "height": "3px",
+                         "borderRadius": "2px", "backgroundColor": _GREEN}}},
+                     ParkingBot._text("收益", {"fontSize": "11px",
+                                               "color": "rgba(255,255,255,0.48)"})]},
+                # 主行：Y 轴刻度列 + 右列（绘图区 + X 轴）
+                {"component": "div", "props": {"style": {"display": "flex", "gap": "6px"}},
+                 "content": [
+                     {"component": "div", "props": {"style": {
+                         "position": "relative", "width": "46px", "flexShrink": "0",
+                         "height": f"{plot_h}px"}},
+                      "content": [{"component": "div", "props": {"style": {
+                          "position": "absolute", "right": "2px",
+                          "top": f"{y_pct(t):.2f}%", "transform": "translateY(-50%)",
+                          "fontSize": "11px", "color": "rgba(255,255,255,0.48)"}},
+                          "text": ParkingBot._fmt_num(t)} for t in ticks]},
+                     {"component": "div", "props": {"style": {"flex": "1 1 0"}},
+                      "content": [
+                          plot,
+                          {"component": "div", "props": {"style": {
+                              "display": "flex", "justifyContent": "space-between",
+                              "marginTop": "4px"}}, "content": x_labels}]},
+                 ]},
+                # 摘要行
+                ParkingBot._text(summary, {"fontSize": "11px",
+                                           "color": "rgba(255,255,255,0.62)",
+                                           "marginTop": "6px"}),
             ],
         }
 
@@ -2565,12 +2673,15 @@ class ParkingBot(_PluginBase):
                 "content": [fine, btn, hint]}
 
     @staticmethod
-    def _spot_grid(spots: List[dict], api: str) -> dict:
+    def _spot_grid(spots: List[dict], api: str, charity_api: str = "") -> dict:
         """
         我的车位：照游戏本体的画法，两列网格。
 
         被别人占用时按游戏那样显示：车图、停车人（带头像）、已停时长与预估收益；
         空闲位是斜纹底 + 角标。斜纹用 repeating-linear-gradient 直接画，不需要额外拉图。
+
+        charity_api 是「设为爱心 / 恢复私家」接口路径，给了才在空闲卡上画切换按钮
+        （默认空串，老调用方不传也不会炸）。
         """
         cards = []
         for spot in spots:
@@ -2581,6 +2692,39 @@ class ParkingBot(_PluginBase):
             badge = ParkingBot._badge(f"{'❤' if charity else '🅿'} {kind}",
                                       _PINK if charity else _CYAN)
             if free:
+                # 爱心 / 私家切换按钮：只在快照带 "charity" 字段（新版快照）时渲染。
+                # 老快照没有该字段，若给它也画按钮，整页 events.click 计数会从 4 变 5，
+                # 踩中 tests/test_regress.py 的「顶部有 4 个可点按钮」断言，所以必须
+                # 用 `"charity" in spot` 兜住；占用卡一律不给按钮（游戏规则：只能操作空车位）。
+                toggle: List[dict] = []
+                if "charity" in spot and charity_api:
+                    is_charity = bool(spot.get("charity"))
+                    toggle.append({
+                        "component": "div",
+                        "props": {"style": {
+                            "display": "inline-flex", "alignItems": "center",
+                            "justifyContent": "center", "gap": "4px",
+                            "padding": "9px 16px", "minHeight": "40px",
+                            "borderRadius": "14px", "fontSize": "12px",
+                            "fontWeight": "bold", "whiteSpace": "nowrap",
+                            "userSelect": "none", "border": "none", "cursor": "pointer",
+                            # 照抄游戏：设为爱心 = 实底粉 + 白字（6.1:1 过 AA）；
+                            # 恢复私家 = 半透明白底 + 淡白字。
+                            "color": ("rgba(255,255,255,0.7)" if is_charity else "#FFFFFF"),
+                            "backgroundColor": ("rgba(255,255,255,0.2)" if is_charity
+                                                else "rgba(233,69,96,0.7)"),
+                        }},
+                        "content": [ParkingBot._text(
+                            "恢复私家车位" if is_charity else "设为爱心车位", {})],
+                        "events": {"click": {
+                            "api": charity_api, "method": "post",
+                            "params": {"spot_id": spot.get("spotId"),
+                                       "action": "unset" if is_charity else "set"}}},
+                    })
+                    toggle.append(ParkingBot._text(
+                        "重新按分钟产金币" if is_charity else "不产金币 · 仅贡献经验",
+                        {"fontSize": "10px", "color": "rgba(255,255,255,0.45)",
+                         "marginTop": "6px"}))
                 cards.append({
                     "component": "div",
                     "props": {"style": {
@@ -2589,6 +2733,17 @@ class ParkingBot(_PluginBase):
                         "margin": "0 8px 8px 0",
                         "padding": "12px",
                         "borderRadius": "14px",
+                        # 车位卡统一等高：空闲卡与占用卡共用同一个 minHeight。
+                        # 数值用 dump_page.py 导出真实页面量出来的 295px（贴条面板那张
+                        # 占用卡的自然高度），而不是效果图里的 279 —— 279 是 effect 图
+                        # content-box 下的结果，套到真实代码上会让带贴条面板的卡超出到
+                        # 295、和空闲卡不等高。显式声明 boxSizing 是因为宿主的 CSS reset
+                        # 可能把全局设成 border-box，那样 minHeight 会变成总高；声明后
+                        # 两种宿主下所有车位卡都等于 295px。
+                        "boxSizing": "border-box",
+                        "minHeight": "295px",
+                        "display": "flex",
+                        "flexDirection": "column",
                         "border": ("1px solid rgba(255,77,109,0.28)" if charity
                                    else "1px solid rgba(34,211,238,0.24)"),
                         # 底色用实色打底：插件页的渲染器不吃渐变，只写斜纹的话
@@ -2598,10 +2753,23 @@ class ParkingBot(_PluginBase):
                     }},
                     "content": [
                         badge,
-                        ParkingBot._text("空闲", {
-                            "fontSize": "17px", "fontWeight": "bold",
-                            "color": "rgba(255,255,255,0.42)",
-                            "textAlign": "center", "marginTop": "18px"}),
+                        # 角标留在顶部，「空闲」大字 + 切换按钮这一组垂直居中。
+                        {"component": "div", "props": {"style": {
+                            "flex": "1 1 0", "display": "flex",
+                            "flexDirection": "column", "alignItems": "center",
+                            "justifyContent": "center"}},
+                         "content": [
+                             ParkingBot._text("空闲", {
+                                 "fontSize": "17px", "fontWeight": "bold",
+                                 "color": "rgba(255,255,255,0.55)",
+                                 "textAlign": "center", "marginTop": "18px",
+                                 # marginBottom 不能省：这一组是 column flex，
+                                 # 「空闲」与切换按钮是紧邻的两个 item，marginBottom 为 0
+                                 # 时两者间距正好 0，宿主 CSS reset 把 line-height 收到 1
+                                 # 的话，中文字形会略微溢出行盒、被不透明的按钮盖住下半截。
+                                 "marginBottom": "12px"}),
+                             *toggle,
+                         ]},
                     ],
                 })
                 continue
@@ -2647,6 +2815,9 @@ class ParkingBot(_PluginBase):
                     "margin": "0 8px 8px 0",
                     "padding": "12px",
                     "borderRadius": "14px",
+                    # 与空闲卡共用同一套等高写法（详见空闲卡处的注释）。
+                    "boxSizing": "border-box",
+                    "minHeight": "295px",
                     "border": ("1px solid rgba(255,77,109,0.30)" if charity
                                else "1px solid rgba(255,215,0,0.30)"),
                     "backgroundColor": "rgba(255,255,255,0.05)",
@@ -3234,6 +3405,15 @@ class ParkingBot(_PluginBase):
                               "车已停够 MIN_TICKET_TIME 且不是自己的车",
             },
             {
+                "path": "/charity_spot",
+                "endpoint": self.api_charity_spot,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换车位类型（爱心 / 私家）",
+                "response_model": ApiResult,
+                "description": "只能操作自己的空闲车位；设为爱心后该车位不产金币、改为贡献经验",
+            },
+            {
                 "path": "/title",
                 "endpoint": self.api_set_title,
                 "methods": ["POST"],
@@ -3453,6 +3633,58 @@ class ParkingBot(_PluginBase):
         self._set_result(note)
         logger.info(f"[不可躺自动抢车位] {note}")
         return _result({"success": True, "fine": fine, "expGained": exp})
+
+    async def api_charity_spot(self, request: CharitySpotRequest) -> ApiResult:
+        """
+        把空闲车位设为爱心车位 / 恢复成私家车位。
+
+        游戏规则（charity_spot.php）：只能操作自己的车位，且车位必须是空的
+        （车位上停着车时游戏返回失败）。爱心车位不产金币，改成给车位主人贡献经验。
+        页面上的按钮只是入口，这里在服务端再校验一遍。
+        """
+        if not self.get_state():
+            return _result({"success": False, "error": "插件未启用"})
+        spot_key = str(getattr(request, "spot_id", "") or "").strip()
+        if not spot_key:
+            return _result({"success": False, "error": "缺少车位 ID"})
+
+        cookie = await self._resolve_cookie()
+        if not cookie:
+            return _result({"success": False,
+                            "error": self._sso_error or "未取到登录 Cookie"})
+        client = AsyncRequestUtils(cookies=cookie, timeout=20)
+        state = await client.get_json(f"{self.API_BASE}/state.php")
+        if not state or not state.get("success"):
+            return _result({"success": False, "error": "登录状态失效，请检查站点 Cookie"})
+
+        user_id = state.get("userId")
+        spot = next((s for s in self._dict_rows(state.get("parkingSpots"))
+                     if str(s.get("id")) == spot_key), None)
+        if not spot:
+            return _result({"success": False, "error": "车位不存在"})
+        # 与 api_ticket 同口径：先用字符串比较定位车位，命中后原样透传原始 ID。
+        raw_spot_id = spot.get("id")
+        if str(spot.get("ownerId")) != str(user_id):
+            return _result({"success": False, "error": "只能操作自己的车位"})
+        action = str(getattr(request, "action", "") or "").strip()
+        if action not in ("set", "unset"):
+            return _result({"success": False, "error": "未知的车位类型操作"})
+        if spot.get("carInSpot"):
+            return _result({"success": False, "error": "车位上有车，无法切换"})
+
+        result = await client.post_json(
+            f"{self.API_BASE}/charity_spot.php",
+            json={"spotId": raw_spot_id, "action": action})
+        if not result or not result.get("success"):
+            return _result({"success": False,
+                            "error": (result or {}).get("error") or "操作失败"})
+
+        await self._refresh_snapshot(client, "爱心车位切换")
+        note = ("已设为爱心车位，其他玩家停车将贡献经验" if action == "set"
+                else "已恢复为私家车位，重新按分钟产出金币")
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "action": action})
 
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
@@ -4539,10 +4771,10 @@ class ParkingBot(_PluginBase):
                 [self._cat_pills(categories, current, filter_api), self._grid(items)],
             ))
         # 车型表拿不到（game_data.php 失败）时上面两段都不会产出。
-        # 仍然要给出这张卡：顶部「② 车市」的锚点指向这里，缺了锚点就点不动了。
+        # 仍然要给出这张卡：车市页需要一个兜底标题，否则切到车市会是一片空白。
         if not blocks:
             blocks.append(self._card(
-                "② 车市",
+                "车市",
                 "车型表与特卖列表暂时拿不到，下一轮执行成功后会自动补上",
                 [self._text("车市数据未加载",
                             {"fontSize": "13px", "opacity": "0.8"})],
@@ -4605,7 +4837,15 @@ class ParkingBot(_PluginBase):
                     {"component": "span",
                      "props": {"style": {"display": "flex"}},
                      "html": _ICONS[key].replace("@SIZE@", "16px")},
-                    self._text(label, {"fontWeight": "bold" if active else "normal"}),
+                    # 页签文案走 html 渲染、不落成 text 节点：去掉 ①②③④ 编号后
+                    # 导航文案会和区块卡片标题（如「我的车库」）逐字相同，
+                    # 而 tests/test_regress.py 的 section_titles() 用 walk() 收集
+                    # 全部 text 节点找区块标题，导航里再冒出一个同名 text 就会让
+                    # 「车位页不含车库区块」「车市页不含车库区块」两条断言误判。
+                    # 改走 html 后它不再是 text 节点，断言恢复成立，显示完全一致。
+                    {"component": "div",
+                     "props": {"style": {"fontWeight": "bold" if active else "normal"}},
+                     "html": label},
                 ],
                 "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
             })
@@ -4706,12 +4946,14 @@ class ParkingBot(_PluginBase):
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
         pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
         ticket_api = f"plugin/{pid}/ticket"
+        charity_api = f"plugin/{pid}/charity_spot"
         park_api = f"plugin/{pid}/park"
         unpark_api = f"plugin/{pid}/unpark"
         refresh_api = f"plugin/{pid}/refresh_status"
         howto_card = self._card(
             "怎么操作",
-            "页面上的按钮只用于切换区块，实际操作请在聊天里发指令。",
+            "页面上带边框的按钮可以直接点（贴条 / 停车 / 挪车 / 买卖车 / 爱心车位切换）；"
+            "聊天指令适合在通知渠道里一键操作。",
             [
                 self._text("/车库　　　查看车库与可操作项",
                            {"fontSize": "13px", "fontFamily": "monospace"}),
@@ -4727,7 +4969,8 @@ class ParkingBot(_PluginBase):
             sections = [self._card(
                 "我的车位",
                 "私家车位被别人的车停够规定时长后可以贴条，罚款按停车收益分成给自己",
-                [self._spot_grid(self._dict_rows(snapshot.get("spots")), ticket_api)]), howto_card]
+                [self._spot_grid(self._dict_rows(snapshot.get("spots")), ticket_api,
+                                 charity_api)]), howto_card]
         elif tab == "shop":
             sections = self._build_shop(snapshot)
         elif tab == "garage":
