@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.31.0"
+    plugin_version = "1.32.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -318,6 +318,15 @@ class ParkingBot(_PluginBase):
     # 进程不重启就永远看不到新车（2026-10-14 一次就从 4 个分类加到 9 个）。
     _cars_cache_at: float = 0.0
     _CARS_TTL = 3600.0
+    # 自动贴条：同一辆车在同一个车位只贴一次。
+    # 存的是「车位 ID -> 已贴的车辆 ID」，车位上没车了就删掉该车位的记录，
+    # 所以这个字典的长度始终不超过我的车位数，不会无限增长。
+    _ticket_seen: Dict[str, str] = {}
+    # 默认值必须写在类上：run_once 里会直接读 self._auto_ticket，
+    # 而插件实例并非任何时刻都保证刚跑过 init_plugin（热重载中间态、
+    # 派生实例等），缺属性会 AttributeError 让整轮作废。默认关，最保守。
+    _auto_ticket: bool = False
+    _ticket_min_fine: int = 0
     # 详情页数据缓存（快照 + 历史）。
     # 每轮执行结束后在内存里同步刷新，页面渲染与插件重载都直接读它，
     # 不再每次访问数据库 —— 保存配置会触发插件重载，重载又会重新收集
@@ -341,6 +350,15 @@ class ParkingBot(_PluginBase):
         self._notify = bool(config.get("notify", True))
         self._auto_buy = self._as_switch(config.get("auto_buy"))
         self._auto_trade = self._as_switch(config.get("auto_trade"))
+        # 自动贴条默认关闭：它会真实产生罚款收入，也可能招致对方报复，
+        # 不该插件替用户默认开启。
+        self._auto_ticket = self._as_switch(config.get("auto_ticket"))
+        self._ticket_min_fine = self._to_int(config.get("ticket_min_fine"),
+                                             0, minimum=0)
+        # 已贴记录要从 data 里恢复：只在内存里存的话，插件一重载就忘了贴过谁，
+        # 同一辆车会被反复贴条。
+        stored_seen = self.get_data("ticket_seen")
+        self._ticket_seen = dict(stored_seen) if isinstance(stored_seen, dict) else {}
         # 记住上次停留的区块与查看的日期；插件重载、MoviePilot 重启后仍回到原来那一页
         saved_view = self.get_data("view") or {}
         if not isinstance(saved_view, dict):
@@ -598,6 +616,21 @@ class ParkingBot(_PluginBase):
             return
 
         still_parked = len(parked) - (0 if recomputed else moved)
+        # 自动贴条：排在挪车之后、停车之前。
+        # 挪车之后 state 已刷新过，谁停在我的车位上是最准的；停车只会把我的车
+        # 停到别人车位上，与贴条无关，放哪都不影响结果。
+        ticket_note = ""
+        if self._auto_ticket:
+            try:
+                ticket_note = await self._auto_ticket_one(client, state, cars_map,
+                                                          user_id)
+                if ticket_note:
+                    shop_note = f"{shop_note}；{ticket_note}" if shop_note else ticket_note
+                    # 贴条之后服务端车位状态变了，落快照得用新状态
+                    state_is_current = False
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 自动贴条异常：{err}")
+
         new_parked = await self._park_idle_cars(
             client, idle, self._dict_rows(state.get("parkingSpots")), user_id,
             max(0, self._max_cars - still_parked),
@@ -742,6 +775,101 @@ class ParkingBot(_PluginBase):
                 self.post_message(title=self.plugin_name, text=note)
             except Exception as err:
                 logger.error(f"[不可躺自动抢车位] 发送通知失败：{err}")
+        return note
+
+    async def _auto_ticket_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
+                               user_id: Any) -> str:
+        """
+        自动贴条：给我的私家车位上停够时长、且罚款够阈值的别人的车贴条。
+
+        和手动贴条共用同一套游戏规则校验（这里再查一遍是因为自动流程不经过页面，
+        页面上那个置灰按钮的保护在服务端等于不存在）。判定口径与
+        _spot_snapshot 算出的「贴条收益」保持一致，否则用户会看到页面上写着
+        「贴条收益 675」但阈值设 700 也不贴。
+
+        「同一辆车在同一个车位只贴一次」由 _ticket_seen 保证：车位上没车了就把
+        该车位的记录删掉，所以那辆车开走再回来会被当成新的一次停放。
+        """
+        if not self._auto_ticket:
+            return ""
+
+        rules = state.get("gameSettings") or {}
+        min_ticket = self._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
+        percent = self._to_int(rules.get("TICKET_OWNER_PERCENT"), 90,
+                                minimum=0, maximum=100)
+        cap = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=0)
+        threshold = self._ticket_min_fine
+
+        my_spots = [s for s in self._dict_rows(state.get("parkingSpots"))
+                    if str(s.get("ownerId")) == str(user_id)]
+        occupied = {str(s.get("id")) for s in my_spots if s.get("carInSpot")}
+
+        # 车位空了就把记录清掉，否则这张表会一直攒着历史车位 ID
+        if self._ticket_seen:
+            self._ticket_seen = {k: v for k, v in self._ticket_seen.items()
+                                 if k in occupied}
+
+        candidates = []
+        for spot in my_spots:
+            spot_key = str(spot.get("id"))
+            # 爱心车位按游戏规则不能贴条
+            if spot.get("spotType") == "charity":
+                continue
+            car_in_spot = spot.get("carInSpot")
+            if not car_in_spot:
+                continue
+            # 同一辆车在这个车位已经贴过了就不再来一次
+            if self._ticket_seen.get(spot_key) == str(car_in_spot):
+                continue
+            car = next((c for c in self._dict_rows(state.get("userCars"))
+                        if str(c.get("id")) == str(car_in_spot)), None)
+            if car is None:
+                continue
+            # 自己停自己车位上的车不贴
+            if str(car.get("userId")) == str(user_id):
+                continue
+            parked_at = self._parse_time(spot.get("parkedTime"))
+            mins = max(0, int((self._now_naive() - parked_at).total_seconds() / 60)) \
+                if parked_at else 0
+            if mins < min_ticket:
+                continue
+            definition = self._lookup_car(cars_map, car.get("carId")) or {}
+            gain = min(mins * self._to_int(definition.get("earnPerMin"), 0), cap)
+            fine = gain * percent // 100
+            if fine < threshold:
+                continue
+            candidates.append((fine, spot_key, spot, car))
+
+        if not candidates:
+            return ""
+
+        # 先罚收益高的，同样的轮次里多拿一点
+        candidates.sort(key=lambda item: -item[0])
+        notes = []
+        total = 0
+        for fine, spot_key, spot, car in candidates:
+            result = await self._post(client, "ticket.php", {"spotId": spot.get("id")})
+            if not (result and result.get("success")):
+                logger.warning(
+                    "[不可躺自动抢车位] 自动贴条失败，车位 %s：%s",
+                    spot_key, (result or {}).get("error") or "未知原因")
+                # 这一轮不再重试这个车位，但车还在上面，下一轮会重新判定
+                continue
+            got = self._to_int(result.get("fine"), fine, minimum=0)
+            total += got
+            # 只有真贴上了才记进去：贴失败若也记，车开走再回来就不会被贴
+            self._ticket_seen[spot_key] = str(spot.get("carInSpot"))
+            notes.append(f"{self._car_name(car, cars_map)}@{spot_key} 罚 {got}")
+
+        if not notes:
+            return ""
+        try:
+            await self.async_save_data("ticket_seen", dict(self._ticket_seen))
+        except Exception as err:
+            # 记录写不下去只影响去重，不该让本轮其它动作失败
+            logger.warning(f"[不可躺自动抢车位] 保存贴条记录失败：{err}")
+        note = f"自动贴条 {len(notes)} 个车位：{'、'.join(notes)}，合计 {total} 金币"
+        logger.info(f"[不可躺自动抢车位] {note}")
         return note
 
     async def _auto_buy_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
@@ -1789,6 +1917,41 @@ class ParkingBot(_PluginBase):
                                          "hint": "默认关闭。打开后每轮最多换一辆："
                                                  "从每分钟收益最低的空闲车开始，换成差价付得起且收益更高的车型。"
                                                  "只能换空闲车，停车中的车不参与。",
+                                     }}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {
+                                         "model": "auto_ticket",
+                                         "label": "自动贴条",
+                                         "hint": "默认关闭。打开后：别人停在我私家车位上够规定时长、"
+                                                 "且预计罚款达到下方阈值时自动贴条。"
+                                                 "同一辆车在同一个车位只贴一次，它开走后再回来才会重新计算。"
+                                                 "会真实产生罚款收入，但可能招致对方报复，谨慎开启。",
+                                     }}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VTextField",
+                                     "props": {
+                                         "model": "ticket_min_fine",
+                                         "label": "达到多少金币才自动贴条",
+                                         "placeholder": "0",
+                                         "hint": "比较的是车位卡片上显示的「贴条收益」。"
+                                                 "填 0 表示不设门槛，所有停够时长、可以贴的车位都贴。"
+                                                 "想只贴高价值车位就填个几百。",
                                      }}
                                 ],
                             },
