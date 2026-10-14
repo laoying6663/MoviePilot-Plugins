@@ -246,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.35.0"
+    plugin_version = "1.36.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -4469,11 +4469,32 @@ class ParkingBot(_PluginBase):
             if value is None or str(value).strip() == "":
                 return "0"
             return str(value)
-        if number >= 10000000:
-            return f"{number / 1000000:.1f}M"
-        if number >= 10000:
-            return f"{number / 1000:.1f}K"
-        return f"{number:,}"
+        # 缩放用真除，但要包一层 OverflowError。
+        #
+        # 两条 OverflowError 路径得分清：
+        #   1) int(float("inf")) —— v1.29.0 修的，转换阶段就炸；
+        #   2) 大整数真除 —— int() 对 10**400 是合法的（Python 任意精度整数），
+        #      但 number / 1000000 的结果超出 float 范围，抛的是
+        #      「integer division result too large for a float」。
+        # 第 2 条一直没修，一格脏数据就能让整页白屏。
+        #
+        # 只在真除抛的时候才退到整除：正常数字的输出必须和以前逐字一致，
+        # 包括负数不缩写、以及 99999 四舍五入成 100.0K 这类既有行为 ——
+        # 那些不是 bug，动它等于偷偷改了用户已经习惯的显示。
+        try:
+            if number >= 10000000:
+                return f"{number / 1000000:.1f}M"
+            if number >= 10000:
+                return f"{number / 1000:.1f}K"
+            return f"{number:,}"
+        except OverflowError:
+            sign = "-" if number < 0 else ""
+            mag = abs(number)
+            if mag >= 10000000:
+                return "%s%d.%dM" % (sign, mag // 1000000, (mag % 1000000) // 100000)
+            if mag >= 10000:
+                return "%s%d.%dK" % (sign, mag // 1000, (mag % 1000) // 100)
+            return "{:,}".format(number)
 
     @staticmethod
     def _action_btn(label: str, api: str, params: Dict[str, Any],
@@ -5187,7 +5208,7 @@ class ParkingBot(_PluginBase):
                         if snapshot and self._title_open
                         and self._owned_titles(snapshot) else [])
 
-        return [
+        return ParkingBot._mark_tappable([
             head_card,
             *title_picker,
             # 四个指标块：手机上一行两个、宽屏一行四个。用单个 flex 容器而不是
@@ -5198,7 +5219,65 @@ class ParkingBot(_PluginBase):
              "content": stats},
             self._nav_row(tab),
             *sections,
-        ]
+        ], self._tap_style_node())
+
+    # ---- 按下反馈（v1.36.0）----
+    #
+    # 为什么需要注入 <style>：插件的元素没有 class，宿主的样式表里也就没有
+    # 任何 :hover / :active 规则可选，单独给节点写 transition 是死的 ——
+    # transition 只在「属性值发生变化」时才起作用，没有状态变化就永远不动。
+    # 声明式 JSON 没有 JS 执行口，唯一能给页面补规则的途径就是 html 字段里
+    # 的一段 <style>（v-html 插入的 style 标签浏览器会正常解析生效）。
+    #
+    # 作用域：所有选择器都以 .pb-tap 打头，只匹配我们自己挂上去的类，
+    # 不会波及同一弹窗里的其他插件。不用包裹容器是因为 get_page() 返回的是
+    # 平铺的列表，各顶层块是兄弟节点、没有共同父节点可挂类名。
+    _TAP_CSS = (
+        "<style>"
+        ".pb-tap{transition:filter .12s ease,transform .12s ease}"
+        ".pb-tap:hover{filter:brightness(1.14)}"
+        ".pb-tap:active{transform:scale(.96)}"
+        # 尊重系统的「减少动态效果」设置：有人对动效敏感，别硬给。
+        "@media (prefers-reduced-motion:reduce){.pb-tap{transition:none}}"
+        "</style>")
+
+    @classmethod
+    def _tap_style_node(cls) -> dict:
+        """把那段 CSS 单独装成一个节点，插在页面最前面。"""
+        return {"component": "div", "props": {"style": {"display": "none"}},
+                "html": cls._TAP_CSS}
+
+    @classmethod
+    def _mark_tappable(cls, nodes, style_node=None):
+        """
+        原地给所有可点节点挂上 pb-tap 类；给了 style_node 就插在列表最前面。
+
+        放在 get_page 返回前统一处理，而不是在每个按钮的构造处手动加类 ——
+        以后新增按钮不必记得补，漏了也只是没动效，不会出错。
+
+        只改 props 不动结构：节点数与 JSON 体积的变化仅来自多了个 class 值。
+        """
+
+        def visit(n):
+            if isinstance(n, list):
+                for x in n:
+                    visit(x)
+                return
+            if not isinstance(n, dict):
+                return
+            if isinstance(n.get("events"), dict) and "click" in n["events"]:
+                props = n.setdefault("props", {})
+                cur = str(props.get("class") or "")
+                if "pb-tap" not in cur:
+                    props["class"] = (cur + " pb-tap").strip()
+            content = n.get("content")
+            if isinstance(content, list):
+                visit(content)
+
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+        visit(nodes)
+        return ([style_node] + nodes) if style_node is not None else nodes
 
     def get_dashboard_meta(self) -> List[Dict[str, str]]:
         """在主面板登记一块状态卡。"""
