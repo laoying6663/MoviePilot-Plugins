@@ -236,7 +236,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.32.0"
+    plugin_version = "1.32.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -804,7 +804,10 @@ class ParkingBot(_PluginBase):
                     if str(s.get("ownerId")) == str(user_id)]
         occupied = {str(s.get("id")) for s in my_spots if s.get("carInSpot")}
 
-        # 车位空了就把记录清掉，否则这张表会一直攒着历史车位 ID
+        # 车位空了就把记录清掉，否则这张表会一直攒着历史车位 ID。
+        # 清理发生在前面，落盘必须跟着走 —— 哪怕这一轮一张都没贴。
+        # 否则内存里是空的、磁盘上还是旧的，插件一重启就会把早就开走的车当成还在。
+        before_seen = dict(self._ticket_seen)
         if self._ticket_seen:
             self._ticket_seen = {k: v for k, v in self._ticket_seen.items()
                                  if k in occupied}
@@ -841,6 +844,11 @@ class ParkingBot(_PluginBase):
             candidates.append((fine, spot_key, spot, car))
 
         if not candidates:
+            # 一张都贴不了不代表「记录没变」：开头的清理可能已经删掉了空车位的条目，
+            # 那份清理同样要落盘，否则内存是空的、磁盘是旧的，插件一重启就会把
+            # 早就开走的车当成还停在那儿。
+            if self._ticket_seen != before_seen:
+                await self._persist_ticket_seen()
             return ""
 
         # 先罚收益高的，同样的轮次里多拿一点
@@ -862,15 +870,22 @@ class ParkingBot(_PluginBase):
             notes.append(f"{self._car_name(car, cars_map)}@{spot_key} 罚 {got}")
 
         if not notes:
+            # 一张没贴成不代表「什么都没变」：开头的清理可能已经删掉了记录，
+            # 那份清理同样要落盘，否则内存和磁盘会长期不一致。
+            if self._ticket_seen != before_seen:
+                await self._persist_ticket_seen()
             return ""
-        try:
-            await self.async_save_data("ticket_seen", dict(self._ticket_seen))
-        except Exception as err:
-            # 记录写不下去只影响去重，不该让本轮其它动作失败
-            logger.warning(f"[不可躺自动抢车位] 保存贴条记录失败：{err}")
+        await self._persist_ticket_seen()
         note = f"自动贴条 {len(notes)} 个车位：{'、'.join(notes)}，合计 {total} 金币"
         logger.info(f"[不可躺自动抢车位] {note}")
         return note
+
+    async def _persist_ticket_seen(self) -> None:
+        """把「已贴记录」写回 data 目录。写失败只影响去重，不该打断本轮其它动作。"""
+        try:
+            await self.async_save_data("ticket_seen", dict(self._ticket_seen))
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 保存贴条记录失败：{err}")
 
     async def _auto_buy_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
                             user_id: Any) -> str:
