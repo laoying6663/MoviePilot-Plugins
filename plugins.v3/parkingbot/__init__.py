@@ -246,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.34.0"
+    plugin_version = "1.35.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -2150,9 +2150,14 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _stat(label: str, value: Any, color: str) -> dict:
-        """单个数字指标块。紫色淡底 + 小灰标签 + 大号彩值，对齐游戏车库页。
+        """单个数字指标块：内嵌面 + 左侧语义色条 + 大号彩值。
 
-        底色是实色 rgba：渐变在插件页渲染不出来，原来那层紫色渐变底等于没写。
+        色义只落在「色条 + 数值」两处。整块底色改成中性内嵌面之后，四个指标块
+        不再各顶一大片紫底 —— 底色一多就互相打架，颜色反而认不出来。
+
+        borderRadius / minWidth / margin 保持原值不动：空快照用例要求页面上
+        至少存在一个 14px 圆角的节点，这里是最稳的那个来源。
+        底色是实色 rgba：渐变在插件页渲染不出来。
         """
         return {
             "component": "div",
@@ -2162,45 +2167,158 @@ class ParkingBot(_PluginBase):
                 "margin": "0 8px 8px 0",
                 "padding": "12px 14px",
                 "borderRadius": "14px",
-                "border": "1px solid rgba(167,139,250,0.28)",
-                "backgroundColor": "rgba(167,139,250,0.14)",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "display": "flex",
+                "alignItems": "center",
+                "gap": "10px",
             }},
             "content": [
-                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.72",
-                                         "letterSpacing": "0.5px"}),
-                ParkingBot._text(value, {"fontSize": "23px", "fontWeight": "bold",
-                                         "color": color, "lineHeight": "1.3",
-                                         "marginTop": "3px"}),
+                # 左侧语义色条：把「这块是哪个指标」从底色搬到一根竖条上
+                {"component": "div",
+                 "props": {"style": {
+                     "width": "3px",
+                     "height": "34px",
+                     "borderRadius": "2px",
+                     "flex": "0 0 auto",
+                     "backgroundColor": color,
+                 }}},
+                {"component": "div",
+                 "props": {"style": {
+                     "display": "flex",
+                     "flexDirection": "column",
+                     "gap": "3px",
+                     "minWidth": "0",
+                 }},
+                 "content": [
+                     ParkingBot._text(label, {"fontSize": "11px", "fontWeight": "700",
+                                              "letterSpacing": "0.5px",
+                                              "color": "rgba(255,255,255,0.62)"}),
+                     # 数字等宽：跳数时宽度不抖（tabular-nums 只影响数字字形）
+                     ParkingBot._text(value, {"fontSize": "23px", "fontWeight": "700",
+                                              "color": color, "lineHeight": "1.15",
+                                              "fontVariantNumeric": "tabular-nums"}),
+                 ]},
             ],
         }
 
     @staticmethod
-    def _card(title: str, subtitle: str, content: List[dict]) -> dict:
+    def _card(title: str, subtitle: str, content: List[dict],
+              accent: str = _CYAN) -> dict:
         """
         统一的信息卡片外壳。
 
         标题用 div 渲染而不依赖 VCardTitle 插槽：Vuetify 这类组件在本插件
         页面里只渲染出空壳，内容并不会填进去。卡片外壳同理改用 div，
         少一层 VCard + VCardText，样式也更可控。
+
+        标题不再写死青色：青色在页面上只留给「可点 / 选中」，区块之间改用左侧
+        一枚语义圆点来区分（车位青 / 车市金 / 车库紫 / 统计绿）。圆点占掉
+        「8px 圆点 + 8px 间隔」这 16px，副标题也跟着缩进同样距离，两行左缘对齐。
+        内距从「14 14 4」改成四边等距 16px —— 原来的底距比其它三边少 10px，
+        卡片底部看着总是贴得太紧。
         """
+        head: List[dict] = []
+        if title:
+            head.append({
+                "component": "div",
+                "props": {"style": {"display": "flex", "alignItems": "center",
+                                    "gap": "8px", "marginBottom": "3px"}},
+                "content": [
+                    {"component": "span",
+                     "props": {"style": {"width": "8px", "height": "8px",
+                                         "borderRadius": "999px", "flex": "0 0 auto",
+                                         "backgroundColor": accent}}},
+                    ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "700",
+                                             "color": "rgba(255,255,255,0.92)",
+                                             "letterSpacing": "0.3px"}),
+                ],
+            })
+        if subtitle:
+            head.append(ParkingBot._text(subtitle, {
+                "fontSize": "12px", "color": "rgba(255,255,255,0.62)",
+                "lineHeight": "1.55", "marginBottom": "12px",
+                "paddingLeft": "16px" if title else "0"}))
         return {
             "component": "div",
             "props": {"style": {
                 "marginBottom": "12px",
-                "padding": "14px 14px 4px",
+                "padding": "16px",
                 "borderRadius": "16px",
                 "border": "1px solid rgba(255,255,255,0.10)",
                 "backgroundColor": "rgba(255,255,255,0.045)",
             }},
+            "content": [*head, *content],
+        }
+
+    @staticmethod
+    def _meta_pill(label: str, value: Any) -> dict:
+        """概览卡里的元信息胶囊：小灰键 + 亮一档的值，同行排布。"""
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex",
+                "alignItems": "center",
+                "gap": "5px",
+                "padding": "3px 9px",
+                "borderRadius": "999px",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "fontSize": "11px",
+            }},
             "content": [
-                ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
-                                         "color": _CYAN, "marginBottom": "4px",
-                                         "letterSpacing": "0.4px"}),
-                ParkingBot._text(subtitle, {"fontSize": "12px", "opacity": "0.58",
-                                            "lineHeight": "1.55", "marginBottom": "10px"}),
-                *content,
+                ParkingBot._text(label, {"color": "rgba(255,255,255,0.32)"}),
+                ParkingBot._text(value, {"color": "rgba(255,255,255,0.62)"}),
             ],
         }
+
+    @staticmethod
+    def _meta_row(pairs: List[Tuple[str, Any]]) -> dict:
+        """一排元信息胶囊（执行周期 / 车辆 / 数据时间）。"""
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                "gap": "6px", "marginTop": "10px"}},
+            "content": [ParkingBot._meta_pill(key, value) for key, value in pairs],
+        }
+
+    @staticmethod
+    def _humanize_gap(minutes: int) -> str:
+        """把「距今多少分钟」说成人话，**不含「更新」二字**。
+
+        60 分钟以内直接报分钟；超过就换算成小时并带上零头分钟
+        （1595 → 「26 小时 35 分钟前」，而不是让用户心算「1595 分钟是多少小时」）。
+
+        概览卡角标和车库工具条共用这一份换算。原先两边各写一套：角标那套只会
+        说「N 分钟前」，插件挂机一天就在肩上顶着「1595 分钟前更新」——
+        而「数据很旧」恰恰是这个角标最该起作用的场景。
+        """
+        minutes = ParkingBot._to_int(minutes, 0)
+        if minutes < 1:
+            return "刚刚"
+        if minutes < 60:
+            return f"{minutes} 分钟前"
+        hours, rest = minutes // 60, minutes % 60
+        return f"{hours} 小时 {rest} 分钟前" if rest else f"{hours} 小时前"
+
+    def _freshness_text(self, snapshot: dict) -> str:
+        """概览卡右肩的「数据有多新」，读不出来就返回空串（整颗角标不渲染）。
+
+        和车库工具条的 _age_text 区别只在「缺数据时给什么」：那边降级成
+        「数据时间未知」，这边宁可不显示，也不给「未知」这种占位。
+        量词换算两者共用 _humanize_gap，别再各写一套。
+        """
+        raw = str(snapshot.get("time") or "").strip()
+        if not raw:
+            return ""
+        try:
+            taken = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return ""
+        minutes = int((self._now_naive() - taken).total_seconds() // 60)
+        if minutes < 0:            # 时间在未来：宁可不显示，也不显示负数
+            return ""
+        return f"数据 {ParkingBot._humanize_gap(minutes)}更新"
 
     @staticmethod
     def _kv(label: str, value: Any, color: str = "") -> dict:
@@ -2492,7 +2610,7 @@ class ParkingBot(_PluginBase):
                 "数据统计",
                 "从下一轮执行开始累积数据",
                 [self._text("还没有统计数据，插件执行一轮后就会出现。",
-                            {"fontSize": "13px", "opacity": "0.7"})])
+                            {"fontSize": "13px", "opacity": "0.7"})], accent=_GREEN)
 
         def day_row(d: str) -> Tuple[int, int, int]:
             b = daily.get(d) or {}
@@ -2556,7 +2674,7 @@ class ParkingBot(_PluginBase):
                        f"当日共 {self._to_int(bucket.get('rounds'), 0)} 轮执行，"
                        f"买车 {self._to_int(bucket.get('bought'), 0)} 次、"
                        f"换车 {self._to_int(bucket.get('traded'), 0)} 次",
-                       [self._hour_chart(hours)]),
+                       [self._hour_chart(hours)], accent=_GREEN),
             # 每日明细
             self._card(
                 "每日明细",
@@ -2570,7 +2688,7 @@ class ParkingBot(_PluginBase):
                       str(day_row(d)[2])]
                      for d in days[:30]],
                     ["3", "2", "2", "2", "2"],
-                    ["left", "right", "right", "right", "right"])]),
+                    ["left", "right", "right", "right", "right"])], accent=_GREEN),
             # 买卖汇总
             self._card(
                 "本月买卖",
@@ -2580,7 +2698,7 @@ class ParkingBot(_PluginBase):
                     f"买入 {sum(self._to_int((daily[d] or {}).get('spent'), 0) for d in month_days)} 金"
                     f"　·　换车补差价 "
                     f"{sum(self._to_int((daily[d] or {}).get('diff'), 0) for d in month_days)} 金",
-                    {"fontSize": "14px", "color": _PINK})],
+                    {"fontSize": "14px", "color": _PINK})], accent=_GREEN,
             ),
         ]
         # 最近几轮明细放在最下面，保留原来的执行历史能力
@@ -2593,7 +2711,7 @@ class ParkingBot(_PluginBase):
                                str(i.get("moved", 0)), str(i.get("earned", 0))]
                               for i in history[:10]],
                              ["2", "1", "1", "1"],
-                             ["left", "center", "center", "right"])]))
+                             ["left", "center", "center", "right"])], accent=_GREEN))
         return {"component": "div", "props": {"style": {}}, "content": blocks}
 
     @staticmethod
@@ -4060,6 +4178,8 @@ class ParkingBot(_PluginBase):
 
         页面渲染器不会自己跳（PageRender 没有任何定时能力），所以数据新不新
         全靠这一行字告诉用户 —— 没有它，用户只能凭猜。
+
+        量词换算与概览卡角标共用 _humanize_gap：同一件事不该有两种说法。
         """
         raw = str(snapshot.get("time") or "").strip()
         if not raw:
@@ -4071,11 +4191,7 @@ class ParkingBot(_PluginBase):
         minutes = int((self._now_naive() - taken).total_seconds() // 60)
         if minutes < 0:
             return f"数据时间 {raw}"
-        if minutes < 1:
-            return "刚刚更新"
-        if minutes < 60:
-            return f"{minutes} 分钟前更新"
-        return f"{minutes // 60} 小时 {minutes % 60} 分钟前更新"
+        return f"{ParkingBot._humanize_gap(minutes)}更新"
 
     def _garage_toolbar(self, snapshot: dict, api: str) -> dict:
         """
@@ -4318,7 +4434,7 @@ class ParkingBot(_PluginBase):
             "和游戏里点顶栏称号一样：只改显示的名字，不影响任何收益",
             [*rows,
              self._action_btn("收起", f"plugin/{pid}/title_pick", {"open": False},
-                              kind="trade")])
+                              kind="trade")], accent=_GOLD)
 
     @staticmethod
     def _dict_rows(value: Any) -> List[dict]:
@@ -4625,7 +4741,7 @@ class ParkingBot(_PluginBase):
         return self._card(
             "以旧换新",
             "旧车必须是空闲车，且要换成更贵的车型；金币不够的那辆按钮会置灰",
-            content)
+            content, accent=_GOLD)
 
     def _build_shop(self, snapshot: dict) -> List[dict]:
         """
@@ -4707,7 +4823,7 @@ class ParkingBot(_PluginBase):
             blocks.append(self._card(
                 "限时 / 限量特卖",
                 "折扣车辆，按场次限购或限时，过期失效；等级不足或金币不够则按钮置灰",
-                [self._grid(items)],
+                [self._grid(items)], accent=_GOLD,
             ))
 
         # ---------- 车市 ----------
@@ -4768,7 +4884,7 @@ class ParkingBot(_PluginBase):
                 "车市",
                 f"当前金币 {ParkingBot._fmt_num(cash)}，车辆 {owned_count}/{car_max} 辆；"
                 f"按钮直接扣金币，可用性在后端还会再校验一次",
-                [self._cat_pills(categories, current, filter_api), self._grid(items)],
+                [self._cat_pills(categories, current, filter_api), self._grid(items)], accent=_GOLD,
             ))
         # 车型表拿不到（game_data.php 失败）时上面两段都不会产出。
         # 仍然要给出这张卡：车市页需要一个兜底标题，否则切到车市会是一片空白。
@@ -4777,7 +4893,7 @@ class ParkingBot(_PluginBase):
                 "车市",
                 "车型表与特卖列表暂时拿不到，下一轮执行成功后会自动补上",
                 [self._text("车市数据未加载",
-                            {"fontSize": "13px", "opacity": "0.8"})],
+                            {"fontSize": "13px", "opacity": "0.8"})], accent=_GOLD,
             ))
         return blocks
 
@@ -4851,8 +4967,15 @@ class ParkingBot(_PluginBase):
             })
         return {
             "component": "div",
-            "props": {"style": {"display": "flex", "gap": "8px", "marginBottom": "14px",
-                                "flexWrap": "wrap"}},
+            "props": {"style": {
+                "display": "flex", "gap": "6px", "marginBottom": "14px",
+                "flexWrap": "wrap",
+                # 外面套一层内嵌槽：页签是「一组互斥选项」，收进一个凹槽里
+                # 比四颗按钮直接浮在页面上更像一组。按钮自己的样式一个都没动。
+                "padding": "6px", "borderRadius": "14px",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "border": "1px solid rgba(255,255,255,0.10)",
+            }},
             "content": buttons,
         }
 
@@ -4865,6 +4988,7 @@ class ParkingBot(_PluginBase):
         tab = self._tab if self._tab in dict(self._TABS) else "spots"
 
         # ---------- 概览 ----------
+        subtitle = ""
         if snapshot:
             stats = [
                 self._stat("今日收益", today_earned, _GREEN),
@@ -4873,9 +4997,6 @@ class ParkingBot(_PluginBase):
                 self._stat("距下次运行", self._next_run_text(), _PURPLE),
             ]
             header = f"{snapshot.get('name', '未命名')} · Lv.{snapshot.get('level', 1)}"
-            subtitle = (f"执行周期 {self._cron or '未启用'}"
-                        f" · 车辆 {snapshot.get('car_total', 0)}/{snapshot.get('car_max', 10)} 辆"
-                        f" · 数据时间 {snapshot.get('time', '-')}")
         else:
             stats = [
                 self._stat("今日收益", today_earned, _GREEN),
@@ -4891,23 +5012,83 @@ class ParkingBot(_PluginBase):
             last_run = f"{last_run}（{datetime.fromtimestamp(self._last_run_ts):%Y-%m-%d %H:%M:%S}）"
 
         chip = self._title_chip(snapshot) if snapshot else None
-        head_lines = [
-            # 名字和称号并排：称号标签是点的入口，和游戏顶栏一个位置
+        fresh = self._freshness_text(snapshot) if snapshot else ""
+
+        # 名字行：玩家名 + 称号标签（点的入口，和游戏顶栏同位置）+ 右肩新鲜度角标
+        name_row: List[dict] = [
+            self._text(header, {"fontSize": "21px", "fontWeight": "700",
+                                "color": "rgba(255,255,255,0.92)",
+                                "letterSpacing": "0.3px"}),
+        ]
+        if chip:
+            name_row.append(chip)
+        # 中间垫一个可伸缩的空 div，把角标顶到右肩；窄屏放不下时整行会换行
+        name_row.append({"component": "div",
+                         "props": {"style": {"flex": "1 1 auto"}}})
+        if fresh:
+            name_row.append({
+                "component": "div",
+                "props": {"style": {
+                    "display": "inline-flex", "alignItems": "center", "gap": "5px",
+                    "padding": "3px 10px", "borderRadius": "999px",
+                    "backgroundColor": "rgba(255,255,255,0.03)",
+                    "border": "1px solid rgba(255,255,255,0.10)",
+                    "fontSize": "11px", "color": "rgba(255,255,255,0.62)",
+                }},
+                "text": fresh,
+            })
+
+        head_lines: List[dict] = [
             {"component": "div",
              "props": {"style": {"display": "flex", "alignItems": "center",
                                  "gap": "10px", "flexWrap": "wrap"}},
-             "content": [
-                 self._text(header, {"fontSize": "19px", "fontWeight": "bold",
-                                     "letterSpacing": "0.3px"}),
-                 *([chip] if chip else []),
-             ]},
-            self._text(subtitle, {"fontSize": "12px", "opacity": "0.62",
-                                  "marginTop": "4px", "lineHeight": "1.6"}),
-            self._text(f"最近一轮　{last_run}",
-                       {"fontSize": "12px", "opacity": "0.78", "marginTop": "8px"}),
-            self._text(f"本次进程累计挪车收益　{self._total_earned} 金币",
-                       {"fontSize": "12px", "opacity": "0.78"}),
+             "content": name_row},
         ]
+        # 元信息收成胶囊（原来是「执行周期 · 车辆 · 数据时间」一行裸文字）
+        if snapshot:
+            head_lines.append(self._meta_row([
+                ("周期", self._cron or "未启用"),
+                ("车辆", f"{snapshot.get('car_total', 0)}"
+                         f"/{snapshot.get('car_max', 10)} 辆"),
+                ("数据时间", snapshot.get("time", "-")),
+            ]))
+        else:
+            head_lines.append(self._text(subtitle, {
+                "fontSize": "12px", "color": "rgba(255,255,255,0.62)",
+                "marginTop": "8px", "lineHeight": "1.6"}))
+
+        # 最近一轮 / 累计收益：并成一条横条，比两行裸文字更像"读数"
+        head_lines.append({
+            "component": "div",
+            "props": {"style": {
+                "display": "flex", "alignItems": "center", "gap": "20px",
+                "flexWrap": "wrap", "marginTop": "12px", "padding": "9px 12px",
+                "borderRadius": "10px",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "border": "1px solid rgba(255,255,255,0.10)",
+            }},
+            "content": [
+                {"component": "div",
+                 "props": {"style": {"display": "flex", "alignItems": "baseline",
+                                     "gap": "6px"}},
+                 "content": [
+                     self._text("最近一轮", {"fontSize": "11px",
+                                             "color": "rgba(255,255,255,0.32)"}),
+                     self._text(last_run, {"fontSize": "12px", "fontWeight": "700",
+                                           "color": "rgba(255,255,255,0.92)"}),
+                 ]},
+                {"component": "div",
+                 "props": {"style": {"display": "flex", "alignItems": "center",
+                                     "gap": "6px"}},
+                 "content": [
+                     self._text("本进程累计挪车收益",
+                                {"fontSize": "11px",
+                                 "color": "rgba(255,255,255,0.32)"}),
+                     self._coin(f"{self._total_earned} 金币", size=14, color=_GOLD,
+                                bold=True, align="left"),
+                 ]},
+            ],
+        })
         if note:
             head_lines.append(self._text(
                 f"自动操作　{note}",
@@ -4928,12 +5109,25 @@ class ParkingBot(_PluginBase):
             "component": "div",
             "props": {"style": {
                 "marginBottom": "12px",
-                "padding": "14px",
-                "borderRadius": "14px",
-                "border": "1px solid rgba(128,128,128,0.20)",
-                "backgroundColor": "rgba(255,255,255,0.05)",
+                "padding": "16px",
+                "borderRadius": "16px",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "backgroundColor": "rgba(255,255,255,0.045)",
+                # 顶线用负外边距顶到卡片两缘，没有 overflow:hidden 就会溢出圆角
+                "overflow": "hidden",
             }},
-            "content": head_lines,
+            "content": [
+                # 极光顶线：青 → 紫的横向渐变。gradient 只能走 backgroundImage，
+                # 写进 backgroundColor 会被渲染器丢掉（这个坑踩过）。
+                {"component": "div",
+                 "props": {"style": {
+                     "height": "3px",
+                     "borderRadius": "16px 16px 0 0",
+                     "backgroundImage": "linear-gradient(90deg,#22D3EE,#A78BFA)",
+                     "margin": "-16px -16px 14px",
+                 }}},
+                *head_lines,
+            ],
         }
 
         # 只构造当前页签对应的那一个区块。
@@ -4963,14 +5157,14 @@ class ParkingBot(_PluginBase):
                            {"fontSize": "13px", "fontFamily": "monospace"}),
                 self._text("Telegram / Slack 上发 /车库 会直接收到可点的按钮。",
                            {"fontSize": "11px", "opacity": "0.6", "marginTop": "8px"}),
-            ])
+            ], accent=_AMBER)
 
         if tab == "spots":
             sections = [self._card(
                 "我的车位",
                 "私家车位被别人的车停够规定时长后可以贴条，罚款按停车收益分成给自己",
                 [self._spot_grid(self._dict_rows(snapshot.get("spots")), ticket_api,
-                                 charity_api)]), howto_card]
+                                 charity_api)], accent=_CYAN), howto_card]
         elif tab == "shop":
             sections = self._build_shop(snapshot)
         elif tab == "garage":
@@ -4985,7 +5179,7 @@ class ParkingBot(_PluginBase):
                               self._to_int(snapshot.get("free_spots"), 0),
                               self._to_int(snapshot.get("parked_total"), 0),
                               self._to_int(snapshot.get("car_max"), 1),
-                              park_api, unpark_api)])]
+                              park_api, unpark_api)], accent=_PURPLE)]
         else:
             sections = [self._stats_page(daily, history, today_earned)]
 
