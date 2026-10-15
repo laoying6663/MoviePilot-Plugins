@@ -273,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.42.0"
+    plugin_version = "1.43.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1347,8 +1347,19 @@ class ParkingBot(_PluginBase):
             logger.warning(f"[不可躺自动抢车位] 读取通知列表失败：{err}")
             return []
         if not (isinstance(data, dict) and data.get("success")):
+            # 不抛异常、也不静默：角标明明有未读、列表却是空的，
+            # 这种「静默空」最难排查 —— 页面上只显示「暂无通知」，
+            # 后端一点线索都不留。把真实响应原样记下来。
+            logger.warning(
+                f"[不可躺自动抢车位] 通知列表返回异常："
+                f"{repr(data)[:300]}")
             return []
-        return self._notif_rows(data)
+        rows = self._notif_rows(data)
+        if not rows:
+            logger.warning(
+                f"[不可躺自动抢车位] 通知列表为空，响应键："
+                f"{sorted(data)[:12]}")
+        return rows
 
     @staticmethod
     def _notif_rows(data: Any) -> List[dict]:
@@ -1775,12 +1786,15 @@ class ParkingBot(_PluginBase):
             # 铃铛角标用的未读数。这轮没拉到（接口挂了 / 超时）就沿用上一次的，
             # 而不是写成 0 —— 后者等于把「接口挂了」和「真的没有未读」当成同一个数，
             # 角标会在一次网络抖动后凭空消失，看起来像通知被谁读了。
-            notif_unread = notif_count
-            if notif_unread is None:
-                prev = await self.async_get_data("snapshot")
-                notif_unread = self._to_int(
-                    prev.get("notifUnread") if isinstance(prev, dict) else 0,
-                    0, minimum=0)
+            #
+            # 通知列表也必须一起带过去：_record_round 每轮都**重建整份快照**，
+            # 不显式搬运的话，下一次定时任务就把用户刚点开看到的列表抹成空 ——
+            # 而定时任务是每 5 分钟一次，等于这个面板基本永远显示「暂无通知」。
+            prev = await self.async_get_data("snapshot")
+            prev = prev if isinstance(prev, dict) else {}
+            carried = prev.get("notifications")
+            notif_unread = (notif_count if notif_count is not None
+                            else self._to_int(prev.get("notifUnread"), 0, minimum=0))
 
             snapshot = {
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1836,6 +1850,12 @@ class ParkingBot(_PluginBase):
                 ],
                 "flash": flash,
                 "notifUnread": notif_unread,
+                # 通知列表跨轮次带过去，见上面 notif_unread 那段注释。
+                # 不是列表（第一次点开之前还没拉过）就留空键，别塞 None ——
+                # 面板用 _dict_rows 过滤，None 和 [] 结果一样，但快照里
+                # 混进 None 会让「这份快照有没有通知列表」这件事变得没法一眼看懂。
+                "notifications": (list(carried)
+                                  if isinstance(carried, list) else []),
             }
             await self.async_save_data("snapshot", snapshot)
 
