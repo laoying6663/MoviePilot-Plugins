@@ -246,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.38.0"
+    plugin_version = "1.39.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -3707,14 +3707,13 @@ class ParkingBot(_PluginBase):
         if not spot_key:
             return _result({"success": False, "error": "缺少车位 ID"})
 
-        cookie = await self._resolve_cookie()
-        if not cookie:
-            return _result({"success": False,
-                            "error": self._sso_error or "未取到登录 Cookie"})
-        client = AsyncRequestUtils(cookies=cookie, timeout=20)
-        state = await client.get_json(f"{self.API_BASE}/state.php")
-        if not state or not state.get("success"):
-            return _result({"success": False, "error": "登录状态失效，请检查站点 Cookie"})
+        # 和 api_unpark / api_park 共用同一个并行封装：state.php ‖ 车型表 ‖ 市场预取。
+        # 贴条原先是老写法 —— 自己串行 resolve_cookie → state.php，事后又补拉车型表。
+        # 单请求约 1.1 秒时总耗时 8.8 秒，是挪车/停车（1.1 秒）的八倍。
+        # 走这个封装后，车型表和市场预取在第一跳就备好，后面全都命中缓存。
+        client, state, cars_map, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
 
         user_id = state.get("userId")
         spot = next((s for s in self._dict_rows(state.get("parkingSpots"))
@@ -3770,10 +3769,17 @@ class ParkingBot(_PluginBase):
         # 原先只累加、不记账，等下一次 run_once 里的 _record_round 才写进 daily。
         # 那有两个后果：一是跨天贴的会记到第二天（日期错），二是插件在这期间
         # 重启的话 _shop_fined 随内存一起没了，这笔钱永久丢失 —— 而统计页上的
-        # 「其中贴条」正是读这个字段。record_history=False：不写执行历史噪声行。
-        await self._record_round(client, state, user_id, 0, 0, 0, record_history=False)
-        await self._refresh_snapshot(client, "贴条")
-        note = f"贴条 {self._car_name(car, await self._load_cars_map(client))}，罚款 {fine} 金"
+        # 「其中贴条」正是读这个字段。
+        #
+        # 这里**不能**再调一次 _record_round：紧接着的刷新逻辑里还会调一遍，
+        # 两次叠起来白白多花两轮网络往返（_record_round 每次约 2.2 秒）。
+        # 记账统一交给下面那次刷新做，_shop_fined 会被它一并收走。
+        fresh = await client.get_json(f"{self.API_BASE}/state.php")
+        if fresh and fresh.get("success"):
+            await self._record_round(client, fresh, fresh.get("userId"),
+                                     0, 0, 0, record_history=False)
+        # 车名直接用第一跳就取到的 cars_map，不要为了拼一句通知再拉一次车型表
+        note = f"贴条 {self._car_name(car, cars_map)}，罚款 {fine} 金"
         if exp:
             note += f"，经验 +{exp}"
         self._set_result(note)
@@ -3794,14 +3800,9 @@ class ParkingBot(_PluginBase):
         if not spot_key:
             return _result({"success": False, "error": "缺少车位 ID"})
 
-        cookie = await self._resolve_cookie()
-        if not cookie:
-            return _result({"success": False,
-                            "error": self._sso_error or "未取到登录 Cookie"})
-        client = AsyncRequestUtils(cookies=cookie, timeout=20)
-        state = await client.get_json(f"{self.API_BASE}/state.php")
-        if not state or not state.get("success"):
-            return _result({"success": False, "error": "登录状态失效，请检查站点 Cookie"})
+        client, state, _cars_map, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
 
         user_id = state.get("userId")
         spot = next((s for s in self._dict_rows(state.get("parkingSpots"))
@@ -3825,7 +3826,13 @@ class ParkingBot(_PluginBase):
             return _result({"success": False,
                             "error": (result or {}).get("error") or "操作失败"})
 
-        await self._refresh_snapshot(client, "爱心车位切换")
+        # 同样是先并行备好 state/车型表/市场预取，再动手 —— 详见 api_ticket 处的说明。
+        # 这里原本是「串行拉 state → 操作 → _refresh_snapshot(再拉一遍)」，
+        # 单请求 1.1 秒时要 5.6 秒。
+        fresh = await client.get_json(f"{self.API_BASE}/state.php")
+        if fresh and fresh.get("success"):
+            await self._record_round(client, fresh, fresh.get("userId"),
+                                     0, 0, 0, record_history=False)
         note = ("已设为爱心车位，其他玩家停车将贡献经验" if action == "set"
                 else "已恢复为私家车位，重新按分钟产出金币")
         self._set_result(note)
