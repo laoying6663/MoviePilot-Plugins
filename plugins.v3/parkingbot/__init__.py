@@ -212,32 +212,6 @@ _SHOP_LOCK = "#E94560"
 # 也和金色（挪车收益）、粉色（支出）、绿色（净收）都拉得开
 _TICKET_C = "#FF7A9C"
 
-# ====================================================================
-# ★ 诊断埋点（v1.46.1 临时，定位完会整块删掉）
-#
-# 要回答的问题：浏览器实测每次交互的 POST 要 437~2847ms，但服务端渲染只要
-# 13~25ms。时间到底花在哪？
-#
-# 判别办法是量「处理器总耗时」并和「HTTP 总耗时」比：
-#   - 两者接近        -> 时间在插件代码里（多半是 _save_view 的读写）
-#   - HTTP 远大于处理器 -> 时间花在 MoviePilot 派发阶段（事件循环排队），
-#     插件代码改什么都没用，得从「少占事件循环」下手。
-# 所以每个交互处理器都要量总耗时，不能只量某一步。
-# ====================================================================
-_DIAG = True
-_DIAG_SLOW_MS = 50.0
-
-
-def _diag(label: str, t0: float) -> None:
-    """打一条耗时日志。慢于阈值就打，快的也打（诊断期需要样本量）。"""
-    if not _DIAG:
-        return
-    took = (time.monotonic() - t0) * 1000.0
-    try:
-        logger.info(f"[不可躺自动抢车位][诊断] {label} 耗时 {took:.0f} 毫秒")
-    except Exception:
-        pass
-
 
 # 金币图标，照抄游戏 index.html 雪碧图里的 <symbol id="ico-coin">，去掉了 use 引用。
 # 为什么不用 🪙 emoji：U+1FA99 是 2019 年才进 Unicode 的，Windows 默认字体里
@@ -301,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.46.1"
+    plugin_version = "1.47.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -357,6 +331,27 @@ class ParkingBot(_PluginBase):
     # 通知面板是否展开，同样是服务端视图状态。
     # 默认不展开：通知列表要在点开的当刻现拉，留着上次的旧通知没有意义。
     _notif_open = False
+    # ---- view 状态的落盘（v1.47.0）----
+    #
+    # 实测（诊断版 v1.46.1）：每次点页签/展开面板，插件自己的处理器里
+    # 99% 的时间都耗在 async_save_data("view", …) 这一步 ——
+    # 读只要 1~4 毫秒，写却要 31 / 175 / 763 / 4813 毫秒，
+    # 浏览器那边看到的就是 POST 692~2847 毫秒。写为什么这么慢至今没查清，
+    # 但**让用户点击不等它**就行。
+    #
+    # 所以 view 改成「内存是真相源 + 防抖后台落盘」：
+    #   - 点一下立刻返回，等待从几百毫秒降到 0
+    #   - 连续点击合并成一次写（每 0.8 秒最多落一次盘）
+    # 代价只有一个：MoviePilot 在落盘前被重启的话，下次打开回到默认页签。
+    # 那只是 UI 偏好，不是数据，值这个价。
+    _VIEW_DEBOUNCE = 0.8
+    # 这三个**故意声明成 None 而不是 {}**：可变的类属性是所有实例共享的，
+    # 而详情页渲染可能在 init_plugin 之前就调进来（类属性注释里已经写过
+    # 这个坑）。用 None 占位 + 首次使用时惰性建实例属性，才不会两个插件实例
+    # 互相串味。
+    _view_mem: Optional[Dict[str, Any]] = None
+    _view_dirty: Optional[Dict[str, Any]] = None
+    _view_flush_task: Any = None
     # 称号的进程内短缓存。游戏接口单次往返实测约 1.1 秒，而称号只在解锁或
     # 切换时变：10 分钟 TTL 跨两个执行周期，稳定状态下每两轮才发一次请求。
     # 特卖是限时场次，不缓存 —— 缓存后页面上会一直挂着已结束的场次。
@@ -455,6 +450,11 @@ class ParkingBot(_PluginBase):
         self._notif_open = bool(saved_view.get("notif_open"))
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
+        # view 的内存真相源：后台落盘时以它为准，这样只改局部字段也不会
+        # 把车市选好的分类、待换新的目标车型冲掉（原来靠的是读改写）。
+        self._view_mem = dict(saved_view)
+        self._view_dirty = {}
+        self._view_flush_task = None
         self._auth_warned = False
         # 插件重载时清空车型表缓存：手动保存配置就等于用户想"按最新数据来一遍"
         self._cars_cache = {}
@@ -4357,7 +4357,6 @@ class ParkingBot(_PluginBase):
         页面渲染器在执行完事件后会重新拉一次 plugin/page/{id}，
         所以这里只要把选择记下来，get_page() 自然就只渲染选中的那一个区块。
         """
-        _t0 = time.monotonic()  # [诊断] 处理器总耗时，用来和 HTTP 总耗时对比
         tab = str(getattr(request, "tab", "") or "").strip().lower()
         if tab not in dict(self._TABS):
             return _result({"success": False, "error": f"未知区块：{tab}"})
@@ -4369,30 +4368,84 @@ class ParkingBot(_PluginBase):
             self._day = day
             saved["day"] = day
         await self._save_view(saved)
-        _diag("api_set_tab 总耗时", _t0)  # [诊断]
         return _result({"success": True, "name": dict(self._TABS)[tab]})
 
     async def _save_view(self, patch: Dict[str, Any]) -> None:
         """
-        把 view 状态读出来、合并这次的改动再写回。
+        记住详情页的视图状态（当前页签、面板展开与否、车市筛选…）。
 
-        必须读改写：切页签、选分类、选旧车是三组独立操作。原先直接
-        async_save_data({"tab": ...}) 是整份覆盖，切一次页签就会把车市里
-        选好的分类和待换新的目标车型一起冲掉。
+        **不落盘，只改内存，然后排一个防抖后台写。**
+
+        为什么不再同步写：诊断版 v1.46.1 实测，async_save_data("view", …)
+        要 31~4813 毫秒（读只要 1~4 毫秒，慢的全是写），而这步在每次点击
+        的同步路径上。浏览器实测 POST 692~2847 毫秒，和这个写耗时完全对得上。
+        写为什么慢至今没查清，但让点击不等它就行。
+
+        为什么合并也不会丢数据：内存是全量真相源，后台任务醒来时写的是
+        **那一刻**的完整 view，不是各次增量的累加 —— 连点五次页签也只写一次，
+        而且写出去的一定是最新状态。
+
+        必须在内存里做合并，不能靠读改写：读虽然只要几毫秒，但每次点击都
+        多一次数据库往返；而且写既然是异步的，读到的可能已经不是最新的了。
         """
-        _t0 = time.monotonic()
-        stored = await self.async_get_data("view") or {}
-        _t1 = time.monotonic()
-        saved = dict(stored) if isinstance(stored, dict) else {}
-        saved.update(patch)
+        if self._view_mem is None:
+            self._view_mem = {}
+        if self._view_dirty is None:
+            self._view_dirty = {}
+        self._view_mem.update(patch)
+        self._view_dirty.update(patch)
+        self._schedule_view_flush()
+
+    def _schedule_view_flush(self) -> None:
+        """排一个防抖后台落盘。已有任务在排队就不重复排，它醒来时会写最新状态。"""
         try:
-            await self.async_save_data("view", saved)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 不在事件循环里（正常路径不会走到）：没法排后台任务。
+            # 直接放弃这次落盘 —— view 只是 UI 偏好，内存里仍然是对的。
+            return
+        task = self._view_flush_task
+        if task is not None:
+            try:
+                # 必须是**同一个**事件循环里未完成的任务才算数。跨循环的
+                # （插件重启、或者测试里反复 asyncio.run）一律当成已死 ——
+                # 否则会一直以为「已经有任务在排队」，新变更永远排不出去。
+                if not task.done() and task.get_loop() is loop:
+                    return
+            except Exception:
+                pass
+
+        async def _later() -> None:
+            try:
+                await asyncio.sleep(self._VIEW_DEBOUNCE)
+            except asyncio.CancelledError:
+                return
+            await self._flush_view()
+
+        self._view_flush_task = loop.create_task(_later())
+
+    async def _flush_view(self) -> None:
+        """把内存里的 view 写回 data。没有待落盘的变更就直接返回。"""
+        if not self._view_dirty or self._view_mem is None:
+            return
+        payload = dict(self._view_mem)
+        self._view_dirty = {}
+        try:
+            await self.async_save_data("view", payload)
         except Exception as err:
-            # 记不住只影响下次打开时回到默认状态，不该让点击直接失败
+            # 写失败要把变更放回去重试，否则这次改动就彻底丢了
+            self._view_mem.update(payload)
+            self._view_dirty.update(payload)
             logger.warning(f"[不可躺自动抢车位] 保存详情页状态失败：{err}")
-        _diag("_save_view(%s) 读 %.0f 毫秒 / 写 %.0f 毫秒"
-              % (",".join(sorted(patch)) or "-",
-                 (_t1 - _t0) * 1000, (time.monotonic() - _t1) * 1000), _t0)
+
+    async def flush_view_now(self) -> None:
+        """
+        立刻把待落盘的 view 写掉，不等防抖。
+
+        给测试用（asyncio.run() 一结束事件循环就关，后台任务会被丢掉），
+        以及插件停用时兜底落一次。
+        """
+        await self._flush_view()
 
     async def _patch_snapshot_title(self, title_id: int, title_name: str) -> bool:
         """
@@ -4640,10 +4693,8 @@ class ParkingBot(_PluginBase):
         和称号选择器（api_title_pick）是同一套路：声明式 JSON 没有 JS 执行口，
         弹不出模态框，只能翻转一个视图状态，让重渲染时带上展开内容。
         """
-        _t0 = time.monotonic()  # [诊断]
         self._exp_open = bool(getattr(request, "open", False))
         await self._save_view({"exp_open": self._exp_open})
-        _diag("api_exp_detail 总耗时", _t0)  # [诊断]
         return _result({"success": True, "open": self._exp_open})
 
     async def api_notif_detail(self, request: NotifDetailRequest) -> ApiResult:
@@ -4657,12 +4708,10 @@ class ParkingBot(_PluginBase):
         只读不记账，_record_round 不会被调用，市场预取的结果没人取。
         不关掉预取的话，每次点铃铛都白发 3 个请求。
         """
-        _t0 = time.monotonic()  # [诊断]
         self._notif_open = bool(getattr(request, "open", False))
         await self._save_view({"notif_open": self._notif_open})
         if not self._notif_open:
             await self._patch_snapshot_notifications([])
-            _diag("api_notif_detail 总耗时(收起)", _t0)  # [诊断]
             return _result({"success": True, "open": False})
 
         # prefetch=False：通知面板只读不记账，_record_round 不会被调用，
@@ -4676,7 +4725,6 @@ class ParkingBot(_PluginBase):
 
         items = await self._load_notif_list(client)
         await self._patch_snapshot_notifications(items)
-        _diag("api_notif_detail 总耗时", _t0)  # [诊断]
         return _result({"success": True, "open": True, "count": len(items)})
 
     async def _notif_read_all(self, client: Any) -> dict:
@@ -5954,7 +6002,6 @@ class ParkingBot(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """返回插件详情页：顶部切换栏 + 当前选中的那一个区块。"""
-        _t0 = time.monotonic()  # [诊断] 同步端点（FastAPI 线程池），用于对照
         snapshot, history, daily = self._page_data()
         today_earned = self._today_earned(history)
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
@@ -6087,7 +6134,6 @@ class ParkingBot(_PluginBase):
                 f"自动操作　{note}",
                 {"fontSize": "12px", "color": _GOLD, "marginTop": "6px",
                  "lineHeight": "1.6"}))
-        _diag("get_page 前半段(概览+名字行)", _t0)  # [诊断]
 
         # 开关开着但这一轮没花钱（比如没找到划算的车型）时也给个提示，
         # 否则用户会以为开关没生效。
@@ -6193,7 +6239,6 @@ class ParkingBot(_PluginBase):
             self._nav_row(tab),
             *sections,
         ], self._tap_style_node())
-        _diag("get_page 总耗时(同步端点/线程池)", _t0)  # [诊断]
 
     # ---- 按下反馈（v1.36.0）----
     #
