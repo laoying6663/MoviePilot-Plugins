@@ -273,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.41.0"
+    plugin_version = "1.42.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -357,6 +357,11 @@ class ParkingBot(_PluginBase):
     # 「缺少登录 Cookie」会把排查方向带偏，这里把真实原因带出去。
     _sso_error = ""
     _cars_cache: Optional[Dict[int, dict]] = None
+    # 最近一次 game_data.php 的**完整**响应。它和车型表是同一次请求拿回来的，
+    # 里面的 levelTable（等级门槛）和 expConfig（经验来源每日上限）是经验值面板
+    # 的唯一数据源 —— state.php 根本不返回这两个字段。
+    # 一并存着，经验值面板就不需要再发任何请求。
+    _game_data: Optional[Dict[str, Any]] = None
     # 车型表缓存的取用时刻与有效期。游戏会不定期上新车，没有失效时间的话
     # 进程不重启就永远看不到新车（2026-10-14 一次就从 4 个分类加到 9 个）。
     _cars_cache_at: float = 0.0
@@ -421,6 +426,7 @@ class ParkingBot(_PluginBase):
         # 插件重载时清空车型表缓存：手动保存配置就等于用户想"按最新数据来一遍"
         self._cars_cache = {}
         self._cars_cache_at = 0.0
+        self._game_data = None
 
         if config.get("onlyonce"):
             self._schedule_once(delay_seconds=3)
@@ -1098,6 +1104,10 @@ class ParkingBot(_PluginBase):
             logger.warning(f"[不可躺自动抢车位] 读取车型表失败，本轮按无车型表继续：{err}")
             return {}
         if data and data.get("success"):
+            # 同一份响应里还有等级表 levelTable 和经验配置 expConfig，
+            # 经验值面板全靠它们。**state.php 不返回这两个字段**，
+            # 所以必须跟着车型表走 —— 顺手存一份缓存，不额外发请求。
+            self._game_data = data
             cars: Dict[Any, dict] = {}
             for item in (data.get("cars") or []):
                 if not isinstance(item, dict):
@@ -1326,8 +1336,13 @@ class ParkingBot(_PluginBase):
         未读数走 ?count=1 已经够画角标了，列表没人看的时候不该去取。
         """
         try:
+            # category=all 必须带：游戏那边每次都带（showNotifications 里拼的
+            # 'notifications.php?perPage=50&category=' + this._notifCategory），
+            # 这个后端认它。少带一个参数就可能返回空数组，
+            # 页面上看起来就是「明明有通知却说什么都没有」。
             data = await client.get_json(
-                f"{self.API_BASE}/notifications.php?perPage={self._NOTIF_PAGE}")
+                f"{self.API_BASE}/notifications.php"
+                f"?perPage={self._NOTIF_PAGE}&category=all")
         except Exception as err:
             logger.warning(f"[不可躺自动抢车位] 读取通知列表失败：{err}")
             return []
@@ -1771,16 +1786,16 @@ class ParkingBot(_PluginBase):
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "name": mine.get("name") or "未命名",
                 "level": self._to_int(mine.get("level"), 1, minimum=1),
-                # 经验值。state.php 一并给了这几项，别再自己猜口径：
-                #   exp        累计总经验（游戏 checkLevelUp 拿它跟 expReq 比）
-                #   levelTable [{level, expReq}]，expReq 是**累计**门槛
-                #   expConfig  各来源每日上限
-                #   dailyExp   今日各来源已得（字段名未经验证，取不到就显示「—」，
-                #               「没数据」和「真的是 0」必须分得开）
+                # 经验值。levelTable / expConfig 来自 game_data.php（跟车型表同一份
+                # 缓存，state.php 不返回它们），dailyExp 来自 state.php：
+                #   exp        users[我的 id].exp，累计总经验
+                #   levelTable game_data.levelTable，expReq 是**累计**门槛
+                #   expConfig  game_data.expConfig 的 xxxDailyLimit，各来源每日上限
+                #   dailyExp   state.dailyExp，键是 "<用户ID>_<动作>_<日期>"
                 "exp": self._to_int(mine.get("exp"), 0, minimum=0),
-                "levelTable": self._exp_level_table(state),
-                "expConfig": self._exp_config(state),
-                "dailyExp": self._exp_daily(state, mine),
+                "levelTable": self._exp_level_table(self._game_data or {}),
+                "expConfig": self._exp_config(self._game_data or {}),
+                "dailyExp": self._exp_daily(state, user_id),
                 "cash": self._to_int(mine.get("cash"), 0),
                 "bonus": self._to_int(mine.get("bonus"), 0),
                 "car_total": len(my_cars),
@@ -1920,24 +1935,32 @@ class ParkingBot(_PluginBase):
             if self._page_cache is None:
                 self._page_cache = {"snapshot": {}, "history": []}
 
-    # ========== 经验值（v1.40.0）==========
+    # ========== 经验值（v1.40.0，数据源在 v1.42.0 改成实测口径）==========
     #
-    # 字段名在游戏前端 JS 里对得上：LEVEL_TABLE = data.levelTable、
-    # EXP_CONFIG = data.expConfig、this.userData.exp（users[我的 id]）。
-    # 但**嵌套结构没验证过** —— 浏览器里点开弹窗只看得到渲染结果，看不到 JSON。
-    # 所以下面一律「两种形态都兼容」：
-    #     {"PARK": 150}                            → 值就是上限
-    #     {"PARK": {"limit": 150, "name": "停车"}} → 取 .limit
-    # 上次就是硬编码了一个已被游戏改掉的名字（ticket.php 的 fine → ownerEarn），
-    # 结果贴条收入恒为 0、连查两轮。这次不重蹈。
+    # 下面每一行都对着 **game_data.php 的真实响应**和 **游戏前端 showExpDetail 的源码**
+    # 校过，不再是推测：
+    #   levelTable [{"level":7,"expReq":1700},{"level":8,"expReq":2500}, ...]
+    #       expReq 是**累计**门槛，不是「本级需要多少」。
+    #   expConfig  {"park":15,"ticket":15,...,"parkDailyLimit":150,
+    #               "ticketDailyLimit":90,"reportDailyLimit":100,
+    #               "buyDailyLimit":300,"tradeInDailyLimit":300}
+    #       左半（park/ticket/...）是「单次动作给多少经验」，
+    #       **右半 xxxDailyLimit 才是每日上限** —— 一开始只认左半，
+    #       页面上每个来源的上限都显示成 15 这种单次值。
+    #   dailyExp   键是复合的 "<用户ID>_<动作>_<日期>"（游戏 addExp 拼的），
+    #       比如 "liyo1_park_2026-10-16"，不是直接拿动作名当键。
+    #
+    # 这三样全在 game_data.php / state.php，**不在同一个响应里**，
+    # 而 levelTable 和 expConfig 只在 game_data.php 里有（state.php 不返回）。
+    # 所以它们跟着车型表走同一份缓存，不额外发请求。
     @staticmethod
-    def _exp_level_table(state: dict) -> List[dict]:
+    def _exp_level_table(game_data: dict) -> List[dict]:
         """取等级表 [{level, expReq}]，按 level 升序。
 
-        expReq 是**累计**经验门槛（游戏拿 userData.exp 与它比较），
+        expReq 是**累计**经验门槛（游戏 updateExpProgress 拿 userData.exp 与它比较），
         不是「本级需要多少」。
         """
-        raw = state.get("levelTable")
+        raw = game_data.get("levelTable") if isinstance(game_data, dict) else None
         rows = [r for r in (raw if isinstance(raw, list) else [])
                 if isinstance(r, dict)]
         out = []
@@ -1950,50 +1973,75 @@ class ParkingBot(_PluginBase):
         out.sort(key=lambda x: x["level"])
         return out
 
-    @staticmethod
-    def _exp_config(state: dict) -> dict:
-        """取经验来源每日上限，归一成 {来源键: 上限}。结构未验证，两种形态都认。"""
-        raw = state.get("expConfig")
+    @classmethod
+    def _exp_config(cls, game_data: dict) -> Dict[str, int]:
+        """
+        取各来源每日上限，归一成 {动作键: 上限}。
+
+        上限在 expConfig 的 **xxxDailyLimit** 那一组。游戏自己的 showExpDetail 里
+        每个动作都带一个 `|| 默认值` 兜底，所以后端没给这个键时游戏照样显示一个数 ——
+        这里跟它一样取默认值，页面上永远是 7 行，不会少行。
+        """
+        cfg = (game_data or {}).get("expConfig")
+        cfg = cfg if isinstance(cfg, dict) else {}
         out: Dict[str, int] = {}
-        if not isinstance(raw, dict):
-            return out
-        for key, val in raw.items():
-            if isinstance(val, dict):
-                lim = None
-                for k in ("limit", "max", "cap", "dailyLimit"):
-                    if k in val:
-                        lim = val.get(k)
-                        break
-                if lim is None:
-                    continue
-            else:
-                lim = val
-            n = ParkingBot._to_int(lim, 0, minimum=0)
-            if n > 0:
-                out[str(key)] = n
+        for key, _label, fallback in cls._EXP_SOURCES:
+            out[key] = cls._to_int(cfg.get(key + "DailyLimit"), fallback, minimum=0)
         return out
 
-    @staticmethod
-    def _exp_daily(state: dict, mine: dict) -> Dict[str, int]:
-        """取今日各来源已得经验，归一成 {来源键: 已得}。位置同样未验证：
-        先找用户对象上的 dailyExp / expToday，再找 state 顶层。
+    @classmethod
+    def _exp_daily(cls, state: dict, user_id: Any = None) -> Dict[str, int]:
         """
-        for holder in (mine, state):
+        取今日各来源已得经验，归一成 {动作键: 已得}。
+
+        dailyExp 的键是复合的 `<用户ID>_<动作>_<日期>`，要拆开才能用。
+        拆法是「剥掉用户 ID 前缀 + 剥掉日期后缀，中间必须正好是一个已知动作名」，
+        **不能用 rsplit("_", 2)**：动作名本身带下划线（charity_park），
+        rsplit 会把 "liyo1_charity_park_2026-10-16" 切成动作 "park"，
+        于是爱心停车的经验被算到停车头上，页面上显示成 170/150。
+        只留今天的 —— 昨天的数字叠上来会让「今日经验」凭空变大。
+        """
+        raw: dict = {}
+        holders: List[Any] = [state]
+        if isinstance(state, dict) and user_id is not None:
+            holders.append((state.get("users") or {}).get(user_id))
+        for holder in holders:
             if not isinstance(holder, dict):
                 continue
             for key in ("dailyExp", "expToday", "todayExp"):
                 val = holder.get(key)
-                if isinstance(val, dict):
-                    return {str(k): ParkingBot._to_int(v, 0, minimum=0)
-                            for k, v in val.items() if isinstance(k, str)}
-        return {}
+                if isinstance(val, dict) and val:
+                    raw = val
+                    break
+            if raw:
+                break
+        if not raw:
+            return {}
+        today = cls._now_naive().strftime("%Y-%m-%d")
+        known = {key for key, _label, _fb in cls._EXP_SOURCES}
+        prefix = f"{user_id}_" if user_id is not None else ""
+        tail = f"_{today}"
+        out: Dict[str, int] = {}
+        for key, val in raw.items():
+            text = str(key)
+            if prefix and not text.startswith(prefix):
+                continue
+            body = text[len(prefix):] if prefix else text
+            if not body.endswith(tail):
+                continue
+            action = body[:-len(tail)]
+            if action not in known:
+                continue
+            out[action] = out.get(action, 0) + cls._to_int(val, 0, minimum=0)
+        return out
 
     @classmethod
     def _exp_progress(cls, snapshot: dict) -> dict:
         """算等级进度 {cur, exp, base, next, percent, remain}。
 
-        百分比必须拿「本级起点」当分母：(exp - 本级门槛) / (下一级门槛 - 本级门槛)。
-        直接 exp / 下一级门槛 会把游戏里显示的 73% 算成 91%。
+        百分比必须拿「本级起点」当分母：(exp - 本级门槛) / (下一级门槛 - 本级门槛)，
+        口径与游戏 updateExpProgress 的 progress 一致。直接 exp / 下一级门槛
+        会把游戏里显示的 73% 算成 91%。
         拿不到等级表时 percent 为 None，调用方降级成「只显示经验数」。
         """
         out = {"cur": cls._to_int(snapshot.get("level"), 1, minimum=1),
@@ -2022,7 +2070,8 @@ class ParkingBot(_PluginBase):
         return out
 
     @classmethod
-    def _exp_fill(cls, percent: int, height: str = "6px") -> dict:
+    def _exp_fill(cls, percent: int, height: str = "6px",
+                  color: str = _CYAN) -> dict:
         """进度条：底 + 填充。填充用 div 纯色（插件渲染器不吃渐变）。"""
         return {"component": "div", "props": {"style": {
             "position": "relative", "height": height, "borderRadius": "999px",
@@ -2030,38 +2079,66 @@ class ParkingBot(_PluginBase):
         }},
             "content": [{"component": "div", "props": {"style": {
                 "width": f"{max(0, min(100, percent))}%", "height": "100%",
-                "borderRadius": "999px", "backgroundColor": _CYAN,
+                "borderRadius": "999px", "backgroundColor": color,
             }}}]}
 
-    # 经验来源的中文名与顺序照游戏弹窗。键名从 expConfig 取，
-    # 这里只管「键 → 中文名」；取不到对应键就不显示那一行，不写死上限数值。
+    # 经验来源：键名、顺序、名称全部照抄游戏前端 showExpDetail 的 actions 数组。
+    # 第三项是游戏自己写的兜底默认值（`limit: e.xxxDailyLimit || 默认`），
+    # 后端没给这个键时游戏照样显示一个数，这里跟着用同一套默认值，
+    # 页面上永远 7 行，不会少行也不会显示 0。
+    #   键 → 上限取自 expConfig.<键>DailyLimit（game_data.php 实测有前 5 个，
+    #   charity_park / charity 后端根本没给，正好落到游戏自己的默认值 50 / 200）
     _EXP_SOURCES = (
-        ("PARK", "停车"),
-        ("TICKET", "贴条"),
-        ("REPORT", "举报"),
-        ("BUY", "买车"),
-        ("TRADEIN", "以旧换新"),
-        ("CHARITY_PARK", "爱心停车"),
-        ("CHARITY_SPOT", "爱心车位收益"),
-        ("CHARITY", "爱心车位收益"),
+        ("park", "停车", 100),
+        ("ticket", "贴条", 60),
+        ("report", "举报", 200),
+        ("buy", "购车", 150),
+        ("tradeIn", "以旧换新", 200),
+        ("charity_park", "爱心停车", 50),
+        ("charity", "爱心车位收益", 200),
     )
+
+    # 游戏按百分比分三档色：满了红、过七成橙、其余绿
+    _EXP_BAR_FULL = "#e94560"
+    _EXP_BAR_HIGH = "#ff9800"
+    _EXP_BAR_LOW = "#4caf50"
+
+    @classmethod
+    def _exp_bar_color(cls, percent: int) -> str:
+        if percent >= 100:
+            return cls._EXP_BAR_FULL
+        if percent >= 70:
+            return cls._EXP_BAR_HIGH
+        return cls._EXP_BAR_LOW
 
     @classmethod
     def _exp_bar(cls, snapshot: dict, api: str) -> dict:
-        """常显的一格：等级 Lv.N + 细进度条 + 本级经验/下一级门槛，可点。
+        """
+        常显的一格：等级 Lv.N + 细进度条 + 本级经验/下一级门槛，可点。
+
+        「等级」和「Lv.N」**同一排**，进度条和经验数在下面一行 ——
+        和游戏顶栏一致（<span class="stat-label">等级</span><span>Lv.1</span>
+        后面才跟 exp-progress-bar）。原先三样东西竖着排，这一格比称号高出一倍，
+        名字行被顶得参差不齐。
         没有等级表时降级成「等级 Lv.N · 经验 X」，仍然可点开详情。
         """
         pg = cls._exp_progress(snapshot)
-        head = [
-            cls._text("等级", {"fontSize": "11px",
-                              "color": "rgba(255,255,255,0.45)"}),
-            cls._text(f"Lv.{pg['cur']}", {"fontSize": "12px", "fontWeight": "bold",
-                                          "color": "#FFFFFF"}),
-        ]
+        head: List[dict] = [{
+            "component": "div",
+            "props": {"style": {"display": "inline-flex", "alignItems": "baseline",
+                                "gap": "4px"}},
+            "content": [
+                cls._text("等级", {"fontSize": "11px",
+                                  "color": "rgba(255,255,255,0.45)"}),
+                cls._text(f"Lv.{pg['cur']}", {"fontSize": "12px",
+                                              "fontWeight": "bold",
+                                              "color": "#FFFFFF"}),
+            ],
+        }]
         if pg["percent"] is None:
             head.append(cls._text(f"经验 {ParkingBot._fmt_num(pg['exp'])}",
-                                   {"fontSize": "11px",
-                                    "color": "rgba(255,255,255,0.62)"}))
+                                  {"fontSize": "11px",
+                                   "color": "rgba(255,255,255,0.62)"}))
         else:
             head.append(cls._exp_fill(pg["percent"], "4px"))
             head.append(cls._text(
@@ -2123,7 +2200,7 @@ class ParkingBot(_PluginBase):
                          "content": [bar]})
             prog.append(cls._text(
                 f"还需 {ParkingBot._fmt_num(pg['remain'])} 经验"
-                f"升到 Lv.{pg['cur'] + 1}",
+                f"升级到 Lv.{pg['cur'] + 1}",
                 {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
                  "marginTop": "6px"}))
 
@@ -2133,70 +2210,73 @@ class ParkingBot(_PluginBase):
             "border": "1px solid rgba(255,255,255,0.10)",
         }}, "content": prog}]
 
+        # 上限为空时退回游戏自己的默认值，跟 showExpDetail 的 `|| 默认值` 一样 ——
+        # 游戏弹窗恒 7 行，插件这边也恒 7 行，不会因为某个键缺了就少一行。
         cfg = snapshot.get("expConfig") or {}
         daily = snapshot.get("dailyExp") or {}
-        if cfg:
-            items: List[dict] = []
-            got_total = 0
-            seen = set()
-            # 元组是 (键, 中文名)，解包顺序必须跟着它 —— 写成 (label, key)
-            # 会拿中文名去 cfg 里查，一个都匹配不上，7 行全被跳过，
-            # 而这在语法和类型上都是合法的，只有渲染出来才看得见。
-            #
-            # 去重要按**中文名**，不是按键：CHARITY_SPOT 和 CHARITY 是同一个
-            # 展示项的两个别名键，游戏给不给两个都还没验证。按键去重会让两个都
-            # 在 cfg 里时渲染出两行同名「爱心车位收益」，而且每日经验被重复
-            # 累加进总计。命中顺序按 _EXP_SOURCES 的先后，取第一个。
-            for key, label in cls._EXP_SOURCES:
-                if key not in cfg or label in seen:
-                    continue
-                seen.add(label)
-                limit = cls._to_int(cfg.get(key), 0, minimum=0)
-                got = cls._to_int(daily.get(key), None) if key in daily else None
-                if got is not None:
-                    got_total += got
-                row = {"component": "div", "props": {"style": {
-                    "display": "flex", "alignItems": "center",
-                    "justifyContent": "space-between", "gap": "8px"}},
-                    "content": [
-                        cls._text(label, {"fontSize": "12px",
-                                          "color": "rgba(255,255,255,0.92)"}),
-                        cls._text("—" if got is None else
-                                  f"{ParkingBot._fmt_num(got)}"
-                                  f"/{ParkingBot._fmt_num(limit)}",
-                                  {"fontSize": "11px",
-                                   "color": "rgba(255,255,255,0.62)",
-                                   "fontVariantNumeric": "tabular-nums"}),
-                    ]}
-                # 细条必须独占一行。直接 append 进上面那个
-                # justify-content: space-between 的横排里，它就成了第三个 flex
-                # 子项、去和文字抢宽度，被压成一条看不见的缝 —— 节点在页面上
-                # 查得到，肉眼什么都没有。所以外层改竖排。
-                line = {"component": "div",
-                        "props": {"style": {"display": "flex",
-                                            "flexDirection": "column",
-                                            "marginTop": "7px"}},
-                        "content": [row]}
-                if got is not None:
-                    pct = 0 if limit <= 0 else int(round(got / limit * 100))
-                    bar = cls._exp_fill(pct, "3px")
-                    bar["props"]["style"]["marginTop"] = "4px"
-                    line["content"].append(bar)
-                items.append(line)
-            if items:
-                head = ("今日经验获取（总计："
-                        + ("—" if not daily else ParkingBot._fmt_num(got_total))
-                        + "）")
-                rows.append({"component": "div", "props": {"style": {
-                    "marginTop": "10px", "padding": "10px 12px",
-                    "borderRadius": "12px",
-                    "backgroundColor": "rgba(255,255,255,0.035)",
-                    "border": "1px solid rgba(255,255,255,0.10)",
-                }},
-                    "content": [cls._text(
-                        head, {"fontSize": "12px",
+        if not cfg:
+            cfg = cls._exp_config({})
+        # 游戏这边 dailyExp 里没有今天这一项时是 `|| 0`，显示 0；
+        # 但快照里 dailyExp 整个缺失是「没数据」，显示「—」——两者必须分得开。
+        have_daily = bool(daily)
+        items: List[dict] = []
+        got_total = 0
+        for key, label, _fallback in cls._EXP_SOURCES:
+            limit = cls._to_int(cfg.get(key), 0, minimum=0)
+            if limit <= 0:
+                continue
+            got = cls._to_int(daily.get(key), 0) if key in daily else None
+            if got is not None:
+                got_total += got
+            pct = int(round(got / limit * 100)) if (got is not None and limit > 0) else 0
+            row = {"component": "div", "props": {"style": {
+                "display": "flex", "alignItems": "center",
+                "justifyContent": "space-between", "gap": "8px"}},
+                "content": [
+                    cls._text(label, {"fontSize": "12px",
+                                      "color": "rgba(255,255,255,0.92)"}),
+                    # 缺这一项时显示「—/上限」而不是光一个「—」：
+                    # 游戏那边恒显示「已得/上限」，光显示「—」等于把上限也吞了，
+                    # 用户连「一天最多能拿多少」都看不到。
+                    cls._text((f"—/{ParkingBot._fmt_num(limit)}" if got is None
+                               else f"{ParkingBot._fmt_num(got)}"
+                                    f"/{ParkingBot._fmt_num(limit)}"),
+                              {"fontSize": "11px",
                                "color": "rgba(255,255,255,0.62)",
-                               "marginBottom": "2px"})] + items})
+                               "fontVariantNumeric": "tabular-nums"}),
+                ]}
+            # 细条必须独占一行。直接 append 进上面那个
+            # justify-content: space-between 的横排里，它就成了第三个 flex
+            # 子项、去和文字抢宽度，被压成一条看不见的缝 —— 节点在页面上
+            # 查得到，肉眼什么都没有。所以外层改竖排。
+            line = {"component": "div",
+                    "props": {"style": {"display": "flex",
+                                        "flexDirection": "column",
+                                        "marginTop": "7px"}},
+                    "content": [row]}
+            if got is not None:
+                bar = cls._exp_fill(pct, "3px", cls._exp_bar_color(pct))
+                bar["props"]["style"]["marginTop"] = "4px"
+                line["content"].append(bar)
+            items.append(line)
+
+        # 这一整块必须在 for **外面**：放进去的话每循环一次就把当前全部行
+        # 再追加一遍，页面上同一批来源会重复渲染 7 遍、且每遍的「总计」都不同
+        # （150 / 240 / 240 …）。这类缩进错在语法上完全合法，只有渲染看得见。
+        if items:
+            head = ("今日经验获取（总计："
+                    + ("—" if not have_daily else ParkingBot._fmt_num(got_total))
+                    + "）")
+            rows.append({"component": "div", "props": {"style": {
+                "marginTop": "10px", "padding": "10px 12px",
+                "borderRadius": "12px",
+                "backgroundColor": "rgba(255,255,255,0.035)",
+                "border": "1px solid rgba(255,255,255,0.10)",
+            }},
+                "content": [cls._text(
+                    head, {"fontSize": "12px",
+                           "color": "rgba(255,255,255,0.62)",
+                           "marginBottom": "2px"})] + items})
 
         # 收起：_exp_open 记在服务端，不给出口的话面板会一直挂着，
         # 用户只能重启插件才能让它消失。
