@@ -246,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.37.0"
+    plugin_version = "1.38.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -873,7 +873,12 @@ class ParkingBot(_PluginBase):
                     spot_key, (result or {}).get("error") or "未知原因")
                 # 这一轮不再重试这个车位，但车还在上面，下一轮会重新判定
                 continue
-            got = self._to_int(result.get("fine"), fine, minimum=0)
+            # 同 api_ticket：游戏把 ticket.php 的返回字段从 fine 改成了 ownerEarn，
+            # 两个都得读。读不到时退回本地估算值，好过静默记成 0。
+            raw_earn = result.get("ownerEarn")
+            if raw_earn is None:
+                raw_earn = result.get("fine")
+            got = self._to_int(raw_earn, fine, minimum=0)
             total += got
             # 罚款是真金白银，必须并进当日统计（和挪车收益同一口径）。
             #
@@ -3747,9 +3752,18 @@ class ParkingBot(_PluginBase):
         if not result or not result.get("success"):
             return _result({"success": False,
                             "error": (result or {}).get("error") or "贴条失败"})
-        fine = self._to_int(result.get("fine"), 0, minimum=0)
-        exp = self._to_int(result.get("expGained"), 0, minimum=0)
         # 罚款是真金白银的收入，并进当天统计（和挪车收益同一口径）。
+        #
+        # 字段名要兼容：游戏 2026-10 改过 ticket.php 的返回结构，旧版给的是
+        # `fine`，新版给的是 `ownerEarn` —— 指同一笔钱（贴条给自己车位带来的金币），
+        # 只是文案从「罚款 N 金」红字改成了「获得 N 金币」金字。
+        # 游戏前端 JS 里两个版本并存可见。只读一个的后果是静默的：
+        # 读不到就落成 0，贴条看着成功、统计页却一直是 0，不报任何错。
+        raw_earn = result.get("ownerEarn")
+        if raw_earn is None:
+            raw_earn = result.get("fine")
+        fine = self._to_int(raw_earn, 0, minimum=0)
+        exp = self._to_int(result.get("expGained"), 0, minimum=0)
         self._shop_fined += fine
         # 立刻落盘，不等下一轮定时任务。
         #
