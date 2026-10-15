@@ -150,6 +150,17 @@ class CharitySpotRequest(BaseModel):
     action: str = Field(default="", description="set 设为爱心车位；unset 恢复私家车位")
 
 
+class ExpDetailRequest(BaseModel):
+    """
+    展开 / 收起经验值详情面板。面板是纯展示，没有别的入参。
+
+    open 必须留这个开关：_exp_open 是记在服务端的视图状态，点开后会一直挂着，
+    没有收起入口的话用户就只能重启插件才能让它消失。称号选择器是同一个道理。
+    """
+
+    open: bool = Field(default=False, description="True 展开面板，False 收起")
+
+
 def _result(payload: Dict[str, Any]) -> ApiResult:
     """
     把接口内部构造的字典收敛成宿主要求的三键响应信封。
@@ -246,7 +257,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.39.0"
+    plugin_version = "1.40.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -296,6 +307,9 @@ class ParkingBot(_PluginBase):
     # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
     # 切页签回来还在，和 _cat / _trade_for 一个套路。
     _title_open = False
+    # 经验值详情面板是否展开。和 _title_open 一个套路：插件页弹不出模态框，
+    # 只能翻转一个服务端状态，让重渲染时带上展开的面板。
+    _exp_open = False
     # 称号的进程内短缓存。游戏接口单次往返实测约 1.1 秒，而称号只在解锁或
     # 切换时变：10 分钟 TTL 跨两个执行周期，稳定状态下每两轮才发一次请求。
     # 特卖是限时场次，不缓存 —— 缓存后页面上会一直挂着已结束的场次。
@@ -380,6 +394,7 @@ class ParkingBot(_PluginBase):
         self._cat = str(saved_view.get("cat") or "").strip()
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
         self._title_open = bool(saved_view.get("title_open"))
+        self._exp_open = bool(saved_view.get("exp_open"))
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
@@ -1640,6 +1655,16 @@ class ParkingBot(_PluginBase):
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "name": mine.get("name") or "未命名",
                 "level": self._to_int(mine.get("level"), 1, minimum=1),
+                # 经验值。state.php 一并给了这几项，别再自己猜口径：
+                #   exp        累计总经验（游戏 checkLevelUp 拿它跟 expReq 比）
+                #   levelTable [{level, expReq}]，expReq 是**累计**门槛
+                #   expConfig  各来源每日上限
+                #   dailyExp   今日各来源已得（字段名未经验证，取不到就显示「—」，
+                #               「没数据」和「真的是 0」必须分得开）
+                "exp": self._to_int(mine.get("exp"), 0, minimum=0),
+                "levelTable": self._exp_level_table(state),
+                "expConfig": self._exp_config(state),
+                "dailyExp": self._exp_daily(state, mine),
                 "cash": self._to_int(mine.get("cash"), 0),
                 "bonus": self._to_int(mine.get("bonus"), 0),
                 "car_total": len(my_cars),
@@ -1777,6 +1802,294 @@ class ParkingBot(_PluginBase):
             # 正是当初加缓存想避免的开销。
             if self._page_cache is None:
                 self._page_cache = {"snapshot": {}, "history": []}
+
+    # ========== 经验值（v1.40.0）==========
+    #
+    # 字段名在游戏前端 JS 里对得上：LEVEL_TABLE = data.levelTable、
+    # EXP_CONFIG = data.expConfig、this.userData.exp（users[我的 id]）。
+    # 但**嵌套结构没验证过** —— 浏览器里点开弹窗只看得到渲染结果，看不到 JSON。
+    # 所以下面一律「两种形态都兼容」：
+    #     {"PARK": 150}                            → 值就是上限
+    #     {"PARK": {"limit": 150, "name": "停车"}} → 取 .limit
+    # 上次就是硬编码了一个已被游戏改掉的名字（ticket.php 的 fine → ownerEarn），
+    # 结果贴条收入恒为 0、连查两轮。这次不重蹈。
+    @staticmethod
+    def _exp_level_table(state: dict) -> List[dict]:
+        """取等级表 [{level, expReq}]，按 level 升序。
+
+        expReq 是**累计**经验门槛（游戏拿 userData.exp 与它比较），
+        不是「本级需要多少」。
+        """
+        raw = state.get("levelTable")
+        rows = [r for r in (raw if isinstance(raw, list) else [])
+                if isinstance(r, dict)]
+        out = []
+        for r in rows:
+            lv = ParkingBot._to_int(r.get("level"), 0, minimum=0)
+            if lv <= 0:
+                continue
+            out.append({"level": lv,
+                        "expReq": ParkingBot._to_int(r.get("expReq"), 0, minimum=0)})
+        out.sort(key=lambda x: x["level"])
+        return out
+
+    @staticmethod
+    def _exp_config(state: dict) -> dict:
+        """取经验来源每日上限，归一成 {来源键: 上限}。结构未验证，两种形态都认。"""
+        raw = state.get("expConfig")
+        out: Dict[str, int] = {}
+        if not isinstance(raw, dict):
+            return out
+        for key, val in raw.items():
+            if isinstance(val, dict):
+                lim = None
+                for k in ("limit", "max", "cap", "dailyLimit"):
+                    if k in val:
+                        lim = val.get(k)
+                        break
+                if lim is None:
+                    continue
+            else:
+                lim = val
+            n = ParkingBot._to_int(lim, 0, minimum=0)
+            if n > 0:
+                out[str(key)] = n
+        return out
+
+    @staticmethod
+    def _exp_daily(state: dict, mine: dict) -> Dict[str, int]:
+        """取今日各来源已得经验，归一成 {来源键: 已得}。位置同样未验证：
+        先找用户对象上的 dailyExp / expToday，再找 state 顶层。
+        """
+        for holder in (mine, state):
+            if not isinstance(holder, dict):
+                continue
+            for key in ("dailyExp", "expToday", "todayExp"):
+                val = holder.get(key)
+                if isinstance(val, dict):
+                    return {str(k): ParkingBot._to_int(v, 0, minimum=0)
+                            for k, v in val.items() if isinstance(k, str)}
+        return {}
+
+    @classmethod
+    def _exp_progress(cls, snapshot: dict) -> dict:
+        """算等级进度 {cur, exp, base, next, percent, remain}。
+
+        百分比必须拿「本级起点」当分母：(exp - 本级门槛) / (下一级门槛 - 本级门槛)。
+        直接 exp / 下一级门槛 会把游戏里显示的 73% 算成 91%。
+        拿不到等级表时 percent 为 None，调用方降级成「只显示经验数」。
+        """
+        out = {"cur": cls._to_int(snapshot.get("level"), 1, minimum=1),
+               "exp": cls._to_int(snapshot.get("exp"), 0, minimum=0),
+               "base": 0, "next": None, "percent": None, "remain": None}
+        table = cls._dict_rows(snapshot.get("levelTable"))
+        if not table:
+            return out
+        cur, exp = out["cur"], out["exp"]
+        base = next_req = None
+        for row in table:
+            lv = cls._to_int(row.get("level"), 0, minimum=0)
+            req = cls._to_int(row.get("expReq"), 0, minimum=0)
+            if lv <= cur:
+                base = req if base is None else max(base, req)
+            elif next_req is None:
+                next_req = req
+        out["base"] = int(base or 0)
+        if next_req is None:
+            return out                      # 已满级：没有下一级，不画进度条
+        out["next"] = int(next_req)
+        span = out["next"] - out["base"]
+        pct = 100 if span <= 0 else round((exp - out["base"]) / span * 100)
+        out["percent"] = max(0, min(100, int(pct)))
+        out["remain"] = max(0, out["next"] - exp)
+        return out
+
+    @classmethod
+    def _exp_fill(cls, percent: int, height: str = "6px") -> dict:
+        """进度条：底 + 填充。填充用 div 纯色（插件渲染器不吃渐变）。"""
+        return {"component": "div", "props": {"style": {
+            "position": "relative", "height": height, "borderRadius": "999px",
+            "backgroundColor": "rgba(255,255,255,0.10)", "overflow": "hidden",
+        }},
+            "content": [{"component": "div", "props": {"style": {
+                "width": f"{max(0, min(100, percent))}%", "height": "100%",
+                "borderRadius": "999px", "backgroundColor": _CYAN,
+            }}}]}
+
+    # 经验来源的中文名与顺序照游戏弹窗。键名从 expConfig 取，
+    # 这里只管「键 → 中文名」；取不到对应键就不显示那一行，不写死上限数值。
+    _EXP_SOURCES = (
+        ("PARK", "停车"),
+        ("TICKET", "贴条"),
+        ("REPORT", "举报"),
+        ("BUY", "买车"),
+        ("TRADEIN", "以旧换新"),
+        ("CHARITY_PARK", "爱心停车"),
+        ("CHARITY_SPOT", "爱心车位收益"),
+        ("CHARITY", "爱心车位收益"),
+    )
+
+    @classmethod
+    def _exp_bar(cls, snapshot: dict, api: str) -> dict:
+        """常显的一格：等级 Lv.N + 细进度条 + 本级经验/下一级门槛，可点。
+        没有等级表时降级成「等级 Lv.N · 经验 X」，仍然可点开详情。
+        """
+        pg = cls._exp_progress(snapshot)
+        head = [
+            cls._text("等级", {"fontSize": "11px",
+                              "color": "rgba(255,255,255,0.45)"}),
+            cls._text(f"Lv.{pg['cur']}", {"fontSize": "12px", "fontWeight": "bold",
+                                          "color": "#FFFFFF"}),
+        ]
+        if pg["percent"] is None:
+            head.append(cls._text(f"经验 {ParkingBot._fmt_num(pg['exp'])}",
+                                   {"fontSize": "11px",
+                                    "color": "rgba(255,255,255,0.62)"}))
+        else:
+            head.append(cls._exp_fill(pg["percent"], "4px"))
+            head.append(cls._text(
+                f"{ParkingBot._fmt_num(pg['exp'])}/{ParkingBot._fmt_num(pg['next'])}",
+                {"fontSize": "10px", "color": "rgba(255,255,255,0.45)",
+                 "marginTop": "2px"}))
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "flexDirection": "column",
+                "alignItems": "flex-start", "gap": "3px",
+                "padding": "3px 10px", "borderRadius": "12px",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "cursor": "pointer", "userSelect": "none",
+            }},
+            "content": head,
+            "events": {"click": {"api": api, "method": "post", "params": {}}},
+        }
+
+    @classmethod
+    def _exp_panel(cls, snapshot: dict, api: str) -> dict:
+        """
+        展开后的详情面板，信息量照抄游戏弹窗。
+        取不到等级表 / 经验配置时不编数字，只显示能确认的。
+
+        api 由调用方传进来：面板自己拿不到 plugin_id，而「收起」按钮要打回
+        同一个接口的 open=False。
+        """
+        pg = cls._exp_progress(snapshot)
+        prog: List[dict] = [
+            cls._text(f"当前等级：Lv.{pg['cur']}",
+                      {"fontSize": "13px", "color": "#FFFFFF"}),
+        ]
+        if pg["next"] is None:
+            prog.append(cls._text(
+                f"累计经验：{ParkingBot._fmt_num(pg['exp'])}（已满级）",
+                {"fontSize": "12px", "color": "rgba(255,255,255,0.62)",
+                 "marginTop": "4px"}))
+        else:
+            prog.append(cls._text(
+                f"总经验：{ParkingBot._fmt_num(pg['exp'])} / "
+                f"下一级：{ParkingBot._fmt_num(pg['next'])}",
+                {"fontSize": "12px", "color": "rgba(255,255,255,0.62)",
+                 "marginTop": "4px"}))
+            bar = cls._exp_fill(pg["percent"], "8px")
+            bar["content"].append({"component": "div", "props": {"style": {
+                "position": "absolute", "inset": "0", "display": "flex",
+                "alignItems": "center", "justifyContent": "center",
+                "fontSize": "10px", "fontWeight": "bold", "color": "#04222B",
+            }}, "text": f"{pg['percent']}%"})
+            prog.append({"component": "div",
+                         "props": {"style": {"marginTop": "8px"}},
+                         "content": [bar]})
+            prog.append(cls._text(
+                f"还需 {ParkingBot._fmt_num(pg['remain'])} 经验"
+                f"升到 Lv.{pg['cur'] + 1}",
+                {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+                 "marginTop": "6px"}))
+
+        rows: List[dict] = [{"component": "div", "props": {"style": {
+            "padding": "10px 12px", "borderRadius": "12px",
+            "backgroundColor": "rgba(255,255,255,0.035)",
+            "border": "1px solid rgba(255,255,255,0.10)",
+        }}, "content": prog}]
+
+        cfg = snapshot.get("expConfig") or {}
+        daily = snapshot.get("dailyExp") or {}
+        if cfg:
+            items: List[dict] = []
+            got_total = 0
+            seen = set()
+            # 元组是 (键, 中文名)，解包顺序必须跟着它 —— 写成 (label, key)
+            # 会拿中文名去 cfg 里查，一个都匹配不上，7 行全被跳过，
+            # 而这在语法和类型上都是合法的，只有渲染出来才看得见。
+            #
+            # 去重要按**中文名**，不是按键：CHARITY_SPOT 和 CHARITY 是同一个
+            # 展示项的两个别名键，游戏给不给两个都还没验证。按键去重会让两个都
+            # 在 cfg 里时渲染出两行同名「爱心车位收益」，而且每日经验被重复
+            # 累加进总计。命中顺序按 _EXP_SOURCES 的先后，取第一个。
+            for key, label in cls._EXP_SOURCES:
+                if key not in cfg or label in seen:
+                    continue
+                seen.add(label)
+                limit = cls._to_int(cfg.get(key), 0, minimum=0)
+                got = cls._to_int(daily.get(key), None) if key in daily else None
+                if got is not None:
+                    got_total += got
+                row = {"component": "div", "props": {"style": {
+                    "display": "flex", "alignItems": "center",
+                    "justifyContent": "space-between", "gap": "8px"}},
+                    "content": [
+                        cls._text(label, {"fontSize": "12px",
+                                          "color": "rgba(255,255,255,0.92)"}),
+                        cls._text("—" if got is None else
+                                  f"{ParkingBot._fmt_num(got)}"
+                                  f"/{ParkingBot._fmt_num(limit)}",
+                                  {"fontSize": "11px",
+                                   "color": "rgba(255,255,255,0.62)",
+                                   "fontVariantNumeric": "tabular-nums"}),
+                    ]}
+                # 细条必须独占一行。直接 append 进上面那个
+                # justify-content: space-between 的横排里，它就成了第三个 flex
+                # 子项、去和文字抢宽度，被压成一条看不见的缝 —— 节点在页面上
+                # 查得到，肉眼什么都没有。所以外层改竖排。
+                line = {"component": "div",
+                        "props": {"style": {"display": "flex",
+                                            "flexDirection": "column",
+                                            "marginTop": "7px"}},
+                        "content": [row]}
+                if got is not None:
+                    pct = 0 if limit <= 0 else int(round(got / limit * 100))
+                    bar = cls._exp_fill(pct, "3px")
+                    bar["props"]["style"]["marginTop"] = "4px"
+                    line["content"].append(bar)
+                items.append(line)
+            if items:
+                head = ("今日经验获取（总计："
+                        + ("—" if not daily else ParkingBot._fmt_num(got_total))
+                        + "）")
+                rows.append({"component": "div", "props": {"style": {
+                    "marginTop": "10px", "padding": "10px 12px",
+                    "borderRadius": "12px",
+                    "backgroundColor": "rgba(255,255,255,0.035)",
+                    "border": "1px solid rgba(255,255,255,0.10)",
+                }},
+                    "content": [cls._text(
+                        head, {"fontSize": "12px",
+                               "color": "rgba(255,255,255,0.62)",
+                               "marginBottom": "2px"})] + items})
+
+        # 收起：_exp_open 记在服务端，不给出口的话面板会一直挂着，
+        # 用户只能重启插件才能让它消失。
+        rows.append({"component": "div",
+                     "props": {"style": {"marginTop": "10px",
+                                         "display": "flex",
+                                         "justifyContent": "flex-end"}},
+                     "content": [cls._action_btn("收起", api, {"open": False},
+                                                 kind="trade")]})
+
+        return {"component": "div", "props": {"style": {
+            "marginTop": "10px", "padding": "12px", "borderRadius": "14px",
+            "border": "1px solid rgba(34,211,238,0.22)",
+            "backgroundColor": "rgba(34,211,238,0.06)",
+        }}, "content": rows}
 
     @classmethod
     def _spot_snapshot(cls, spot: dict, index: int, state: dict,
@@ -3553,6 +3866,15 @@ class ParkingBot(_PluginBase):
                 "description": "按称号 ID 调用游戏 titles.php 切换佩戴；传 0 取消佩戴",
             },
             {
+                "path": "/exp_detail",
+                "endpoint": self.api_exp_detail,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "展开经验值详情",
+                "response_model": ApiResult,
+                "description": "记录经验值面板是否展开；渲染器随后重新拉取页面并带上详情",
+            },
+            {
                 "path": "/title_pick",
                 "endpoint": self.api_title_pick,
                 "methods": ["POST"],
@@ -3838,6 +4160,17 @@ class ParkingBot(_PluginBase):
         self._set_result(note)
         logger.info(f"[不可躺自动抢车位] {note}")
         return _result({"success": True, "action": action})
+
+    async def api_exp_detail(self, request: ExpDetailRequest) -> ApiResult:
+        """
+        展开 / 收起经验值详情面板。页面渲染器随即重拉，把面板带上或收掉。
+
+        和称号选择器（api_title_pick）是同一套路：声明式 JSON 没有 JS 执行口，
+        弹不出模态框，只能翻转一个视图状态，让重渲染时带上展开内容。
+        """
+        self._exp_open = bool(getattr(request, "open", False))
+        await self._save_view({"exp_open": self._exp_open})
+        return _result({"success": True, "open": self._exp_open})
 
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
@@ -5070,6 +5403,11 @@ class ParkingBot(_PluginBase):
         chip = self._title_chip(snapshot) if snapshot else None
         fresh = self._freshness_text(snapshot) if snapshot else ""
 
+        # 经验值格与它的详情面板都要打回同一个接口，这里先算一次 api，
+        # 别让下面两处各自 getattr 一遍、再互相依赖谁先执行。
+        _pid_now = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        _exp_api = f"plugin/{_pid_now}/exp_detail"
+
         # 名字行：玩家名 + 称号标签（点的入口，和游戏顶栏同位置）+ 右肩新鲜度角标
         name_row: List[dict] = [
             self._text(header, {"fontSize": "21px", "fontWeight": "700",
@@ -5078,6 +5416,10 @@ class ParkingBot(_PluginBase):
         ]
         if chip:
             name_row.append(chip)
+        # 经验值格：紧跟称号，点它展开详情面板（走 /exp_detail，和称号选择器
+        # 同一个套路）。放在弹性垫片之前，右肩仍留给新鲜度角标。
+        if snapshot:
+            name_row.append(self._exp_bar(snapshot, _exp_api))
         # 中间垫一个可伸缩的空 div，把角标顶到右肩；窄屏放不下时整行会换行
         name_row.append({"component": "div",
                          "props": {"style": {"flex": "1 1 auto"}}})
@@ -5100,6 +5442,9 @@ class ParkingBot(_PluginBase):
                                  "gap": "10px", "flexWrap": "wrap"}},
              "content": name_row},
         ]
+        # 展开的经验值详情面板：紧跟名字行。只在点了之后才有内容。
+        if snapshot and self._exp_open:
+            head_lines.append(self._exp_panel(snapshot, _exp_api))
         # 元信息收成胶囊（原来是「执行周期 · 车辆 · 数据时间」一行裸文字）
         if snapshot:
             head_lines.append(self._meta_row([
