@@ -273,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.45.0"
+    plugin_version = "1.46.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -370,6 +370,11 @@ class ParkingBot(_PluginBase):
     # 存的是「车位 ID -> 已贴的车辆 ID」，车位上没车了就删掉该车位的记录，
     # 所以这个字典的长度始终不超过我的车位数，不会无限增长。
     _ticket_seen: Dict[str, str] = {}
+    # 批量贴条时每张之间的错峰间隔（秒）。照抄游戏自己的节奏：它的
+    # showAllTicket 就是 setTimeout(index * 200) + Promise.all，
+    # 注释写明「并行执行，但每个之间间隔 200ms 避免过于密集」。
+    # 单请求约 1.1 秒，所以 5 张从串行的 5.5 秒降到约 1.9 秒。
+    _TICKET_STAGGER = 0.2
     # 默认值必须写在类上：run_once 里会直接读 self._auto_ticket，
     # 而插件实例并非任何时刻都保证刚跑过 init_plugin（热重载中间态、
     # 派生实例等），缺属性会 AttributeError 让整轮作废。默认关，最保守。
@@ -906,8 +911,33 @@ class ParkingBot(_PluginBase):
         candidates.sort(key=lambda item: -item[0])
         notes = []
         total = 0
-        for fine, spot_key, spot, car in candidates:
-            result = await self._post(client, "ticket.php", {"spotId": spot.get("id")})
+        # 并发发出去，但**每个间隔 _TICKET_STAGGER 秒**，和游戏自己的
+        # showAllTicket 完全一致（那边是 setTimeout(index * 200) + Promise.all，
+        # 注释原话「并行执行，但每个之间间隔 200ms 避免过于密集」）。
+        #
+        # 为什么贴条可以并发：它只给各车位加一条**独立**的罚款记录，互不相干，
+        # 游戏自己就在并发做，服务端不拦。错开而不是一齐打，是为了不「过于密集」。
+        #
+        # 为什么挪车/停车**不**这么做：那两步改的是**金币余额**和车辆/车位占用，
+        # 属于共享状态。万一游戏把用户数据放在 PHP session 里，两个并发请求读到
+        # 同一份快照、后写的覆盖先写的，就是丢更新 = 丢金币。游戏自己写「一键挪车」
+        # 用的也是串行（for 里 await），所以那两步保持串行，别自作聪明。
+        async def _tick(index: int) -> Optional[dict]:
+            await asyncio.sleep(index * self._TICKET_STAGGER)
+            return await self._post(
+                client, "ticket.php", {"spotId": candidates[index][2].get("id")})
+
+        # return_exceptions=True：一张贴失败不能让整批抛出去，
+        # 那会让后面所有车位的罚款都记不上账。
+        results = await asyncio.gather(*[_tick(i) for i in range(len(candidates))],
+                                       return_exceptions=True)
+
+        for index, result in enumerate(results):
+            fine, spot_key, spot, car = candidates[index]
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "[不可躺自动抢车位] 自动贴条异常，车位 %s：%s", spot_key, result)
+                continue
             if not (result and result.get("success")):
                 logger.warning(
                     "[不可躺自动抢车位] 自动贴条失败，车位 %s：%s",
@@ -1228,7 +1258,9 @@ class ParkingBot(_PluginBase):
             self._titles_cache, self._titles_at = owned, time.monotonic()
         return {"owned": owned, "color": color}
 
-    async def _load_game_context(self) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
+    async def _load_game_context(
+        self, prefetch: bool = True
+    ) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
         """
         取出「HTTP 客户端 + 游戏状态 + 车型表」。
 
@@ -1239,6 +1271,11 @@ class ParkingBot(_PluginBase):
         不看 state —— 所以并行拉。串行时每个手动操作都要多等一个往返，
         而游戏站单请求约 1.1 秒，用户点一下按钮就得多等一秒。
         车型表有进程缓存，缓存命中时本来就不发请求，并行也不会多花钱。
+
+        prefetch=False 表示「本次不会记账，别启动市场预取」。预取的结果只有
+        _record_round 会去取（它要把特卖/称号/未读数落进快照）。像通知面板这种
+        只读不记账的路径要传 False，否则每次点铃铛都白发 3 个请求
+        （flash_sale + titles + 未读数），取回来没人用。
         """
         cookie = await self._resolve_cookie()
         if not cookie:
@@ -1252,9 +1289,10 @@ class ParkingBot(_PluginBase):
         if not state or not state.get("success"):
             await self._drop_cached_cookie()
             return client, None, {}, f"登录状态失效：{(state or {}).get('error') or '游戏接口无响应'}"
-        # 顺手把特卖/称号的预取挂上：调用方接下来要去发真正的写请求
-        #（挪车/停车/买卖），那段时间正好用来跑这两个只读接口。
-        self._start_market_prefetch(client, state)
+        if prefetch:
+            # 顺手把特卖/称号的预取挂上：调用方接下来要去发真正的写请求
+            #（挪车/停车/买卖），那段时间正好用来跑这两个只读接口。
+            self._start_market_prefetch(client, state)
         return client, state, cars_map, ""
 
     def _start_market_prefetch(self, client: Any, state: dict) -> None:
@@ -4585,7 +4623,9 @@ class ParkingBot(_PluginBase):
             await self._patch_snapshot_notifications([])
             return _result({"success": True, "open": False})
 
-        client, state, _cars, err = await self._load_game_context()
+        # prefetch=False：通知面板只读不记账，_record_round 不会被调用，
+        # 市场预取的结果没人取。不关掉的话每次点铃铛都白发 3 个请求。
+        client, state, _cars, err = await self._load_game_context(prefetch=False)
         if not state:
             return _result({"success": False, "error": err})
 
