@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.48.0"
+    plugin_version = "1.49.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1261,8 +1261,8 @@ class ParkingBot(_PluginBase):
         return {"owned": owned, "color": color}
 
     async def _load_game_context(
-        self, prefetch: bool = True
-    ) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str]:
+        self, prefetch: bool = True, extra: Any = None
+    ) -> Tuple[Optional[Any], Optional[dict], Dict[Any, dict], str, Any]:
         """
         取出「HTTP 客户端 + 游戏状态 + 车型表」。
 
@@ -1278,24 +1278,54 @@ class ParkingBot(_PluginBase):
         _record_round 会去取（它要把特卖/称号/未读数落进快照）。像通知面板这种
         只读不记账的路径要传 False，否则每次点铃铛都白发 3 个请求
         （flash_sale + titles + 未读数），取回来没人用。
+
+        extra 是一个 ``lambda client: 协程``，让调用方想拉的别的数据
+        **和 state.php 一起并发**发出去。通知面板原来是串行的：
+        先 state.php 鉴权（约 1.1 秒），再 notifications.php 拉列表（又 1.1 秒），
+        打开面板要等两个来回。两者互不依赖，并行后一次往返就够了。
+        传进来的协程用 return_exceptions 接住，别让它把整个 gather 带崩。
         """
         cookie = await self._resolve_cookie()
         if not cookie:
-            return None, None, {}, self._sso_error or "未取到登录 Cookie"
+            return None, None, {}, self._sso_error or "未取到登录 Cookie", None
         client = AsyncRequestUtils(cookies=cookie, timeout=20)
         # _load_cars_map 内部自己兜异常，这里 gather 不会因它而炸
-        state, cars_map = await asyncio.gather(
-            client.get_json(f"{self.API_BASE}/state.php"),
-            self._load_cars_map(client),
-        )
+        jobs = [client.get_json(f"{self.API_BASE}/state.php"),
+                self._load_cars_map(client)]
+        if extra is not None:
+            jobs.append(extra(client))
+        if extra is None:
+            state, cars_map = await asyncio.gather(*jobs)
+            extra_result = None
+        else:
+            state, cars_map, extra_result = await asyncio.gather(
+                *jobs, return_exceptions=True)
+            if isinstance(extra_result, BaseException):
+                # extra 失败不该挡住鉴权成功的整体流程，记一条就按空值继续。
+                logger.warning(
+                    f"[不可躺自动抢车位] 并发取数失败：{extra_result}")
+                extra_result = None
+            # return_exceptions=True 是**整个 gather** 的开关，state.php 和车型表
+            # 的异常也会被接住。不把它们归位的话，下一行 state.get("success")
+            # 会对着一个异常对象炸成 AttributeError，用户看到的是内部错误而不是
+            # 「登录状态失效」。原来（不接异常）这里是直接往外抛，所以归位成
+            # 空值后走的是同一条对外分支，对外表现不变。
+            if isinstance(state, BaseException):
+                logger.warning(
+                    f"[不可躺自动抢车位] 取游戏状态失败：{state}")
+                state = None
+            if isinstance(cars_map, BaseException):
+                cars_map = {}
         if not state or not state.get("success"):
             await self._drop_cached_cookie()
-            return client, None, {}, f"登录状态失效：{(state or {}).get('error') or '游戏接口无响应'}"
+            return (client, None, {},
+                    f"登录状态失效：{(state or {}).get('error') or '游戏接口无响应'}",
+                    None)
         if prefetch:
             # 顺手把特卖/称号的预取挂上：调用方接下来要去发真正的写请求
             #（挪车/停车/买卖），那段时间正好用来跑这两个只读接口。
             self._start_market_prefetch(client, state)
-        return client, state, cars_map, ""
+        return client, state, cars_map, "", extra_result
 
     def _start_market_prefetch(self, client: Any, state: dict) -> None:
         """
@@ -2379,9 +2409,16 @@ class ParkingBot(_PluginBase):
     # 游戏以后加新类型时别静默丢内容：未知类型照样显示，只是没有配色。
     _NOTIF_FALLBACK = ("通知", "#4fc3f7")
 
-    # 游戏弹窗写死 perPage=50，这里跟它一致 —— 多了对只看前 50 条的页面没用，
-    # 少了则会让「明明有通知却只显示一半」。
+    # 拉多少条：和游戏弹窗一致（perPage=50）。面板只渲染前 _NOTIF_SHOW 条，
+    # 但**全部** rows 都参与算「N 条未读」，所以这里不砍 —— 砍了会让角标上限
+    # 从 50 掉到更小的数，反而变成一个不准的数字。打开慢已经由并发解决
+    # （见 _load_game_context 的 extra），不靠少拉条数。
+    # category=all 必须留着，少带这个参数后端可能返回空数组（见 _load_notif_list）。
     _NOTIF_PAGE = 50
+    # 面板最多渲染几条。一条通知卡片大约 60px 高，50 条就是近 3000px 的滚动，
+    # 手机上要划十几屏才看得完，用户反馈「展开太长」。
+    # 剩下的只在底部给一行提示，让用户知道去游戏网页看全部。
+    _NOTIF_SHOW = 8
 
     @staticmethod
     def _notif_bell_icon() -> dict:
@@ -2439,6 +2476,10 @@ class ParkingBot(_PluginBase):
         """
         rows = cls._dict_rows(snapshot.get("notifications"))
         unread = sum(1 for r in rows if not r.get("read"))
+        # 只渲染最近 _NOTIF_SHOW 条，剩下的用一行提示交代清楚。
+        # 未读数仍按**全部** rows 算，不然角标会和列表对不上。
+        shown = rows[:cls._NOTIF_SHOW]
+        hidden = len(rows) - len(shown)
         head: List[dict] = [cls._text(
             "消息通知",
             {"fontSize": "13px", "fontWeight": "bold", "color": "#FFFFFF"})]
@@ -2458,7 +2499,7 @@ class ParkingBot(_PluginBase):
                             "marginTop": "12px", "textAlign": "center"})]
         else:
             body = []
-            for item in rows:
+            for item in shown:
                 label, color = cls._NOTIF_TYPES.get(
                     str(item.get("type") or ""), cls._NOTIF_FALLBACK)
                 line = [{"component": "div",
@@ -2495,6 +2536,15 @@ class ParkingBot(_PluginBase):
                                         else "rgba(255,255,255,0.02)")}},
                     "content": line})
 
+        # 被截掉的部分只留一行字，说清楚去哪儿看全部 —— 静默截断会让人以为
+        # 游戏侧没发过通知。
+        more: List[dict] = []
+        if hidden > 0:
+            more.append(cls._text(
+                f"仅显示最近 {cls._NOTIF_SHOW} 条，还有 {hidden} 条，回游戏网页看全部",
+                {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+                 "marginTop": "10px", "textAlign": "center"}))
+
         # 底部两个按钮：全部已读（写游戏侧，但不删东西，和游戏弹窗一样不带
         # 二次确认）+ 收起。没有未读时「全部已读」置灰且不挂事件 ——
         # 页面上按下去是真的没反应，不空发一次请求。
@@ -2515,6 +2565,7 @@ class ParkingBot(_PluginBase):
                                  "gap": "4px"}},
              "content": head},
             *body,
+            *more,
             {"component": "div",
              "props": {"style": {"marginTop": "12px", "display": "flex",
                                  "gap": "8px", "justifyContent": "flex-end"}},
@@ -4059,7 +4110,7 @@ class ParkingBot(_PluginBase):
 
     async def _cmd_menu(self, sender: dict) -> None:
         """发送车库菜单：文字列表 + 支持回调的渠道附带真按钮。"""
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             self._reply_data(sender, "❌ 获取状态失败", err)
             return
@@ -4125,7 +4176,7 @@ class ParkingBot(_PluginBase):
             self._reply_data(sender, "用法：/挪车 序号或车辆ID",
                              "先发 /车库 查看序号与车辆 ID。")
             return
-        _, state, cars_map, err = await self._load_game_context()
+        _, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             self._reply_data(sender, "❌ 获取状态失败", err)
             return
@@ -4471,7 +4522,7 @@ class ParkingBot(_PluginBase):
         if not token:
             return _result({"success": False, "error": "缺少车辆 ID"})
 
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4532,7 +4583,7 @@ class ParkingBot(_PluginBase):
         # 贴条原先是老写法 —— 自己串行 resolve_cookie → state.php，事后又补拉车型表。
         # 单请求约 1.1 秒时总耗时 8.8 秒，是挪车/停车（1.1 秒）的八倍。
         # 走这个封装后，车型表和市场预取在第一跳就备好，后面全都命中缓存。
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4621,7 +4672,7 @@ class ParkingBot(_PluginBase):
         if not spot_key:
             return _result({"success": False, "error": "缺少车位 ID"})
 
-        client, state, _cars_map, err = await self._load_game_context()
+        client, state, _cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4678,7 +4729,7 @@ class ParkingBot(_PluginBase):
         展开 / 收起通知面板，以及「全部已读」。
 
         展开时才去拉列表：每轮都已经把未读数带回来了，用户不看通知的时候
-        再去取 50 条纯属浪费。收起时把缓存的列表清掉，下次点开重新拉，
+        再去取这一整页纯属浪费。收起时把缓存的列表清掉，下次点开重新拉，
         免得隔半天再打开看到的是旧数据。
 
         只读不记账，_record_round 不会被调用，市场预取的结果没人取。
@@ -4692,14 +4743,23 @@ class ParkingBot(_PluginBase):
 
         # prefetch=False：通知面板只读不记账，_record_round 不会被调用，
         # 市场预取的结果没人取。不关掉的话每次点铃铛都白发 3 个请求。
-        client, state, _cars, err = await self._load_game_context(prefetch=False)
+        #
+        # extra 把通知列表的请求也塞进同一个 gather：notifications.php 和
+        # state.php 互不依赖，原来是串行两个往返，现在并行一个往返就够。
+        # 依据是实测的单请求延迟（_probe_concurrency.py：5 个并发只读 1.05 秒 /
+        # 串行 3.92 秒，即单请求约 1.1 秒）—— 串行两个约 2.2 秒，并行约 1.1 秒。
+        # 「全部已读」那条路不需要列表，就别发。
+        _read_all = bool(getattr(request, "read_all", False))
+        client, state, _cars, err, items = await self._load_game_context(
+            prefetch=False,
+            extra=None if _read_all else (lambda c: self._load_notif_list(c)))
         if not state:
             return _result({"success": False, "error": err})
 
-        if bool(getattr(request, "read_all", False)):
+        if _read_all:
             return await self._notif_read_all(client)
 
-        items = await self._load_notif_list(client)
+        items = list(items or [])
         await self._patch_snapshot_notifications(items)
         return _result({"success": True, "open": True, "count": len(items)})
 
@@ -4796,7 +4856,7 @@ class ParkingBot(_PluginBase):
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
         title_id = self._to_int(getattr(request, "title_id", 0), 0, minimum=0)
-        client, state, _, err = await self._load_game_context()
+        client, state, _, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4863,7 +4923,7 @@ class ParkingBot(_PluginBase):
         car_id = getattr(request, "car_id", None)
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4919,7 +4979,7 @@ class ParkingBot(_PluginBase):
         if not old_key:
             return _result({"success": False, "error": "缺少旧车 ID"})
 
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -4983,7 +5043,7 @@ class ParkingBot(_PluginBase):
         sale_id = getattr(request, "sale_id", None)
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -5042,7 +5102,7 @@ class ParkingBot(_PluginBase):
         if not token:
             return _result({"success": False, "error": "缺少车辆 ID"})
 
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
@@ -5127,7 +5187,7 @@ class ParkingBot(_PluginBase):
         if not self.get_state():
             return _result({"success": False, "error": "插件未启用"})
 
-        client, state, cars_map, err = await self._load_game_context()
+        client, state, cars_map, err, _extra = await self._load_game_context()
         if not state:
             return _result({"success": False, "error": err})
 
