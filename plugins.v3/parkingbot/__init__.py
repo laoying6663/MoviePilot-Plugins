@@ -161,6 +161,22 @@ class ExpDetailRequest(BaseModel):
     open: bool = Field(default=False, description="True 展开面板，False 收起")
 
 
+class NotifDetailRequest(BaseModel):
+    """
+    展开 / 收起通知面板，以及「全部已读」。
+
+    read_all 是**唯一一个**会写游戏侧通知的操作：调 notifications.php 的
+    action=read_all，只改阅读状态、不删任何东西，游戏自己的弹窗里也一样
+    不带二次确认。
+
+    清空（action=clear）插件**故意不做**：它会真删通知且不可恢复，而插件页
+    弹不出 confirm 二次确认框，误按一下没法挽回。要清回游戏网页上点。
+    """
+
+    open: bool = Field(default=False, description="True 展开面板，False 收起")
+    read_all: bool = Field(default=False, description="True 把所有通知标记为已读")
+
+
 def _result(payload: Dict[str, Any]) -> ApiResult:
     """
     把接口内部构造的字典收敛成宿主要求的三键响应信封。
@@ -257,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.40.0"
+    plugin_version = "1.41.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -310,6 +326,9 @@ class ParkingBot(_PluginBase):
     # 经验值详情面板是否展开。和 _title_open 一个套路：插件页弹不出模态框，
     # 只能翻转一个服务端状态，让重渲染时带上展开的面板。
     _exp_open = False
+    # 通知面板是否展开，同样是服务端视图状态。
+    # 默认不展开：通知列表要在点开的当刻现拉，留着上次的旧通知没有意义。
+    _notif_open = False
     # 称号的进程内短缓存。游戏接口单次往返实测约 1.1 秒，而称号只在解锁或
     # 切换时变：10 分钟 TTL 跨两个执行周期，稳定状态下每两轮才发一次请求。
     # 特卖是限时场次，不缓存 —— 缓存后页面上会一直挂着已结束的场次。
@@ -395,6 +414,7 @@ class ParkingBot(_PluginBase):
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
         self._title_open = bool(saved_view.get("title_open"))
         self._exp_open = bool(saved_view.get("exp_open"))
+        self._notif_open = bool(saved_view.get("notif_open"))
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         self._auth_warned = False
@@ -1229,18 +1249,19 @@ class ParkingBot(_PluginBase):
 
     def _start_market_prefetch(self, client: Any, state: dict) -> None:
         """
-        启动「特卖 + 称号」的并行拉取，结果留给 _record_round 取用。
+        启动「特卖 + 称号 + 未读通知数」的并行拉取，结果留给 _record_round 取用。
 
         不 await —— 就是为了让调用方先去做自己的事。重复启动是安全的：
         已经在途的任务直接复用，不会连发两次请求。
-        两个被调方各自都兜住了异常，这里即使真抛了，_record_round 那边的
-        gather 结果也会退化成空列表，不影响落快照。
+        三个被调方各自都兜住了异常，这里即使真抛了，_record_round 那边的
+        gather 结果也会退化成空值，不影响落快照。
         """
         task = self._market_prefetch
         if task is not None and not task.done():
             return
         task = asyncio.gather(
-            self._load_flash_sales(client), self._load_titles(client, state))
+            self._load_flash_sales(client), self._load_titles(client, state),
+            self._load_notif_count(client))
         # 操作中途失败导致没人来取结果时，事件循环收尾会刷
         # 「_GatheringFuture exception was never retrieved」。挂个回调把异常吃掉，
         # 只留一条 debug，不让并发优化变成日志噪音。
@@ -1260,18 +1281,103 @@ class ParkingBot(_PluginBase):
             logger.debug(f"[不可躺自动抢车位] 特卖/称号预取异常（已忽略）：{exc}")
 
     async def _take_market_prefetch(self, client: Any, state: dict
-                                    ) -> Tuple[List[dict], dict]:
-        """取预取结果；没有在途任务就现场拉一次。"""
+                                    ) -> Tuple[List[dict], dict, Optional[int]]:
+        """取预取结果；没有在途任务就现场拉一次。第三项是未读通知数（None 表示没拉到）。"""
         task, self._market_prefetch = self._market_prefetch, None
         if task is not None:
             try:
-                flash, titles = await task
-                return list(flash or []), (titles or {})
+                flash, titles, unread = await task
+                return list(flash or []), (titles or {}), unread
             except Exception as err:
                 # 预取失败就退回到「重新拉一次」，不能让它连带影响落快照
                 logger.debug(f"[不可躺自动抢车位] 特卖/称号预取失败，改为现拉：{err}")
         return await asyncio.gather(
-            self._load_flash_sales(client), self._load_titles(client, state))
+            self._load_flash_sales(client), self._load_titles(client, state),
+            self._load_notif_count(client))
+
+    # ---------------- 消息通知 ----------------
+    # 游戏侧端点：api/notifications.php，一个端点四种用法
+    #   GET  ?count=1                  -> {success, unread}
+    #   GET  ?perPage=50               -> {success, notifications: [...]}
+    #   POST {action: "read", id}      单条已读（插件**不用**，只读面板）
+    #   POST {action: "read_all" | "clear"}
+    # 每条字段：id / notify_type / message / created_at / is_read
+
+    async def _load_notif_count(self, client: Any) -> Optional[int]:
+        """
+        拉未读通知数。挂进特卖/称号那个 gather 里，所以不额外花时间。
+
+        取不到时返回 None 而不是 0：调用方会沿用上一次快照里的数。返回 0
+        等于把「接口挂了」和「真的没有未读」混成同一个数，铃铛上的角标会
+        在一次网络抖动后凭空消失，用户还以为通知被谁读了。
+        """
+        try:
+            data = await client.get_json(f"{self.API_BASE}/notifications.php?count=1")
+        except Exception as err:
+            logger.debug(f"[不可躺自动抢车位] 读取未读通知数失败（沿用上一次）：{err}")
+            return None
+        if not (isinstance(data, dict) and data.get("success")):
+            return None
+        return self._to_int(data.get("unread"), 0, minimum=0)
+
+    async def _load_notif_list(self, client: Any) -> List[dict]:
+        """
+        拉通知列表。只在用户点开面板时调 —— 每轮都拉 50 条纯属浪费：
+        未读数走 ?count=1 已经够画角标了，列表没人看的时候不该去取。
+        """
+        try:
+            data = await client.get_json(
+                f"{self.API_BASE}/notifications.php?perPage={self._NOTIF_PAGE}")
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 读取通知列表失败：{err}")
+            return []
+        if not (isinstance(data, dict) and data.get("success")):
+            return []
+        return self._notif_rows(data)
+
+    @staticmethod
+    def _notif_rows(data: Any) -> List[dict]:
+        """把接口返回的通知收敛成页面要的字段，顺便丢掉非字典项。"""
+        rows = []
+        for item in ParkingBot._dict_rows(
+                data.get("notifications") if isinstance(data, dict) else None):
+            rows.append({
+                "id": item.get("id"),
+                "type": str(item.get("notify_type") or "").strip(),
+                "message": str(item.get("message") or "").strip(),
+                "time": str(item.get("created_at") or "").strip(),
+                # 任何真值都当已读。游戏侧给的是 0/1，但也可能是 true 或 "1"
+                "read": bool(item.get("is_read")),
+            })
+        return rows
+
+    @classmethod
+    def _notif_time(cls, raw: Any) -> str:
+        """
+        相对时间，口径照抄游戏前端的 _fmtTime：刚刚 / N分钟前 / N小时前 /
+        N天前 / 更早就显示具体日期。
+
+        解析不了就原样返回，不显示「未知」——通知时间是后端给的，
+        猜不出来的时候如实显示比编一个占位强。
+        """
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        when = cls._parse_time(text)
+        if when is None:
+            return text
+        minutes = int((cls._now_naive() - when).total_seconds() // 60)
+        if minutes < 1:
+            return "刚刚"
+        if minutes < 60:
+            return f"{minutes}分钟前"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}小时前"
+        days = hours // 24
+        if days < 7:
+            return f"{days}天前"
+        return when.strftime("%Y-%m-%d %H:%M")
 
     async def _refresh_snapshot(self, client: Any, note: str) -> None:
         """动作成功后重新取状态刷新快照；取不到就跳过，不影响已成功的动作。"""
@@ -1609,7 +1715,7 @@ class ParkingBot(_PluginBase):
             cars_map = await self._load_cars_map(client)
             # 两者互不依赖，并行拉取：各要 1.1 秒，串行就是 2.2 秒。
             # _load_game_context 已经挂过预取的话，这里直接取结果不重发。
-            flash, titles = await self._take_market_prefetch(client, state)
+            flash, titles, notif_count = await self._take_market_prefetch(client, state)
             rules = state.get("gameSettings") or {}
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
@@ -1650,6 +1756,16 @@ class ParkingBot(_PluginBase):
 
             spots = [self._spot_snapshot(spot, index, state, cars_map, rules, now)
                      for index, spot in enumerate(my_spots, start=1)]
+
+            # 铃铛角标用的未读数。这轮没拉到（接口挂了 / 超时）就沿用上一次的，
+            # 而不是写成 0 —— 后者等于把「接口挂了」和「真的没有未读」当成同一个数，
+            # 角标会在一次网络抖动后凭空消失，看起来像通知被谁读了。
+            notif_unread = notif_count
+            if notif_unread is None:
+                prev = await self.async_get_data("snapshot")
+                notif_unread = self._to_int(
+                    prev.get("notifUnread") if isinstance(prev, dict) else 0,
+                    0, minimum=0)
 
             snapshot = {
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1704,6 +1820,7 @@ class ParkingBot(_PluginBase):
                     for item in sorted(cars_map.values(), key=lambda c: self._to_int(c.get("price"), 0))
                 ],
                 "flash": flash,
+                "notifUnread": notif_unread,
             }
             await self.async_save_data("snapshot", snapshot)
 
@@ -1962,7 +2079,12 @@ class ParkingBot(_PluginBase):
                 "cursor": "pointer", "userSelect": "none",
             }},
             "content": head,
-            "events": {"click": {"api": api, "method": "post", "params": {}}},
+            # params 里必须带 open=True。api_exp_detail 读的是 request.open，
+            # 不传就用 Request 里的默认 False —— 那样每次点击都把展开状态设成
+            # False（本来就是），页面毫无变化，看起来就是「点了没反应」。
+            # 这和「收起」按钮的 open=False 是同一个接口的两个方向，别写成 {}。
+            "events": {"click": {"api": api, "method": "post",
+                                 "params": {"open": True}}},
         }
 
     @classmethod
@@ -2090,6 +2212,174 @@ class ParkingBot(_PluginBase):
             "border": "1px solid rgba(34,211,238,0.22)",
             "backgroundColor": "rgba(34,211,238,0.06)",
         }}, "content": rows}
+
+    # ---------------- 通知铃铛与面板 ----------------
+    # notify_type 的取值与配色照抄游戏前端 showNotifications 里的 iconMap /
+    # colorMap。图标没跟着搬：那是 15 个 <symbol> 的精灵表，搬进来是几百行
+    # 内联 SVG，换来的只是一个可区分性完全由颜色承担的信息。
+    # 用 emoji 更糟 —— 金币那颗 🪙 是 2019 年才进 Unicode 的，
+    # Windows 默认字体没有字形，实测直接渲染成豆腐块 □。
+    _NOTIF_TYPES = {
+        "park": ("停车", "#4fc3f7"),
+        "unpark": ("挪车", "#4fc3f7"),
+        "ticket": ("贴条", "#e94560"),
+        "report": ("举报", "#ff9800"),
+        "levelup": ("升级", "#ffd700"),
+        "charity": ("爱心", "#e94560"),
+        "cash_add": ("收入", "#00e676"),
+        "cash_sub": ("支出", "#e94560"),
+        "bid_out": ("出价", "#ff9800"),
+        "bid_win": ("得车", "#ffd700"),
+        "bid_lost": ("落标", "#888888"),
+        "buy_car": ("买车", "#00e676"),
+        "cdk": ("兑换", "#ffd700"),
+        "feedback_reply": ("反馈", "#4fc3f7"),
+        "system": ("系统", "#7c5cfc"),
+    }
+    # 游戏以后加新类型时别静默丢内容：未知类型照样显示，只是没有配色。
+    _NOTIF_FALLBACK = ("通知", "#4fc3f7")
+
+    # 游戏弹窗写死 perPage=50，这里跟它一致 —— 多了对只看前 50 条的页面没用，
+    # 少了则会让「明明有通知却只显示一半」。
+    _NOTIF_PAGE = 50
+
+    @staticmethod
+    def _notif_bell_icon() -> dict:
+        """铃铛：抄游戏 index.html 里的 <symbol id="ico-bell">。"""
+        return {"component": "div",
+                "props": {"style": {"display": "flex", "flexShrink": "0"}},
+                "html": '<svg viewBox="0 0 24 24" width="13px" height="13px">'
+                        '<path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.63-5.64'
+                        '-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 '
+                        '11v5l-2 2v1h16v-1l-2-2z" fill="#ffd700"/></svg>'}
+
+    @classmethod
+    def _notif_bell(cls, snapshot: dict, api: str) -> dict:
+        """
+        名字行里的铃铛，和游戏顶栏同一位置、同一颗图标。
+
+        角标显示的是这一轮拉到的未读数；没拉���时沿用上一次的（见 _record_round）。
+        """
+        unread = cls._to_int(snapshot.get("notifUnread"), 0, minimum=0)
+        inner: List[dict] = [
+            {"component": "div",
+             "props": {"style": {"display": "inline-flex", "alignItems": "center",
+                                 "gap": "4px"}},
+             "content": [cls._notif_bell_icon(), cls._text("通知", {})]},
+        ]
+        if unread > 0:
+            inner[0]["content"].append(cls._text(
+                "99+" if unread > 99 else str(unread),
+                {"fontSize": "10px", "fontWeight": "700",
+                 "color": "#FFFFFF", "backgroundColor": "#e94560",
+                 "borderRadius": "8px", "lineHeight": "16px",
+                 "minWidth": "16px", "textAlign": "center",
+                 "padding": "0 4px", "marginLeft": "2px"}))
+        return {
+            "component": "div",
+            "props": {"style": {
+                "display": "inline-flex", "alignItems": "center",
+                "padding": "3px 10px", "borderRadius": "12px",
+                "border": "1px solid rgba(255,255,255,0.10)",
+                "backgroundColor": "rgba(255,255,255,0.03)",
+                "cursor": "pointer", "userSelect": "none",
+            }},
+            "content": inner,
+            "events": {"click": {"api": api, "method": "post",
+                                 "params": {"open": True}}},
+        }
+
+    @classmethod
+    def _notif_panel(cls, snapshot: dict, api: str) -> dict:
+        """
+        展开后的通知列表。**只读**：不提供标记已读，也不提供清空。
+
+        清空会删掉游戏侧的通知且不可恢复，而插件页弹不出 confirm 二次确认框，
+        误按一下没法挽回；要清回游戏网页上点，那里既有确认框也有确认按钮。
+        """
+        rows = cls._dict_rows(snapshot.get("notifications"))
+        unread = sum(1 for r in rows if not r.get("read"))
+        head: List[dict] = [cls._text(
+            "消息通知",
+            {"fontSize": "13px", "fontWeight": "bold", "color": "#FFFFFF"})]
+        if unread > 0:
+            head.append(cls._text(
+                f"{unread} 条未读",
+                {"fontSize": "11px", "color": "#e94560", "marginLeft": "6px"}))
+        head.append(cls._text(
+            "清空请回游戏网页",
+            {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+             "marginLeft": "auto"}))
+
+        if not rows:
+            body: List[dict] = [cls._text(
+                "暂无通知", {"fontSize": "12px",
+                            "color": "rgba(255,255,255,0.62)",
+                            "marginTop": "12px", "textAlign": "center"})]
+        else:
+            body = []
+            for item in rows:
+                label, color = cls._NOTIF_TYPES.get(
+                    str(item.get("type") or ""), cls._NOTIF_FALLBACK)
+                line = [{"component": "div",
+                         "props": {"style": {
+                             "flex": "1 1 auto", "minWidth": "0",
+                             "display": "flex", "alignItems": "flex-start",
+                             "gap": "8px"}},
+                         "content": [
+                             cls._text(label, {"fontSize": "11px", "fontWeight": "bold",
+                                               "color": color, "flexShrink": "0"}),
+                             {"component": "div",
+                              "props": {"style": {"flex": "1 1 auto", "minWidth": "0"}},
+                              "content": [
+                                  cls._text(str(item.get("message") or ""),
+                                            {"fontSize": "12px",
+                                             "color": "rgba(255,255,255,0.92)"}),
+                                  cls._text(cls._notif_time(item.get("time")),
+                                            {"fontSize": "11px",
+                                             "color": "rgba(255,255,255,0.45)",
+                                             "marginTop": "2px"}),
+                              ]},
+                         ]}]
+                if not item.get("read"):
+                    # 未读：整行左边一条亮色竖条，扫一眼就知道还有几条没看
+                    line.insert(0, {"component": "div", "props": {"style": {
+                        "width": "3px", "alignSelf": "stretch",
+                        "borderRadius": "2px", "backgroundColor": color}}})
+                body.append({"component": "div", "props": {"style": {
+                    "display": "flex", "alignItems": "stretch", "gap": "8px",
+                    "marginTop": "10px", "padding": "8px 10px",
+                    "borderRadius": "10px",
+                    "backgroundColor": ("rgba(255,255,255,0.05)"
+                                        if not item.get("read")
+                                        else "rgba(255,255,255,0.02)")}},
+                    "content": line})
+
+        # 底部两个按钮：全部已读（写游戏侧，但不删东西，和游戏弹窗一样不带
+        # 二次确认）+ 收起。没有未读时「全部已读」置灰且不挂事件 ——
+        # 页面上按下去是真的没反应，不空发一次请求。
+        buttons: List[dict] = []
+        if unread > 0:
+            buttons.append(cls._action_btn(
+                "全部已读", api, {"open": True, "read_all": True}, kind="buy"))
+        buttons.append(cls._action_btn("收起", api, {"open": False},
+                                       kind="trade"))
+
+        return {"component": "div", "props": {"style": {
+            "marginTop": "10px", "padding": "12px", "borderRadius": "14px",
+            "border": "1px solid rgba(255,215,0,0.22)",
+            "backgroundColor": "rgba(255,215,0,0.06)",
+        }}, "content": [
+            {"component": "div",
+             "props": {"style": {"display": "flex", "alignItems": "center",
+                                 "gap": "4px"}},
+             "content": head},
+            *body,
+            {"component": "div",
+             "props": {"style": {"marginTop": "12px", "display": "flex",
+                                 "gap": "8px", "justifyContent": "flex-end"}},
+             "content": buttons},
+        ]}
 
     @classmethod
     def _spot_snapshot(cls, spot: dict, index: int, state: dict,
@@ -3875,6 +4165,15 @@ class ParkingBot(_PluginBase):
                 "description": "记录经验值面板是否展开；渲染器随后重新拉取页面并带上详情",
             },
             {
+                "path": "/notif_detail",
+                "endpoint": self.api_notif_detail,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "展开消息通知列表",
+                "response_model": ApiResult,
+                "description": "展开时拉取游戏 notifications.php 列表并缓存进快照；只读，不改游戏侧数据",
+            },
+            {
                 "path": "/title_pick",
                 "endpoint": self.api_title_pick,
                 "methods": ["POST"],
@@ -4171,6 +4470,70 @@ class ParkingBot(_PluginBase):
         self._exp_open = bool(getattr(request, "open", False))
         await self._save_view({"exp_open": self._exp_open})
         return _result({"success": True, "open": self._exp_open})
+
+    async def api_notif_detail(self, request: NotifDetailRequest) -> ApiResult:
+        """
+        展开 / 收起通知面板，以及「全部已读」。
+
+        展开时才去拉列表：每轮都已经把未读数带回来了，用户不看通知的时候
+        再去取 50 条纯属浪费。收起时把缓存的列表清掉，下次点开重新拉，
+        免得隔半天再打开看到的是旧数据。
+        """
+        self._notif_open = bool(getattr(request, "open", False))
+        await self._save_view({"notif_open": self._notif_open})
+        if not self._notif_open:
+            await self._patch_snapshot_notifications([])
+            return _result({"success": True, "open": False})
+
+        client, state, _cars, err = await self._load_game_context()
+        if not state:
+            return _result({"success": False, "error": err})
+
+        if bool(getattr(request, "read_all", False)):
+            return await self._notif_read_all(client)
+
+        items = await self._load_notif_list(client)
+        await self._patch_snapshot_notifications(items)
+        return _result({"success": True, "open": True, "count": len(items)})
+
+    async def _notif_read_all(self, client: Any) -> dict:
+        """
+        全部标记已读（notifications.php action=read_all）。
+
+        成功后**本地直接改**，不再重拉一次列表：read_all 只是把 is_read 翻成
+        真，游戏侧不会再有别的变化，重拉是白花一次 1.1 秒往返。
+        """
+        try:
+            result = await client.post_json(
+                f"{self.API_BASE}/notifications.php",
+                json={"action": "read_all"})
+        except Exception as err:
+            return _result({"success": False, "error": f"标记已读失败：{err}"})
+        if not (isinstance(result, dict) and result.get("success")):
+            return _result({"success": False,
+                            "error": (result or {}).get("error") or "游戏接口未接受"})
+        stored = await self.async_get_data("snapshot")
+        if isinstance(stored, dict):
+            stored["notifications"] = [
+                dict(item, read=True) if isinstance(item, dict) else item
+                for item in (stored.get("notifications") or [])]
+            stored["notifUnread"] = 0
+            await self.async_save_data("snapshot", stored)
+        self._set_result("所有通知已标记为已读")
+        logger.info("[不可躺自动抢车位] 所有通知已标记为已读")
+        return _result({"success": True, "open": True, "unread": 0})
+
+    async def _patch_snapshot_notifications(self, items: List[dict]) -> None:
+        """把通知列表塞进快照。取不到快照就跳过，不影响别的。"""
+        stored = await self.async_get_data("snapshot")
+        if not isinstance(stored, dict):
+            return
+        stored["notifications"] = items
+        # 未读条数按列表现算一份：点开面板这一刻的未读，比上一轮轮询到的更准。
+        # 收起到空列表时不动 notifUnread —— 那是角标，来源仍是 ?count=1。
+        if items:
+            stored["notifUnread"] = sum(1 for r in items if not r.get("read"))
+        await self.async_save_data("snapshot", stored)
 
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
@@ -5407,6 +5770,7 @@ class ParkingBot(_PluginBase):
         # 别让下面两处各自 getattr 一遍、再互相依赖谁先执行。
         _pid_now = getattr(self, "plugin_id", None) or self._PLUGIN_ID
         _exp_api = f"plugin/{_pid_now}/exp_detail"
+        _notif_api = f"plugin/{_pid_now}/notif_detail"
 
         # 名字行：玩家名 + 称号标签（点的入口，和游戏顶栏同位置）+ 右肩新鲜度角标
         name_row: List[dict] = [
@@ -5420,6 +5784,9 @@ class ParkingBot(_PluginBase):
         # 同一个套路）。放在弹性垫片之前，右肩仍留给新鲜度角标。
         if snapshot:
             name_row.append(self._exp_bar(snapshot, _exp_api))
+            # 铃铛紧跟经验值格 —— 和游戏顶栏的排布一致（等级 / 车辆 / 金币 / 通知）。
+            # 没有快照就不放：铃铛除了角标没别的内容，一个没有数字的铃铛没有意义。
+            name_row.append(self._notif_bell(snapshot, _notif_api))
         # 中间垫一个可伸缩的空 div，把角标顶到右肩；窄屏放不下时整行会换行
         name_row.append({"component": "div",
                          "props": {"style": {"flex": "1 1 auto"}}})
@@ -5445,6 +5812,9 @@ class ParkingBot(_PluginBase):
         # 展开的经验值详情面板：紧跟名字行。只在点了之后才有内容。
         if snapshot and self._exp_open:
             head_lines.append(self._exp_panel(snapshot, _exp_api))
+        # 展开的通知列表：同样挂在名字行下面。
+        if snapshot and self._notif_open:
+            head_lines.append(self._notif_panel(snapshot, _notif_api))
         # 元信息收成胶囊（原来是「执行周期 · 车辆 · 数据时间」一行裸文字）
         if snapshot:
             head_lines.append(self._meta_row([
