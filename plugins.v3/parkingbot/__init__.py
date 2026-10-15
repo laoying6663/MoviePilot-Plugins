@@ -273,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.43.0"
+    plugin_version = "1.44.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -4600,40 +4600,71 @@ class ParkingBot(_PluginBase):
         """
         全部标记已读（notifications.php action=read_all）。
 
-        成功后**本地直接改**，不再重拉一次列表：read_all 只是把 is_read 翻成
-        真，游戏侧不会再有别的变化，重拉是白花一次 1.1 秒往返。
+        成功判据要放宽到「响应里没有 error 字段」：游戏自己的 markAllNotifRead
+        是 `await apiCall(...)` 之后直接清角标，**从不检查返回值**，所以这个端点
+        成功时未必带 success:true。只认 success 会让一次明明生效的操作看起来
+        像「点了没反应」。
+        无论哪种情况都把真实响应写进日志 —— 这种「按了没反应」的问题，
+        没有日志就永远只能靠猜。
         """
         try:
             result = await client.post_json(
                 f"{self.API_BASE}/notifications.php",
                 json={"action": "read_all"})
         except Exception as err:
-            return _result({"success": False, "error": f"标记已读失败：{err}"})
-        if not (isinstance(result, dict) and result.get("success")):
-            return _result({"success": False,
-                            "error": (result or {}).get("error") or "游戏接口未接受"})
-        stored = await self.async_get_data("snapshot")
-        if isinstance(stored, dict):
-            stored["notifications"] = [
-                dict(item, read=True) if isinstance(item, dict) else item
-                for item in (stored.get("notifications") or [])]
-            stored["notifUnread"] = 0
-            await self.async_save_data("snapshot", stored)
+            reason = f"标记已读失败：{err}"
+            logger.warning(f"[不可躺自动抢车位] {reason}")
+            self._set_result(reason)
+            return _result({"success": False, "error": reason})
+        logger.info(f"[不可躺自动抢车位] 全部已读响应：{repr(result)[:200]}")
+        err_text = ""
+        if isinstance(result, dict):
+            err_text = str(result.get("error") or result.get("message") or "")
+        if err_text:
+            reason = f"全部已读失败：{err_text}"
+            logger.warning(f"[不可躺自动抢车位] {reason}")
+            self._set_result(reason)
+            return _result({"success": False, "error": reason})
+        rows = [dict(item, read=True) if isinstance(item, dict) else item
+                for item in ((self._page_cache or {}).get("snapshot") or {})
+                .get("notifications") or []]
+        await self._write_notifications(rows, 0)
         self._set_result("所有通知已标记为已读")
         logger.info("[不可躺自动抢车位] 所有通知已标记为已读")
         return _result({"success": True, "open": True, "unread": 0})
 
     async def _patch_snapshot_notifications(self, items: List[dict]) -> None:
-        """把通知列表塞进快照。取不到快照就跳过，不影响别的。"""
-        stored = await self.async_get_data("snapshot")
-        if not isinstance(stored, dict):
-            return
-        stored["notifications"] = items
-        # 未读条数按列表现算一份：点开面板这一刻的未读，比上一轮轮询到的更准。
-        # 收起到空列表时不动 notifUnread —— 那是角标，来源仍是 ?count=1。
-        if items:
-            stored["notifUnread"] = sum(1 for r in items if not r.get("read"))
-        await self.async_save_data("snapshot", stored)
+        """把通知列表塞进快照。"""
+        await self._write_notifications(items, None)
+
+    async def _write_notifications(self, items: List[dict],
+                                   unread: Optional[int]) -> None:
+        """
+        写通知列表 + 未读数，**内存缓存和库都要改**。
+
+        只改库是不够的 —— 这正是「全部已读点了没反应」的原因：
+        页面渲染走 _page_data()，它优先读 self._page_cache（进程内缓存，
+        只有冷启动才查库）。只 async_save_data 的话，库里已经是 0 了，
+        页面下一次渲染读的还是内存里那份 10，角标和列表纹丝不动。
+        换称号的 _patch_snapshot_title 早就同时改了两处，这里照它的模式来。
+
+        unread 传 None 表示按列表现算；传具体值则强制用它
+        （全部已读后列表可能正好是空的，不能让「算」把 0 又变回别的数）。
+        """
+        cache = self._page_cache or {}
+        snapshot = cache.get("snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            stored = await self.async_get_data("snapshot")
+            if not isinstance(stored, dict) or not stored:
+                return
+            snapshot = stored
+        snapshot["notifications"] = list(items)
+        snapshot["notifUnread"] = (
+            self._to_int(unread, 0, minimum=0) if unread is not None
+            else sum(1 for r in items if not r.get("read")))
+        cache["snapshot"] = snapshot
+        self._page_cache = cache
+        await self.async_save_data("snapshot", snapshot)
 
     async def api_title_pick(self, request: TitlePickRequest) -> ApiResult:
         """展开 / 收起称号选择器。页面渲染器随即重拉，把选择器带上或收掉。"""
