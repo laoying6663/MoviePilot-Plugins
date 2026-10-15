@@ -211,6 +211,34 @@ _SHOP_LOCK = "#E94560"
 # 统计页「其中贴条」专用色：玫红偏橙，贴合处罚语义，
 # 也和金色（挪车收益）、粉色（支出）、绿色（净收）都拉得开
 _TICKET_C = "#FF7A9C"
+
+# ====================================================================
+# ★ 诊断埋点（v1.46.1 临时，定位完会整块删掉）
+#
+# 要回答的问题：浏览器实测每次交互的 POST 要 437~2847ms，但服务端渲染只要
+# 13~25ms。时间到底花在哪？
+#
+# 判别办法是量「处理器总耗时」并和「HTTP 总耗时」比：
+#   - 两者接近        -> 时间在插件代码里（多半是 _save_view 的读写）
+#   - HTTP 远大于处理器 -> 时间花在 MoviePilot 派发阶段（事件循环排队），
+#     插件代码改什么都没用，得从「少占事件循环」下手。
+# 所以每个交互处理器都要量总耗时，不能只量某一步。
+# ====================================================================
+_DIAG = True
+_DIAG_SLOW_MS = 50.0
+
+
+def _diag(label: str, t0: float) -> None:
+    """打一条耗时日志。慢于阈值就打，快的也打（诊断期需要样本量）。"""
+    if not _DIAG:
+        return
+    took = (time.monotonic() - t0) * 1000.0
+    try:
+        logger.info(f"[不可躺自动抢车位][诊断] {label} 耗时 {took:.0f} 毫秒")
+    except Exception:
+        pass
+
+
 # 金币图标，照抄游戏 index.html 雪碧图里的 <symbol id="ico-coin">，去掉了 use 引用。
 # 为什么不用 🪙 emoji：U+1FA99 是 2019 年才进 Unicode 的，Windows 默认字体里
 # 基本没有这个字形，插件页实测直接渲染成豆腐块 □。
@@ -273,7 +301,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.46.0"
+    plugin_version = "1.46.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -4329,6 +4357,7 @@ class ParkingBot(_PluginBase):
         页面渲染器在执行完事件后会重新拉一次 plugin/page/{id}，
         所以这里只要把选择记下来，get_page() 自然就只渲染选中的那一个区块。
         """
+        _t0 = time.monotonic()  # [诊断] 处理器总耗时，用来和 HTTP 总耗时对比
         tab = str(getattr(request, "tab", "") or "").strip().lower()
         if tab not in dict(self._TABS):
             return _result({"success": False, "error": f"未知区块：{tab}"})
@@ -4340,6 +4369,7 @@ class ParkingBot(_PluginBase):
             self._day = day
             saved["day"] = day
         await self._save_view(saved)
+        _diag("api_set_tab 总耗时", _t0)  # [诊断]
         return _result({"success": True, "name": dict(self._TABS)[tab]})
 
     async def _save_view(self, patch: Dict[str, Any]) -> None:
@@ -4350,7 +4380,9 @@ class ParkingBot(_PluginBase):
         async_save_data({"tab": ...}) 是整份覆盖，切一次页签就会把车市里
         选好的分类和待换新的目标车型一起冲掉。
         """
+        _t0 = time.monotonic()
         stored = await self.async_get_data("view") or {}
+        _t1 = time.monotonic()
         saved = dict(stored) if isinstance(stored, dict) else {}
         saved.update(patch)
         try:
@@ -4358,6 +4390,9 @@ class ParkingBot(_PluginBase):
         except Exception as err:
             # 记不住只影响下次打开时回到默认状态，不该让点击直接失败
             logger.warning(f"[不可躺自动抢车位] 保存详情页状态失败：{err}")
+        _diag("_save_view(%s) 读 %.0f 毫秒 / 写 %.0f 毫秒"
+              % (",".join(sorted(patch)) or "-",
+                 (_t1 - _t0) * 1000, (time.monotonic() - _t1) * 1000), _t0)
 
     async def _patch_snapshot_title(self, title_id: int, title_name: str) -> bool:
         """
@@ -4605,8 +4640,10 @@ class ParkingBot(_PluginBase):
         和称号选择器（api_title_pick）是同一套路：声明式 JSON 没有 JS 执行口，
         弹不出模态框，只能翻转一个视图状态，让重渲染时带上展开内容。
         """
+        _t0 = time.monotonic()  # [诊断]
         self._exp_open = bool(getattr(request, "open", False))
         await self._save_view({"exp_open": self._exp_open})
+        _diag("api_exp_detail 总耗时", _t0)  # [诊断]
         return _result({"success": True, "open": self._exp_open})
 
     async def api_notif_detail(self, request: NotifDetailRequest) -> ApiResult:
@@ -4616,11 +4653,16 @@ class ParkingBot(_PluginBase):
         展开时才去拉列表：每轮都已经把未读数带回来了，用户不看通知的时候
         再去取 50 条纯属浪费。收起时把缓存的列表清掉，下次点开重新拉，
         免得隔半天再打开看到的是旧数据。
+
+        只读不记账，_record_round 不会被调用，市场预取的结果没人取。
+        不关掉预取的话，每次点铃铛都白发 3 个请求。
         """
+        _t0 = time.monotonic()  # [诊断]
         self._notif_open = bool(getattr(request, "open", False))
         await self._save_view({"notif_open": self._notif_open})
         if not self._notif_open:
             await self._patch_snapshot_notifications([])
+            _diag("api_notif_detail 总耗时(收起)", _t0)  # [诊断]
             return _result({"success": True, "open": False})
 
         # prefetch=False：通知面板只读不记账，_record_round 不会被调用，
@@ -4634,6 +4676,7 @@ class ParkingBot(_PluginBase):
 
         items = await self._load_notif_list(client)
         await self._patch_snapshot_notifications(items)
+        _diag("api_notif_detail 总耗时", _t0)  # [诊断]
         return _result({"success": True, "open": True, "count": len(items)})
 
     async def _notif_read_all(self, client: Any) -> dict:
@@ -5911,6 +5954,7 @@ class ParkingBot(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """返回插件详情页：顶部切换栏 + 当前选中的那一个区块。"""
+        _t0 = time.monotonic()  # [诊断] 同步端点（FastAPI 线程池），用于对照
         snapshot, history, daily = self._page_data()
         today_earned = self._today_earned(history)
         min_duration = self._to_int(snapshot.get("min_duration"), 10, minimum=1)
@@ -6043,6 +6087,7 @@ class ParkingBot(_PluginBase):
                 f"自动操作　{note}",
                 {"fontSize": "12px", "color": _GOLD, "marginTop": "6px",
                  "lineHeight": "1.6"}))
+        _diag("get_page 前半段(概览+名字行)", _t0)  # [诊断]
 
         # 开关开着但这一轮没花钱（比如没找到划算的车型）时也给个提示，
         # 否则用户会以为开关没生效。
@@ -6148,6 +6193,7 @@ class ParkingBot(_PluginBase):
             self._nav_row(tab),
             *sections,
         ], self._tap_style_node())
+        _diag("get_page 总耗时(同步端点/线程池)", _t0)  # [诊断]
 
     # ---- 按下反馈（v1.36.0）----
     #
