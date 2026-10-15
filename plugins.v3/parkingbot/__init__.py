@@ -246,7 +246,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.36.0"
+    plugin_version = "1.37.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -875,6 +875,13 @@ class ParkingBot(_PluginBase):
                 continue
             got = self._to_int(result.get("fine"), fine, minimum=0)
             total += got
+            # 罚款是真金白银，必须并进当日统计（和挪车收益同一口径）。
+            #
+            # 这里原先只把 total 拼进日志文案就完事，_shop_fined 一次都没加 ——
+            # 于是自动贴条赚的钱根本进不了统计页，「其中贴条」永远是 0。
+            # run_once 里 _auto_ticket_one 后面紧跟着 _record_round，会把这笔
+            # 连同挪车收益一起收走落盘。
+            self._shop_fined += got
             # 只有真贴上了才记进去：贴失败若也记，车开走再回来就不会被贴
             self._ticket_seen[spot_key] = str(spot.get("carInSpot"))
             notes.append(f"{self._car_name(car, cars_map)}@{spot_key} 罚 {got}")
@@ -3742,8 +3749,15 @@ class ParkingBot(_PluginBase):
                             "error": (result or {}).get("error") or "贴条失败"})
         fine = self._to_int(result.get("fine"), 0, minimum=0)
         exp = self._to_int(result.get("expGained"), 0, minimum=0)
-        # 罚款是真金白银的收入，并进当天统计（和挪车收益同一口径）
+        # 罚款是真金白银的收入，并进当天统计（和挪车收益同一口径）。
         self._shop_fined += fine
+        # 立刻落盘，不等下一轮定时任务。
+        #
+        # 原先只累加、不记账，等下一次 run_once 里的 _record_round 才写进 daily。
+        # 那有两个后果：一是跨天贴的会记到第二天（日期错），二是插件在这期间
+        # 重启的话 _shop_fined 随内存一起没了，这笔钱永久丢失 —— 而统计页上的
+        # 「其中贴条」正是读这个字段。record_history=False：不写执行历史噪声行。
+        await self._record_round(client, state, user_id, 0, 0, 0, record_history=False)
         await self._refresh_snapshot(client, "贴条")
         note = f"贴条 {self._car_name(car, await self._load_cars_map(client))}，罚款 {fine} 金"
         if exp:
