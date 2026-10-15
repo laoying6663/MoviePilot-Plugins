@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.47.0"
+    plugin_version = "1.48.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -389,10 +389,6 @@ class ParkingBot(_PluginBase):
     # 进程不重启就永远看不到新车（2026-10-14 一次就从 4 个分类加到 9 个）。
     _cars_cache_at: float = 0.0
     _CARS_TTL = 3600.0
-    # 自动贴条：同一辆车在同一个车位只贴一次。
-    # 存的是「车位 ID -> 已贴的车辆 ID」，车位上没车了就删掉该车位的记录，
-    # 所以这个字典的长度始终不超过我的车位数，不会无限增长。
-    _ticket_seen: Dict[str, str] = {}
     # 批量贴条时每张之间的错峰间隔（秒）。照抄游戏自己的节奏：它的
     # showAllTicket 就是 setTimeout(index * 200) + Promise.all，
     # 注释写明「并行执行，但每个之间间隔 200ms 避免过于密集」。
@@ -431,10 +427,6 @@ class ParkingBot(_PluginBase):
         self._auto_ticket = self._as_switch(config.get("auto_ticket"))
         self._ticket_min_fine = self._to_int(config.get("ticket_min_fine"),
                                              0, minimum=0)
-        # 已贴记录要从 data 里恢复：只在内存里存的话，插件一重载就忘了贴过谁，
-        # 同一辆车会被反复贴条。
-        stored_seen = self.get_data("ticket_seen")
-        self._ticket_seen = dict(stored_seen) if isinstance(stored_seen, dict) else {}
         # 记住上次停留的区块与查看的日期；插件重载、MoviePilot 重启后仍回到原来那一页
         saved_view = self.get_data("view") or {}
         if not isinstance(saved_view, dict):
@@ -446,8 +438,12 @@ class ParkingBot(_PluginBase):
         self._cat = str(saved_view.get("cat") or "").strip()
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
         self._title_open = bool(saved_view.get("title_open"))
-        self._exp_open = bool(saved_view.get("exp_open"))
-        self._notif_open = bool(saved_view.get("notif_open"))
+        # 经验值 / 通知两个面板**故意不从存档读回**（v1.48.0）：
+        # 用户要求每次打开插件页面默认都是收着的。这两个是「看一眼就走」的
+        # 临时面板，记住它们没意义；顺带还省掉两次落盘 ——
+        # 点铃铛/等级格时连 _save_view 都不调，一次数据库写都不发生。
+        self._exp_open = False
+        self._notif_open = False
         saved_day = str(saved_view.get("day") or "").strip()
         self._day = saved_day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved_day or "") else ""
         # view 的内存真相源：后台落盘时以它为准，这样只改局部字段也不会
@@ -871,8 +867,14 @@ class ParkingBot(_PluginBase):
         _spot_snapshot 算出的「贴条收益」保持一致，否则用户会看到页面上写着
         「贴条收益 675」但阈值设 700 也不贴。
 
-        「同一辆车在同一个车位只贴一次」由 _ticket_seen 保证：车位上没车了就把
-        该车位的记录删掉，所以那辆车开走再回来会被当成新的一次停放。
+        判定只有两条：**停够 MIN_TICKET_TIME** 且 **预估罚款达到门槛**，就贴。
+        原先还有一条「同一辆车在同一个车位只贴一次」（_ticket_seen），v1.48.0 去掉了 ——
+        那条规则游戏自己根本没有：它的批量贴条筛选条件只有「是我的车位 + 有车 +
+        非爱心」，没有任何去重；而且贴条成功后游戏会**把车从车位上赶走**
+        （前端 `parkingSpots[i].carInSpot = null`）。也就是说车都被赶走了，
+        不存在「同一辆车赖着不走被反复贴」的场景，那条去重规则只会白白挡住
+        本该贴的车 —— 之前就有一辆停了 84 分钟、贴条收益 1411 的车因为被记过一次
+        而再也不贴。规则跟着游戏对齐即可。
         """
         if not self._auto_ticket:
             return ""
@@ -886,15 +888,6 @@ class ParkingBot(_PluginBase):
 
         my_spots = [s for s in self._dict_rows(state.get("parkingSpots"))
                     if str(s.get("ownerId")) == str(user_id)]
-        occupied = {str(s.get("id")) for s in my_spots if s.get("carInSpot")}
-
-        # 车位空了就把记录清掉，否则这张表会一直攒着历史车位 ID。
-        # 清理发生在前面，落盘必须跟着走 —— 哪怕这一轮一张都没贴。
-        # 否则内存里是空的、磁盘上还是旧的，插件一重启就会把早就开走的车当成还在。
-        before_seen = dict(self._ticket_seen)
-        if self._ticket_seen:
-            self._ticket_seen = {k: v for k, v in self._ticket_seen.items()
-                                 if k in occupied}
 
         candidates = []
         for spot in my_spots:
@@ -905,9 +898,9 @@ class ParkingBot(_PluginBase):
             car_in_spot = spot.get("carInSpot")
             if not car_in_spot:
                 continue
-            # 同一辆车在这个车位已经贴过了就不再来一次
-            if self._ticket_seen.get(spot_key) == str(car_in_spot):
-                continue
+            # 这里原来还有一条「同一辆车在这个车位已经贴过了就不再来一次」，
+            # v1.48.0 去掉了 ——  game's ticketCar 贴完就把车赶下车位，
+            # 不存在「同一辆车赖着不走被反复贴」的场景，那条规则只会误伤。
             car = next((c for c in self._dict_rows(state.get("userCars"))
                         if str(c.get("id")) == str(car_in_spot)), None)
             if car is None:
@@ -928,11 +921,6 @@ class ParkingBot(_PluginBase):
             candidates.append((fine, spot_key, spot, car))
 
         if not candidates:
-            # 一张都贴不了不代表「记录没变」：开头的清理可能已经删掉了空车位的条目，
-            # 那份清理同样要落盘，否则内存是空的、磁盘是旧的，插件一重启就会把
-            # 早就开走的车当成还停在那儿。
-            if self._ticket_seen != before_seen:
-                await self._persist_ticket_seen()
             return ""
 
         # 先罚收益高的，同样的轮次里多拿一点
@@ -986,27 +974,13 @@ class ParkingBot(_PluginBase):
             # run_once 里 _auto_ticket_one 后面紧跟着 _record_round，会把这笔
             # 连同挪车收益一起收走落盘。
             self._shop_fined += got
-            # 只有真贴上了才记进去：贴失败若也记，车开走再回来就不会被贴
-            self._ticket_seen[spot_key] = str(spot.get("carInSpot"))
             notes.append(f"{self._car_name(car, cars_map)}@{spot_key} 罚 {got}")
 
         if not notes:
-            # 一张没贴成不代表「什么都没变」：开头的清理可能已经删掉了记录，
-            # 那份清理同样要落盘，否则内存和磁盘会长期不一致。
-            if self._ticket_seen != before_seen:
-                await self._persist_ticket_seen()
             return ""
-        await self._persist_ticket_seen()
         note = f"自动贴条 {len(notes)} 个车位：{'、'.join(notes)}，合计 {total} 金币"
         logger.info(f"[不可躺自动抢车位] {note}")
         return note
-
-    async def _persist_ticket_seen(self) -> None:
-        """把「已贴记录」写回 data 目录。写失败只影响去重，不该打断本轮其它动作。"""
-        try:
-            await self.async_save_data("ticket_seen", dict(self._ticket_seen))
-        except Exception as err:
-            logger.warning(f"[不可躺自动抢车位] 保存贴条记录失败：{err}")
 
     async def _auto_buy_one(self, client: Any, state: dict, cars_map: Dict[Any, dict],
                             user_id: Any) -> str:
@@ -4693,8 +4667,10 @@ class ParkingBot(_PluginBase):
         和称号选择器（api_title_pick）是同一套路：声明式 JSON 没有 JS 执行口，
         弹不出模态框，只能翻转一个视图状态，让重渲染时带上展开内容。
         """
+        # 不落盘：展开状态只在本次打开期间有效（v1.48.0 起）。
+        # 用户要求「每次打开插件页面默认都是收起来的」，所以这里连 _save_view
+        # 都不调 —— 点一下铃铛/等级格**一次数据库写都不发生**，是瞬时响应。
         self._exp_open = bool(getattr(request, "open", False))
-        await self._save_view({"exp_open": self._exp_open})
         return _result({"success": True, "open": self._exp_open})
 
     async def api_notif_detail(self, request: NotifDetailRequest) -> ApiResult:
@@ -4709,7 +4685,7 @@ class ParkingBot(_PluginBase):
         不关掉预取的话，每次点铃铛都白发 3 个请求。
         """
         self._notif_open = bool(getattr(request, "open", False))
-        await self._save_view({"notif_open": self._notif_open})
+        # 不落盘，和 _exp_open 一个道理（v1.48.0）：每次打开页面都默认收起。
         if not self._notif_open:
             await self._patch_snapshot_notifications([])
             return _result({"success": True, "open": False})
