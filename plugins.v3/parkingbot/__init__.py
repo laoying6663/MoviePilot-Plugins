@@ -273,7 +273,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.44.0"
+    plugin_version = "1.45.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -4617,11 +4617,18 @@ class ParkingBot(_PluginBase):
             self._set_result(reason)
             return _result({"success": False, "error": reason})
         logger.info(f"[不可躺自动抢车位] 全部已读响应：{repr(result)[:200]}")
+        # 成功判据只看「有没有 error」和「success 是不是显式 false」。
+        # 千万别把 message 当错误 —— 实测这个端点成功时返回的是
+        # {'success': True, 'message': '全部标记已读'}，message 是**成功提示**。
+        # 当成错误判据的话，每次成功都被当成失败、快照一个字都不写，
+        # 表现和「点了没反应」一模一样。
         err_text = ""
+        failed = result is None
         if isinstance(result, dict):
-            err_text = str(result.get("error") or result.get("message") or "")
-        if err_text:
-            reason = f"全部已读失败：{err_text}"
+            err_text = str(result.get("error") or "")
+            failed = bool(err_text) or result.get("success") is False
+        if failed:
+            reason = f"全部已读失败：{err_text or '游戏接口未接受'}"
             logger.warning(f"[不可躺自动抢车位] {reason}")
             self._set_result(reason)
             return _result({"success": False, "error": reason})
