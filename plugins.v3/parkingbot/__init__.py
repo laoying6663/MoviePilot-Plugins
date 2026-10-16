@@ -288,7 +288,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.51.1"
+    plugin_version = "1.52.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -391,6 +391,10 @@ class ParkingBot(_PluginBase):
     _shop_traded = 0
     # 贴条罚款收入。同样并进「当日收益」，否则这笔真金白银在统计页上凭空消失。
     _shop_fined = 0
+    # 回收车辆拿回的金币。它是**收入**，和贴条罚款同一口径并进「当日收益」——
+    # 刷购车/以旧换新经验走的是「买 -> 换 -> 回收」的循环，只记支出不记回收的话，
+    # 统计页的当日净收会凭空少一大截（实测每轮 400，一天 4000）。
+    _shop_recycled = 0
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -416,12 +420,19 @@ class ParkingBot(_PluginBase):
     # 单请求约 1.1 秒，所以 5 张从串行的 5.5 秒降到约 1.9 秒。
     _TICKET_STAGGER = 0.2
     # 同一个车位主人名下最多停我几辆车。
+    #
+    # ★v1.52.0 从 2 改成 1：每家停 2 辆还是太容易被贴/被批量驱离/被举报，
+    # 两个人就够让人一眼看出「他车都往我这儿压」。改成一家最多 1 辆之后，
+    # N 辆车就需要 N 个**不同**的车位主人。
+    #
+    # 这条的代价是**主人数量不够时会少停几辆**（钱少了）。所以
+    # 快照里带一个 free_private_owners（有空闲私家车位的不同主人数），
+    # 日志也会在「因为主人不够才少停」时写明 —— 不然用户只看到今天少赚了，
+    # 根本查不出是这个上限卡住的。
+    #
     # 场景加成（game_data.parkingBackgrounds 的 bonusPercent，最高的沙滩/牛来是 5%）
-    # 会让停车目标天然往少数几个买了场景的玩家身上挤。纯按加成排序的话，
-    # 名下 10 辆车可能全部停在同一个人那儿 —— 对方一眼就能看到「他所有车都在我这儿」，
-    # 批量驱离和举报都不用挑目标。这条上限就是为挡住这个：吃加成，但别把
-    # 所有车押在一个人身上。剩下的名额自然分给下一个高加成的人。
-    _PARK_MAX_PER_OWNER = 2
+    # 会让停车目标天然往少数几个买了场景的玩家身上挤；这条上限就是为挡住这个。
+    _PARK_MAX_PER_OWNER = 1
     # 默认值必须写在类上：run_once 里会直接读 self._auto_ticket，
     # 而插件实例并非任何时刻都保证刚跑过 init_plugin（热重载中间态、
     # 派生实例等），缺属性会 AttributeError 让整轮作废。默认关，最保守。
@@ -430,6 +441,10 @@ class ParkingBot(_PluginBase):
     # 优先停爱心车位赚经验。默认关：爱心车位**不产金币**，开着会让收益方式
     # 从「赚金币」变成「赚经验」，是会影响收入结构的改动，得用户自己决定。
     _prefer_charity: bool = False
+    # 自动刷「购车」「以旧换新」两项每日经验，刷满即停、之后照常停车赚钱。
+    # 默认关：它既要真花钱（金币），又会**回收掉一辆车**，属于不可逆操作，
+    # 插件不该替用户默认开启。
+    _exp_farm: bool = False
     # 详情页数据缓存（快照 + 历史）。
     # 每轮执行结束后在内存里同步刷新，页面渲染与插件重载都直接读它，
     # 不再每次访问数据库 —— 保存配置会触发插件重载，重载又会重新收集
@@ -460,6 +475,8 @@ class ParkingBot(_PluginBase):
                                              0, minimum=0)
         # 优先停爱心车位赚经验，默认关（理由见类属性的注释）。
         self._prefer_charity = self._as_switch(config.get("prefer_charity"))
+        # 自动刷购车/以旧换新经验，默认关（理由见类属性的注释）。
+        self._exp_farm = self._as_switch(config.get("exp_farm"))
         # 记住上次停留的区块与查看的日期；插件重载、MoviePilot 重启后仍回到原来那一页
         saved_view = self.get_data("view") or {}
         if not isinstance(saved_view, dict):
@@ -724,6 +741,23 @@ class ParkingBot(_PluginBase):
             except Exception as err:
                 logger.error(f"[不可躺自动抢车位] 自动换新异常：{err}")
 
+        # 刷「购车」「以旧换新」每日经验。排在挪车之后：它可能要回收一辆车，
+        # 而游戏只允许回收**空闲**车 —— 挪车前那些车还停着，一辆都动不了。
+        # 两项经验都满了时这个方法直接返回空串，本轮就只是照常停车。
+        if self._exp_farm:
+            try:
+                note = await self._exp_farm_step(client, state, cars_map, user_id)
+                if note:
+                    shop_note = f"{shop_note}；{note}" if shop_note else note
+                    state_is_current = False
+                    if not await _refresh_state():
+                        stale_after_shop = True
+                        logger.warning(
+                            "[不可躺自动抢车位] 刷经验后刷新状态失败，本轮跳过停车，"
+                            "避免用过期的车辆 ID 继续操作")
+            except Exception as err:
+                logger.error(f"[不可躺自动抢车位] 刷购车/以旧换新经验异常：{err}")
+
         # 还能再停几辆。
         #
         # 买卖那几步会重新拉状态并重算 parked，被挪走的车此时已经是 idle，
@@ -875,6 +909,248 @@ class ParkingBot(_PluginBase):
             logger.info(f"[不可躺自动抢车位] {note}")
             return note
         return ""
+
+    # ---------- 自动刷「购车」「以旧换新」两项每日经验 ----------
+
+    @classmethod
+    def _recycle_rate(cls, state: Any, game_data: Any) -> int:
+        """
+        回收车辆能拿回原价的几成（百分比）。
+
+        ★优先级必须和游戏前端一模一样：`gameSettings` 覆盖 `gameRules`。
+        游戏那边是 api.js:
+            if (cfg.RECYCLE_RATE) this.GAME_RULES.RECYCLE_RATE = parseInt(cfg.RECYCLE_RATE);
+        也就是 state.php 的 gameSettings.RECYCLE_RATE 优先，
+        game_data.php 的 gameRules.RECYCLE_RATE 只是兜底默认值。
+
+        只读 gameRules 会拿到**已经被覆盖掉的旧值**：页面上写「回收率 80%」，
+        实际回收时按另一个比例给钱，刷经验的真实花费就全算错了。
+        （游戏前端 render.js 里 `RECYCLE_RATE || 50` 那个 50 是 JS 兜底，
+        不是服务端的真实值，别拿它当默认。）
+        """
+        cfg = cls._settings_of(state) if isinstance(state, dict) else {}
+        raw = cls._to_int((cfg or {}).get("RECYCLE_RATE"), -1)
+        if raw > 0:
+            return min(100, raw)
+        rules = (game_data or {}).get("gameRules") if isinstance(game_data, dict) else None
+        rules = rules if isinstance(rules, dict) else {}
+        return min(100, cls._to_int(rules.get("RECYCLE_RATE"), 80, minimum=0))
+
+    @classmethod
+    def _exp_farm_need(cls, state: dict, user_id: Any,
+                       game_data: dict) -> Tuple[bool, bool]:
+        """今日「购车」「以旧换新」两项经验各自还缺不缺。
+
+        口径必须和等级详情面板同源（同一套 _exp_daily / _exp_config），
+        否则会出现「面板显示满了插件还在刷」或者反过来漏刷。
+        """
+        caps = cls._exp_config(game_data)
+        got = cls._exp_daily(state, user_id)
+        return (got.get("buy", 0) < cls._to_int(caps.get("buy"), 0),
+                got.get("tradeIn", 0) < cls._to_int(caps.get("tradeIn"), 0))
+
+    @classmethod
+    def _exp_farm_cars(cls, cars_map: Dict[Any, dict], level: int) -> List[dict]:
+        """等级内买得起的车型，按价格升序。
+
+        以旧换新的净支出 = 新车价 x (1 - 回收率)，单车越便宜越省，
+        所以固定取最便宜的那一对，而不是挑收益高的。
+        """
+        rows: List[dict] = []
+        for definition in cars_map.values():
+            if not isinstance(definition, dict):
+                continue
+            if cls._to_int(definition.get("levelReq"), 1, minimum=1) > level:
+                continue
+            if cls._to_int(definition.get("price"), 0, minimum=0) <= 0:
+                continue
+            rows.append(definition)
+        rows.sort(key=lambda d: cls._to_int(d.get("price"), 0, minimum=0))
+        return rows
+
+    def _exp_farm_victim(self, my_cars: List[dict],
+                         cars_map: Dict[Any, dict]) -> Optional[dict]:
+        """挑一辆用来腾位置的「最便宜的空闲车」，挑不到返回 None。
+
+        只认空闲车：游戏要求 status == 'idle' 才能回收，停着的车碰都不行。
+        跳过限时车（carId == 0）—— 那种车回收掉就再也买不回来了。
+        """
+        candidates: List[Tuple[int, dict]] = []
+        for car in my_cars:
+            if car.get("status") != "idle" or car.get("carId") == 0:
+                continue
+            definition = self._lookup_car(cars_map, car.get("carId"))
+            if not definition:
+                # 车型表里查不到的车不碰：算不出原价，回收有可能白扔一辆好车
+                continue
+            price = self._to_int(definition.get("price"), 0, minimum=0)
+            if price > 0:
+                candidates.append((price, car))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[0])
+        return candidates[0][1]
+
+    async def _exp_farm_refresh(self, client: Any) -> Optional[dict]:
+        """重新拉一次游戏状态，拿最新一批车辆实例。失败返回 None。"""
+        try:
+            fresh = await client.get_json(f"{self.API_BASE}/state.php")
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 刷经验刷新状态异常：{err}")
+            return None
+        return fresh if (fresh and fresh.get("success")) else None
+
+    def _exp_farm_pick_new(self, fresh: dict, user_id: Any,
+                           before_ids: set, car_id: Any = None) -> Optional[dict]:
+        """
+        在刷新后的状态里找出「刚刚多出来的那辆车」。
+
+        buy_car.php / trade_in.php 的响应体长什么样**没有实测依据**
+        （游戏前端拿到响应后是直接 loadFromServer 重载，从不读响应里的车 ID），
+        所以不去猜字段名，而是拿刷新前后的车辆实例 ID 做差集定位 ——
+        这样即使服务端改响应结构也不受影响。
+        """
+        rows = [c for c in self._dict_rows(fresh.get("userCars"))
+                if str(c.get("userId")) == str(user_id)
+                and str(c.get("id")) not in before_ids]
+        if car_id is not None:
+            rows = [c for c in rows if str(c.get("carId")) == str(car_id)]
+        return rows[0] if len(rows) == 1 else None
+
+    async def _exp_farm_step(self, client: Any, state: dict,
+                             cars_map: Dict[Any, dict], user_id: Any) -> str:
+        """
+        自动刷「购车」和「以旧换新」两项每日经验，刷满即停，之后照常停车赚钱。
+
+        一轮三次请求，**车位数原样还回来**：
+            买最便宜的车 -> 补差价换成次便宜的 -> 回收换来的那辆
+
+        单轮净支出 = 新车价 x (1 - 回收率)。回收率**不写死**：游戏前端
+        api.js:115 是 `if (cfg.RECYCLE_RATE) GAME_RULES.RECYCLE_RATE = ...`，
+        state.php 的 gameSettings 会覆盖 game_data 的 gameRules，
+        只读后者会拿到已经被覆盖掉的旧值（详见 _recycle_rate）。
+        真正记进统计的是 recycle_car.php **实际返回的** recyclePrice，
+        所以即便回收率再变，账面也不会错。
+
+        为什么能反复刷：循环结束时换来的那辆车正好被回收，工位原样空出来，
+        所以第 4~10 轮不用再腾位置。只有**第一次**要腾 —— 那时车库是满的。
+        """
+        if not self._exp_farm:
+            return ""
+        need_buy, need_trade = self._exp_farm_need(state, user_id, self._game_data)
+        if not need_buy and not need_trade:
+            # 两项都满了就彻底收手，绝不继续买和换
+            return ""
+
+        rules = self._settings_of(state)
+        mine = self._user_of(state, user_id)
+        level = self._to_int(mine.get("level"), 1, minimum=1)
+        cash = self._to_int(mine.get("cash"), 0)
+        max_cars = self._to_int(rules.get("MAX_CARS"), 10, minimum=1)
+        my_cars = [c for c in self._dict_rows(state.get("userCars"))
+                   if str(c.get("userId")) == str(user_id)]
+
+        affordable = self._exp_farm_cars(cars_map, level)
+        if not affordable:
+            logger.warning("[不可躺自动抢车位] 刷购车/以旧换新经验：等级内没有买得起的车型")
+            return ""
+        if need_trade and len(affordable) < 2:
+            logger.warning("[不可躺自动抢车位] 刷经验：等级内只有一辆能买的车，"
+                           "以旧换新换不动更贵的，本轮跳过")
+            return ""
+
+        lo_def = affordable[0]
+        hi_def = affordable[1] if len(affordable) > 1 else None
+        lo_price = self._to_int(lo_def.get("price"), 0, minimum=0)
+        hi_price = self._to_int((hi_def or {}).get("price"), 0, minimum=0)
+        # 要换新时，一轮里钱最多垫到「买 + 补差价」= 新车价；回收那笔是之后才到账的
+        need_cash = hi_price if need_trade else lo_price
+        if cash < need_cash:
+            logger.warning(
+                f"[不可躺自动抢车位] 刷购车/以旧换新经验：金币不足"
+                f"（需要 {need_cash}，现有 {cash}），本轮跳过")
+            return ""
+
+        steps: List[str] = []
+        before_ids = {str(c.get("id")) for c in my_cars}
+
+        # --- 腾位置：只有车库满了才回收一辆最便宜的空闲车 ---
+        if len(my_cars) >= max_cars:
+            victim = self._exp_farm_victim(my_cars, cars_map)
+            if victim is None:
+                logger.info("[不可躺自动抢车位] 刷经验：车库已满且没有可回收的空闲车，本轮跳过")
+                return ""
+            result = await self._post(client, "recycle_car.php",
+                                      {"carInstanceId": victim.get("id")})
+            if not (result and result.get("success")):
+                logger.warning(
+                    f"[不可躺自动抢车位] 回收车辆失败：{(result or {}).get('error') or '未知原因'}")
+                return ""
+            back = self._to_int((result.get("data") or {}).get("recyclePrice"), 0)
+            self._shop_recycled += back
+            steps.append(f"回收 {self._car_name(victim, cars_map)} 换回 {back} 金")
+
+        # --- 买一辆最便宜的：既刷购车经验，又是以旧换新的旧车 ---
+        result = await self._post(client, "buy_car.php", {"carId": lo_def.get("id")})
+        if not (result and result.get("success")):
+            logger.warning(
+                f"[不可躺自动抢车位] 刷经验购车失败：{(result or {}).get('error') or '未知原因'}")
+            return "；".join(steps)
+        self._shop_spent += lo_price
+        self._shop_bought += 1
+        steps.append(f"买 {lo_def.get('name')} {lo_price} 金")
+
+        fresh = await self._exp_farm_refresh(client)
+        if fresh is None:
+            logger.warning("[不可躺自动抢车位] 刷经验：购车后刷新状态失败，本轮到此为止")
+            return "；".join(steps)
+        bought = self._exp_farm_pick_new(fresh, user_id, before_ids, lo_def.get("id"))
+        if bought is None:
+            logger.warning("[不可躺自动抢车位] 刷经验：购车后定位不到新车实例，本轮到此为止")
+            return "；".join(steps)
+
+        if not need_trade:
+            # 以旧换新已经满了：这辆便宜车就留在车库里停车赚钱，不再换也不回收
+            note = "；".join(steps) + "（以旧换新经验已满，这辆车留着停车）"
+            logger.info(f"[不可躺自动抢车位] {note}")
+            return note
+
+        # --- 补差价换成次便宜的：这一步才是刷「以旧换新」经验 ---
+        diff = hi_price - lo_price
+        result = await self._post(client, "trade_in.php", {
+            "oldCarInstanceId": bought.get("id"),
+            "newCarId": hi_def.get("id"),
+        })
+        if not (result and result.get("success")):
+            logger.warning(
+                f"[不可躺自动抢车位] 刷经验换新失败：{(result or {}).get('error') or '未知原因'}")
+            return "；".join(steps)
+        self._shop_diff += diff
+        self._shop_traded += 1
+        steps.append(f"换 {hi_def.get('name')} 补 {diff} 金")
+
+        # --- 回收换来的那辆：把工位还回去，车位数回到本轮开始时的样子 ---
+        fresh = await self._exp_farm_refresh(client)
+        if fresh is None:
+            logger.warning("[不可躺自动抢车位] 刷经验：换新后刷新状态失败，"
+                           "换来的车留在库里（本轮不再回收）")
+            return "；".join(steps)
+        traded = self._exp_farm_pick_new(fresh, user_id, before_ids, hi_def.get("id"))
+        if traded is None:
+            logger.warning("[不可躺自动抢车位] 刷经验：换新后定位不到新车实例，"
+                           "换来的车留在库里（本轮不再回收）")
+            return "；".join(steps)
+        result = await self._post(client, "recycle_car.php",
+                                  {"carInstanceId": traded.get("id")})
+        if not (result and result.get("success")):
+            logger.warning(
+                f"[不可躺自动抢车位] 刷经验回收失败：{(result or {}).get('error') or '未知原因'}")
+            return "；".join(steps)
+        back = self._to_int((result.get("data") or {}).get("recyclePrice"), 0)
+        self._shop_recycled += back
+        note = "；".join(steps) + f"；回收换来的车换回 {back} 金，本轮净支出 {lo_price + diff - back} 金"
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return note
 
     def _disable_auto_buy_if_full(self, owned: int, max_cars: int) -> str:
         """
@@ -1193,6 +1469,15 @@ class ParkingBot(_PluginBase):
             logger.info(
                 f"[不可躺自动抢车位] 优先停爱心车位赚经验：今日已得 {got}/{cap}，"
                 f"可用爱心车位 {len(charity_targets)} 个")
+        elif self._prefer_charity:
+            # ★开着开关却一辆都没停成，几乎只有一种原因：**全世界没有空闲的
+            # 爱心车位**（每个玩家最多 1 个，都停满了）。
+            # 原来这种情况下这里一声不吭，用户看着就是「开关没生效」。
+            logger.info(
+                f"[不可躺自动抢车位] 优先停爱心车位赚经验：今日已得 {got}/{cap}，"
+                f"但**没有空闲的爱心车位**（他人爱心车位 "
+                f"{sum(1 for s in parking_spots if s.get('spotType') == 'charity' and str(s.get('ownerId')) != str(user_id))} 个，"
+                f"其中空的 0 个），本轮改停私家车位")
 
         owner_bonus = self._owner_bonus_map(state, self._game_data)
         # 私家车位那部分：先随机再按加成排序（稳定排序 = 档内随机、档间高者优先）。
@@ -1225,7 +1510,24 @@ class ParkingBot(_PluginBase):
                 spot, owner_key = cand, cand_owner
                 break
             if spot is None:
-                # 剩下的候选全被上限挡完了，这辆车和后面的都停不进去
+                # 剩下的候选全被上限挡完了，这辆车和后面的都停不进去。
+                #
+                # ★这两种「停不进去」的原因必须分开说。原来只有上面那句
+                # 「当前没有可停的他人空余车位」，现在上限调到每家 1 辆之后，
+                # 「还有空车位、但都停在同几个人名下」也走这条路 ——
+                # 不写出来的话用户只会看到今天少赚，完全查不出是被上限卡住的。
+                _owners = {str(s.get("ownerId")) for s in private_targets}
+                _blocked = sorted({str(s.get("ownerId")) for s in targets}
+                                  & set(per_owner)) or sorted(
+                    str(s.get("ownerId")) for s in targets)
+                logger.info(
+                    f"[不可躺自动抢车位] 还能停 {capacity - new_parked} 辆，"
+                    f"但候选车位只剩 {len(targets)} 个、且都归 "
+                    f"{len(_blocked)} 个已停满 {self._PARK_MAX_PER_OWNER} 辆的车主"
+                    f"（每家最多停 {self._PARK_MAX_PER_OWNER} 辆）→ 本轮少停 "
+                    f"{min(capacity - new_parked, len(idle) - new_parked)} 辆。"
+                    f"这些车主名下合计有 {len(_owners)} 个可用车位，"
+                    f"要停更多车需要更多不同的车位主人")
                 break
             result = await self._post(client, "park.php", {
                 "userCarId": car.get("id"),
@@ -2256,11 +2558,30 @@ class ParkingBot(_PluginBase):
             now = self._now_naive()
 
             cars = []
+            # 车位 id → 类型。车停在哪、那是不是爱心车位，**以车位自己为准**，
+            # 不看 car.status —— 服务端到底会不会把停进爱心车位的车标成
+            # status="charity" 没有实测依据，反查车位才是稳的（车带着
+            # parkedSpotId，游戏前端挪车时也是用这个字段的）。
+            all_spots = self._dict_rows(state.get("parkingSpots"))
+            spot_kind = {str(s.get("id")): str(s.get("spotType") or "")
+                         for s in all_spots}
+            spot_owner = {str(s.get("id")): str(s.get("ownerId") or "")
+                          for s in all_spots}
+            # 车主 id → 名字。车的 parkedAt 存的就是车位主人的 id
+            # （游戏前端判「我的车停在他那」用的就是 c.parkedAt === u.id）。
+            names_by_id = {}
+            for _uid, _prof in (state.get("users") or {}).items():
+                if isinstance(_prof, dict) and _prof.get("name"):
+                    names_by_id[str(_uid)] = str(_prof.get("name"))
             for car in my_cars:
                 parked_at = self._parked_at(car)
                 mins = max(0, (self._now_naive() - parked_at).total_seconds() / 60) if parked_at else 0
                 rate = self._earn_per_min(car, cars_map)
                 status = car.get("status")
+                charity = False
+                if status not in ("idle", None, ""):
+                    _spot_type = spot_kind.get(str(car.get("parkedSpotId")), "")
+                    charity = _spot_type == "charity" or status == "charity"
                 # 限时车（carId 为 0）名字与图都挂在车辆实例上，不在车型表里
                 definition = self._lookup_car(cars_map, car.get("carId")) or {}
                 cars.append({
@@ -2270,11 +2591,32 @@ class ParkingBot(_PluginBase):
                     "image": self._asset_url(definition.get("image")
                                             or car.get("flashCarImage")),
                     "rate": rate,
-                    "status": "空闲" if status == "idle" else ("爱心停车" if status == "charity" else "停车中"),
+                    # 停着的车说清楚停在哪类车位；空闲车没有车位可言
+                    "status": ("空闲" if status == "idle"
+                               else ("爱心停车" if charity else "停车中")),
+                    # 车位类型单列一个字段：卡片上除了状态还能显示「爱心车位」/「私家车位」，
+                    # 而且「累计收益」那一行对爱心车位要说清那是经验不是金币。
+                    "charity": charity,
+                    "spotType": (spot_kind.get(str(car.get("parkedSpotId")), "")
+                                 if status not in ("idle", None, "") else ""),
+                    # 停在哪个人名下。parkedAt 是车位主人 id，车位上也有 ownerId，
+                    # 两个都取一次：万一 parkedAt 缺失还能从车位反查。
+                    "ownerName": (
+                        names_by_id.get(str(car.get("parkedAt")))
+                        or names_by_id.get(spot_owner.get(
+                            str(car.get("parkedSpotId")), "")) or ""
+                    ) if status not in ("idle", None, "") else "",
                     "mins": round(mins),
                     # 收益按「已停时长 × 每分钟收益」估算，单车位封顶。
-                    # 爱心车位结算的是经验不是金币，不能算进待结算金币。
-                    "gain": min(int(mins * rate), max_earn) if status == "parked" else 0,
+                    # 爱心车位结算的是经验不是金币，不能算进待结算金币；
+                    # 那边单列一个 exp（游戏规则：CHARITY_EXP_PER_MIN 每分钟经验，
+                    # CHARITY_EXP_DAILY_LIMIT 封顶）。
+                    "gain": (0 if charity or status != "parked"
+                             else min(int(mins * rate), max_earn)),
+                    "exp": (min(int(mins * self._to_int(
+                        rules.get("CHARITY_EXP_PER_MIN"), 3, minimum=0)),
+                        self._to_int(rules.get("CHARITY_EXP_DAILY_LIMIT"),
+                                     300, minimum=0)) if charity else 0),
                 })
             # 排序口径必须与 _ordered_my_cars 完全一致，
             # 否则页面显示的序号和 /挪车 接受的序号会错位。
@@ -2341,6 +2683,29 @@ class ParkingBot(_PluginBase):
                     if not s.get("carInSpot")
                     and s.get("spotType") != "charity"
                     and str(s.get("ownerId")) != str(user_id)),
+                # 他人空闲的**爱心**车位数。「优先停爱心车位」开着却一辆都没停成，
+                # 十有八九就是这里等于 0（每个玩家最多 1 个爱心车位，容易全被占）。
+                "free_charity_spots": sum(
+                    1 for s in all_spots
+                    if not s.get("carInSpot")
+                    and s.get("spotType") == "charity"
+                    and str(s.get("ownerId")) != str(user_id)),
+                # ★有多少个**不同的**车位主人还有空闲私家车位。
+                # free_spots 数的是「车位个数」，而每家最多只能停
+                # _PARK_MAX_PER_OWNER 辆（v1.52.0 起是 1 辆）——
+                # 真正决定能停几辆车的是这个数，不是 free_spots。
+                # 一个人名下 3 个车位全空，free_spots 算 3，可实际只能用 1 个。
+                # 少了这个字段，「今天怎么少停了几辆」就永远查不出是不是被上限卡住的。
+                "free_private_owners": len({
+                    str(s.get("ownerId")) for s in all_spots
+                    if not s.get("carInSpot")
+                    and s.get("spotType") != "charity"
+                    and str(s.get("ownerId")) != str(user_id)}),
+                # 回收率。★gameSettings 会覆盖 gameRules —— 游戏前端
+                # api.js:115 就是 `if (cfg.RECYCLE_RATE) GAME_RULES.RECYCLE_RATE = ...`，
+                # 只读 game_data 的 gameRules 会拿到被覆盖掉的旧值。
+                # 刷购车/以旧换新经验的花费全看这个数，必须按同一套优先级读。
+                "recycle_rate": self._recycle_rate(state, self._game_data),
                 # 车市需要的车型目录：价格、每分钟收益、等级门槛。
                 # 只带展示字段，避免把 image 之类的无用数据塞进快照。
                 "catalog": [
@@ -2399,6 +2764,11 @@ class ParkingBot(_PluginBase):
             bucket["fined"] = self._to_int(bucket.get("fined"), 0) + self._shop_fined
             bucket["earned"] = self._to_int(bucket.get("earned"), 0) + self._shop_fined
             self._shop_fined = 0
+            # 回收拿回的钱同样是收入，并进 earned；另存一份 recycled 让统计页
+            # 能单独显示，不至于和挪车收益混成一坨。
+            bucket["recycled"] = self._to_int(bucket.get("recycled"), 0) + self._shop_recycled
+            bucket["earned"] = self._to_int(bucket.get("earned"), 0) + self._shop_recycled
+            self._shop_recycled = 0
             self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
             daily[day_key] = bucket
 
@@ -3262,6 +3632,34 @@ class ParkingBot(_PluginBase):
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 12},
                                 "content": [
+                                    {"component": "VSwitch",
+                                     "props": {
+                                         "model": "exp_farm",
+                                         "label": "自动刷购车 / 以旧换新经验",
+                                         "hint": "默认关闭。打开后：每轮做一次「买最便宜的车 → "
+                                                 "补差价换成次便宜的 → 回收换来的那辆」，"
+                                                 "把「购车」和「以旧换新」两项每日经验刷到当日上限"
+                                                 "（在等级详情面板里能看到进度），刷满即停、"
+                                                 "之后照常停车赚钱。\n"
+                                                 "★车库满员时会先回收**一辆最便宜的空闲车**腾位置，"
+                                                 "之后每轮循环结束时工位原样空出来，不会越刷车越少。"
+                                                 "被回收的那辆车不会自动买回来。\n"
+                                                 "花费：单轮净支出 = 新车价 x (1 - 回收率)。"
+                                                 "回收率以游戏实际下发的为准（页面「数据统计」里"
+                                                 "能看到当天真实的回收收入），"
+                                                 "每轮实际花了多少也会写在执行摘要里。",
+                                     }}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
+                                "content": [
                                     {"component": "VTextField",
                                      "props": {
                                          "model": "ticket_min_fine",
@@ -3917,6 +4315,13 @@ class ParkingBot(_PluginBase):
                 return 0
             return self._to_int(b.get("fined"), 0)
 
+        def day_recycled(d: str) -> int:
+            """当天回收车辆拿回的金币。老存档没有 recycled 字段，一律按 0 算。"""
+            b = daily.get(d) or {}
+            if not isinstance(b, dict):
+                return 0
+            return self._to_int(b.get("recycled"), 0)
+
         current = self._day if self._day in daily else days[0]
         bucket = daily.get(current) or {}
         # bucket 本身和 bucket["hours"] 都得校验类型：落盘数据被改坏时
@@ -3946,6 +4351,7 @@ class ParkingBot(_PluginBase):
              "content": [
                  self._stat("当日收益", day_earned, _GOLD),
                  self._stat("其中贴条", day_fined(current), _TICKET_C),
+                 self._stat("其中回收", day_recycled(current), _CYAN),
                  self._stat("当日支出", day_cost, _PINK),
                  self._stat("当日净收", day_net, _GREEN),
                  self._stat("挪走次数", self._to_int(bucket.get("moved"), 0), _PURPLE),
@@ -3957,6 +4363,7 @@ class ParkingBot(_PluginBase):
              "content": [
                  self._stat("本月收益", m_earned, _GOLD),
                  self._stat("其中贴条", sum(day_fined(d) for d in month_days), _TICKET_C),
+                 self._stat("其中回收", sum(day_recycled(d) for d in month_days), _CYAN),
                  self._stat("本月支出", m_cost, _PINK),
                  self._stat("本月净收", m_earned - m_cost, _GREEN),
                  self._stat("本月日均", avg, _CYAN),
@@ -5925,15 +6332,30 @@ class ParkingBot(_PluginBase):
                     ParkingBot._text(name, {"fontSize": "17px", "fontWeight": "bold"}),
                     ParkingBot._kv("盈利速率", f"{item.get('rate', 0)} 金/分钟", _GREEN),
                     ParkingBot._kv(
-                        "累计收益" if not idle else "当前状态",
-                        ParkingBot._coin(ParkingBot._fmt_num(item.get("gain")),
-                                         size=13, align="left")
-                        if not idle else "当前未停放",
-                        _GOLD),
+                        "当前状态" if idle else "车位类型",
+                        "当前未停放" if idle
+                        else ("爱心车位（赚经验，不产金币）"
+                              if item.get("charity") else "私家车位"),
+                        _PURPLE if item.get("charity") else _CYAN),
+                    # 爱心车位结算的是经验不是金币，累计收益那栏得说清单位，
+                    # 否则一个 0 会被当成「白停了半天」。
+                    ParkingBot._kv(
+                        "当前状态" if idle else "累计收益",
+                        "当前未停放" if idle else
+                        (f"{ParkingBot._fmt_num(item.get('exp'))} exp"
+                         if item.get("charity") else
+                         ParkingBot._coin(ParkingBot._fmt_num(item.get("gain")),
+                                          size=13, align="left")),
+                        _PURPLE if item.get("charity") else _GOLD),
                     ParkingBot._kv(
                         "已停时长" if not idle else "说明",
                         f"{minutes} 分钟" if not idle else "可立即停到他人车位",
                         "rgba(255,255,255,0.75)"),
+                    # 停在谁名下：车位主人可能哪天就换车了，看名字比看 ID 有用。
+                    *([ParkingBot._kv(
+                        "停在", str(item.get("ownerName") or "（车主未知）"),
+                        "rgba(255,255,255,0.75)")]
+                      if not idle and item.get("ownerName") else []),
                     {"component": "div",
                      "props": {"style": {"marginTop": "10px",
                                          "display": "flex", "alignItems": "center",
@@ -6876,11 +7298,43 @@ class ParkingBot(_PluginBase):
         # 否则用户会以为开关没生效。
         shop_cards = self._build_shop(snapshot)
         turned_on = [label for flag, label in ((self._auto_buy, "自动买车"),
-                                                (self._auto_trade, "自动以旧换新")) if flag]
+                                                (self._auto_trade, "自动以旧换新"),
+                                                (self._exp_farm, "刷购车/以旧换新经验")) if flag]
         if turned_on and not note:
             head_lines.append(self._text(
                 f"{'、'.join(turned_on)}已开启，本轮没有满足条件的操作",
                 {"fontSize": "12px", "opacity": "0.78", "marginTop": "6px"}))
+        # 刷经验开着就把两项进度摆出来。否则「今天还刷不刷」只能点开等级面板才看得到，
+        # 而「本轮没操作」那句话在已经刷满时是正常的，混在一起会让人以为开关坏了。
+        #
+        # ★快照里这两项是**普通 dict**（实测 plugindata.snapshot：
+        #   dailyExp {"park":150,"ticket":90,"tradeIn":300,"charity_park":50}
+        #   expConfig {"buy":300,"park":150,...,"tradeIn":300}），
+        # 不是数组，不能用 _dict_rows 去遍历。
+        # 也不能调 _exp_daily(snapshot, user_id)：快照里根本没有 userId 字段
+        # （实测只有 27 个键，不含 userId），拿 None 当用户 ID 会跳过前缀校验，
+        # 把别人的 dailyExp 也算进来。
+        if self._exp_farm and not note:
+            _got = snapshot.get("dailyExp")
+            _got = _got if isinstance(_got, dict) else {}
+            _caps = snapshot.get("expConfig")
+            _caps = _caps if isinstance(_caps, dict) else {}
+            buy_done = (self._to_int(_got.get("buy"), 0)
+                        >= self._to_int(_caps.get("buy"), 0))
+            trade_done = (self._to_int(_got.get("tradeIn"), 0)
+                          >= self._to_int(_caps.get("tradeIn"), 0))
+            head_lines.append(self._text(
+                f"购车 {self._fmt_num(_got.get('buy'))}/{_caps.get('buy', 0)}　"
+                f"以旧换新 {self._fmt_num(_got.get('tradeIn'))}/{_caps.get('tradeIn', 0)}"
+                # ★「本轮没有满足条件的操作」这句话在经验还没满的时候是误导 ——
+                # 开关明明开着、经验明明还差着一截，用户只会以为插件坏了。
+                # 实际卡住的通常是「车库满且没有可回收的空闲车」或「金币不够垫差价」，
+                # 这里把原因说出来；只有真满额了才叫「已停手」。
+                + ("　（两项都已刷满，已停手）" if buy_done and trade_done
+                   else "　（未刷满却没执行：车库满且没有可回收的空闲车，"
+                        "或金币不够垫差价——详见插件日志）"),
+                {"fontSize": "12px", "color": _CYAN, "marginTop": "6px",
+                 "lineHeight": "1.6"}))
 
         head_card = {
             "component": "div",
