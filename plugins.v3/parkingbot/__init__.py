@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.5"
+    plugin_version = "1.51.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -406,6 +406,9 @@ class ParkingBot(_PluginBase):
     # 派生实例等），缺属性会 AttributeError 让整轮作废。默认关，最保守。
     _auto_ticket: bool = False
     _ticket_min_fine: int = 0
+    # 优先停爱心车位赚经验。默认关：爱心车位**不产金币**，开着会让收益方式
+    # 从「赚金币」变成「赚经验」，是会影响收入结构的改动，得用户自己决定。
+    _prefer_charity: bool = False
     # 详情页数据缓存（快照 + 历史）。
     # 每轮执行结束后在内存里同步刷新，页面渲染与插件重载都直接读它，
     # 不再每次访问数据库 —— 保存配置会触发插件重载，重载又会重新收集
@@ -434,6 +437,8 @@ class ParkingBot(_PluginBase):
         self._auto_ticket = self._as_switch(config.get("auto_ticket"))
         self._ticket_min_fine = self._to_int(config.get("ticket_min_fine"),
                                              0, minimum=0)
+        # 优先停爱心车位赚经验，默认关（理由见类属性的注释）。
+        self._prefer_charity = self._as_switch(config.get("prefer_charity"))
         # 记住上次停留的区块与查看的日期；插件重载、MoviePilot 重启后仍回到原来那一页
         saved_view = self.get_data("view") or {}
         if not isinstance(saved_view, dict):
@@ -707,6 +712,18 @@ class ParkingBot(_PluginBase):
             return
 
         still_parked = len(parked) - (0 if recomputed else moved)
+
+        # 优先停爱心车位：经验满了就把车挪回来，别让它们一直占着车位不产金币。
+        # 挪车接口对爱心车位返回的是经验不是金币，所以不能计入 earned_total。
+        charity_moved = 0
+        if self._prefer_charity and charity:
+            _got, _cap = self._charity_exp(state, user_id)
+            if _got >= _cap:
+                charity, charity_moved = await self._unpark_charity_cars(
+                    client, charity, target_minutes, cars_map)
+                if charity_moved:
+                    still_parked -= charity_moved
+
         # 自动贴条：排在挪车之后、停车之前。
         # 挪车之后 state 已刷新过，谁停在我的车位上是最准的；停车只会把我的车
         # 停到别人车位上，与贴条无关，放哪都不影响结果。
@@ -730,6 +747,11 @@ class ParkingBot(_PluginBase):
         if new_parked:
             # 刚停出去的车在服务端已占位，这份 state 里还显示着「空闲」
             state_is_current = False
+        if charity_moved:
+            if shop_note:
+                shop_note += f"；爱心停车满额挪回 {charity_moved} 辆"
+            else:
+                shop_note = f"爱心停车满额，挪回 {charity_moved} 辆改赚金币"
         self._summarize(new_parked, moved, earned_total)
 
         # 本轮动过车就重新取一次状态：上面那份 state 是动作之前的快照，
@@ -1071,6 +1093,25 @@ class ParkingBot(_PluginBase):
             idle.append(car)
         return earned_total, moved
 
+    def _charity_exp(self, state: Optional[dict], user_id: Any) -> Tuple[int, int]:
+        """
+        今日「爱心停车」经验：(已得, 当日上限)。
+
+        数据口径和等级详情面板完全同一套：已得读 `state.dailyExp` 的
+        `charity_park` 键，上限读 `game_data.expConfig.charity_parkDailyLimit`
+        （后端没给就落到游戏自己的默认值 50，见 _EXP_SOURCES）。
+
+        两边必须同源 —— 用另一套算法算「满没满」，面板上看到的进度条和
+        实际停不停车就会对不上。
+
+        ★这里读的是 `self._game_data`（实例上那份），不能写成 classmethod 去读
+        `cls._game_data`：类属性只有 None 的默认值，实际数据挂在实例上，
+        那样读永远是 None，上限会一直退化成兜底的 50。
+        """
+        got = self._exp_daily(state, user_id).get("charity_park", 0)
+        cap = self._exp_config(self._game_data).get("charity_park", 50)
+        return self._to_int(got, 0, minimum=0), self._to_int(cap, 50, minimum=0)
+
     async def _park_idle_cars(
         self,
         client: AsyncRequestUtils,
@@ -1097,25 +1138,46 @@ class ParkingBot(_PluginBase):
 
         场景加成拿不到时（game_data 没缓存 / 停车收益）一律按 0 处理，
         排序退化成全随机，和这个功能上线之前的行为完全一致。
+
+        prefer_charity 打开且爱心停车经验没满时，别人的**爱心车位**也进候选池，
+        并排在最前面（它们不产金币，值的是经验）。经验满了就不再往里放 ——
+        否则车会全停去爱心位却一经验也涨不到，等于白停一整轮。
         """
         if capacity <= 0 or not idle:
             return 0
 
-        targets = [
+        got, cap = self._charity_exp(state, user_id)
+        want_charity = self._prefer_charity and got < cap
+        private_targets = [
             spot for spot in parking_spots
             if spot.get("ownerId") != user_id
             and not spot.get("carInSpot")
             and spot.get("spotType") != "charity"
         ]
-        if not targets:
-            logger.info("[不可躺自动抢车位] 当前没有可停的他人空余私家车位")
+        charity_targets = [
+            spot for spot in parking_spots
+            if want_charity
+            and spot.get("ownerId") != user_id
+            and not spot.get("carInSpot")
+            and spot.get("spotType") == "charity"
+        ]
+        if not private_targets and not charity_targets:
+            logger.info("[不可躺自动抢车位] 当前没有可停的他人空余车位")
             return 0
+        if want_charity and charity_targets:
+            logger.info(
+                f"[不可躺自动抢车位] 优先停爱心车位赚经验：今日已得 {got}/{cap}，"
+                f"可用爱心车位 {len(charity_targets)} 个")
 
         owner_bonus = self._owner_bonus_map(state, self._game_data)
-        # 先随机再按加成排序：稳定排序保证「加成档内随机、档间高者优先」。
-        random.shuffle(targets)
-        targets.sort(key=lambda s: owner_bonus.get(str(s.get("ownerId")), 0),
-                     reverse=True)
+        # 私家车位那部分：先随机再按加成排序（稳定排序 = 档内随机、档间高者优先）。
+        random.shuffle(private_targets)
+        private_targets.sort(
+            key=lambda s: owner_bonus.get(str(s.get("ownerId")), 0), reverse=True)
+        # 爱心车位本身没有金币收益可言，「场景加成」对它无意义（游戏规则也写了
+        # 场景加成仅对私家车位生效），所以只打散保底顺序，不按加成排。
+        random.shuffle(charity_targets)
+        targets = charity_targets + private_targets
 
         cars_map = await self._load_cars_map(client)
         idle.sort(key=lambda c: self._earn_per_min(c, cars_map), reverse=True)
@@ -1149,12 +1211,52 @@ class ParkingBot(_PluginBase):
                 continue
             per_owner[owner_key] = per_owner.get(owner_key, 0) + 1
             new_parked += 1
-            logger.info(
-                f"[不可躺自动抢车位] 车辆 {car.get('id')} 已停入车位 {spot.get('id')}"
-                f"（车主 {owner_key}，场景加成 +{owner_bonus.get(owner_key, 0)}%），"
-                f"收益 {self._earn_per_min(car, cars_map)} 金/分钟"
-            )
+            if spot.get("spotType") == "charity":
+                # 爱心车位不产金币，日志别写「金/分钟」，那会让人以为有收入
+                logger.info(
+                    f"[不可躺自动抢车位] 车辆 {car.get('id')} 已停入爱心车位 "
+                    f"{spot.get('id')}（车主 {owner_key}），赚经验不赚金币")
+            else:
+                logger.info(
+                    f"[不可躺自动抢车位] 车辆 {car.get('id')} 已停入车位 {spot.get('id')}"
+                    f"（车主 {owner_key}，场景加成 +{owner_bonus.get(owner_key, 0)}%），"
+                    f"收益 {self._earn_per_min(car, cars_map)} 金/分钟"
+                )
         return new_parked
+
+    async def _unpark_charity_cars(
+        self, client: AsyncRequestUtils, cars: List[dict],
+        min_minutes: int, cars_map: Dict[Any, dict]
+    ) -> Tuple[List[dict], int]:
+        """
+        爱心停车经验满了之后，把停在爱心车位的车挪回来，改去赚金币。
+
+        返回 (还没挪成的, 挪成的辆数)。
+
+        两处必须注意：
+        1. 挪车接口对爱心车位返回的是**经验**，字段叫 charityExpContributed，
+           不是 earned —— 算进金币收益里会凭空多出一笔收入。
+        2. 游戏要求停够 MIN_PARK_DURATION 才让挪，不够就留在原位。
+        """
+        still: List[dict] = []
+        moved = 0
+        for car in cars:
+            minutes = self._parked_minutes(car)
+            if minutes < min_minutes:
+                still.append(car)
+                continue
+            result = await self._post(client, "unpark.php", {"userCarId": car.get("id")})
+            if not result or not result.get("success"):
+                logger.warning(
+                    f"[不可躺自动抢车位] 爱心挪车失败：{(result or {}).get('error') or '未知原因'}")
+                still.append(car)
+                continue
+            exp = self._to_int(result.get("charityExpContributed"), 0, minimum=0)
+            moved += 1
+            logger.info(
+                f"[不可躺自动抢车位] 爱心停车经验已满，车辆 {car.get('id')} 挪回来"
+                f"（{self._car_name(car, cars_map)}，已贡献 {exp} 经验），改停普通车位赚金币")
+        return still, moved
 
     async def _post(self, client: AsyncRequestUtils, endpoint: str, payload: dict) -> Optional[dict]:
         """调用游戏写接口，统一返回解析后的 JSON（失败返回 None）。"""
@@ -3100,6 +3202,28 @@ class ParkingBot(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {"component": "VSwitch",
+                                     "props": {
+                                         "model": "prefer_charity",
+                                         "label": "优先停爱心车位赚经验",
+                                         "hint": "默认关闭。打开后：定时任务优先把空闲车停到**别人**的"
+                                                 "爱心车位上赚经验（等级详情面板里能看到"
+                                                 "「爱心停车」那一项的今日进度）。"
+                                                 "经验达到当日上限后车会自动挪回来，"
+                                                 "转去普通车位赚金币。"
+                                                 "注意：停在爱心车位不产金币，期间没有金币收入。",
+                                     }}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
                                 "content": [
                                     {"component": "VTextField",
                                      "props": {
@@ -5061,11 +5185,58 @@ class ParkingBot(_PluginBase):
         if fresh and fresh.get("success"):
             await self._record_round(client, fresh, fresh.get("userId"),
                                      0, 0, 0, record_history=False)
+        # 再按本次操作乐观更新 —— 顺序反了会被上面那份仍旧是旧值的快照盖回去。
+        if await self._patch_spot_charity(raw_spot_id, action == "set"):
+            logger.warning(
+                "[不可躺自动抢车位] 切换后 state.php 立刻读回来的车位类型与本次操作不符"
+                "（服务端写入延迟），已按本次操作显示；下一轮会以真实状态为准。")
         note = ("已设为爱心车位，其他玩家停车将贡献经验" if action == "set"
                 else "已恢复为私家车位，重新按分钟产出金币")
         self._set_result(note)
         logger.info(f"[不可躺自动抢车位] {note}")
         return _result({"success": True, "action": action})
+
+    async def _patch_spot_charity(self, spot_id: Any, is_charity: bool) -> bool:
+        """
+        把快照里某个车位的爱心标记按「我们刚做了什么」改过来。
+
+        为什么需要它：charity_spot.php 立刻返回 success，但**紧接着**那次
+        state.php 有时还读回旧值（服务端写入延迟）—— 游戏网页版那边之所以
+        显示得出爱心，是因为用户之后刷新了整页，等写入生效才看到。
+        插件这一轮拉完就落快照，于是页面停在「私家」，用户看着像按钮没生效。
+
+        顺序很关键：**先**用服务端状态重���整份快照，**再**覆盖这一个车位。
+        反过来的话，那份仍旧是旧值的快照会把乐观更新又盖回「私家」。
+
+        返回 True 表示服务端读回来的值和本次操作不一致（写入延迟），
+        值得记一条日志留证。下一轮定时任务会拿真实状态覆盖回来，自愈。
+        """
+        cache = self._page_cache if isinstance(self._page_cache, dict) else {}
+        snapshot = cache.get("snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            stored = await self.async_get_data("snapshot")
+            snapshot = stored if isinstance(stored, dict) else {}
+            cache = dict(cache)
+        disagree = False
+        kind = "爱心车位" if is_charity else "私家车位"
+        spots = snapshot.get("spots")
+        if isinstance(spots, list):
+            for spot in spots:
+                if not isinstance(spot, dict) \
+                        or str(spot.get("spotId")) != str(spot_id):
+                    continue
+                disagree = bool(spot.get("charity")) != is_charity
+                spot["charity"] = is_charity
+                spot["kind"] = kind
+                # label 形如「私家车位 3」，只换前缀，编号留着
+                old = str(spot.get("label") or "")
+                num = old.rsplit(" ", 1)[-1] if " " in old else ""
+                spot["label"] = f"{kind} {num}".strip()
+        snapshot["spots"] = spots
+        cache["snapshot"] = snapshot
+        self._page_cache = cache
+        await self.async_save_data("snapshot", snapshot)
+        return disagree
 
     async def api_exp_detail(self, request: ExpDetailRequest) -> ApiResult:
         """
