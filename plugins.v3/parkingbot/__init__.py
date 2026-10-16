@@ -445,6 +445,15 @@ class ParkingBot(_PluginBase):
     # 默认关：它既要真花钱（金币），又会**回收掉一辆车**，属于不可逆操作，
     # 插件不该替用户默认开启。
     _exp_farm: bool = False
+    # 买车/换新之后要在游戏状态里认出「新出现的那辆车」，最多试几次、每次间隔多久。
+    #
+    # ★真机实测过：buy_car.php 已经写成功了（新车实例 ID 里的时间戳就是
+    # 买的那一刻），但紧接着那一次 state.php 还没带上它。只试一次的话，
+    # 这一步永远推不下去，车就一直卡在「买进来但没被认出来」的状态，
+    # 下一轮又重来 —— 实测变成一个每轮净亏 160 金币的循环。
+    # 试 3 次、每次隔 1.2 秒，最坏也就多花 2.4 秒，换来「买完就能刷新车库」。
+    _EXP_FARM_FIND_TRIES = 3
+    _EXP_FARM_FIND_DELAY = 1.2
     # 详情页数据缓存（快照 + 历史）。
     # 每轮执行结束后在内存里同步刷新，页面渲染与插件重载都直接读它，
     # 不再每次访问数据库 —— 保存配置会触发插件重载，重载又会重新收集
@@ -1000,22 +1009,55 @@ class ParkingBot(_PluginBase):
             return None
         return fresh if (fresh and fresh.get("success")) else None
 
-    def _exp_farm_pick_new(self, fresh: dict, user_id: Any,
-                           before_ids: set, car_id: Any = None) -> Optional[dict]:
-        """
-        在刷新后的状态里找出「刚刚多出来的那辆车」。
-
-        buy_car.php / trade_in.php 的响应体长什么样**没有实测依据**
-        （游戏前端拿到响应后是直接 loadFromServer 重载，从不读响应里的车 ID），
-        所以不去猜字段名，而是拿刷新前后的车辆实例 ID 做差集定位 ——
-        这样即使服务端改响应结构也不受影响。
-        """
+    def _exp_farm_candidates(self, fresh: dict, user_id: Any,
+                             before_ids: set, car_id: Any) -> List[dict]:
+        """刷新后的状态里，「新出现且是指定车型」的车。"""
         rows = [c for c in self._dict_rows(fresh.get("userCars"))
                 if str(c.get("userId")) == str(user_id)
                 and str(c.get("id")) not in before_ids]
         if car_id is not None:
             rows = [c for c in rows if str(c.get("carId")) == str(car_id)]
-        return rows[0] if len(rows) == 1 else None
+        return rows
+
+    async def _exp_farm_find_new(self, client: Any, user_id: Any, before_ids: set,
+                                 car_id: Any, what: str) -> Optional[dict]:
+        """
+        刷新状态，找出「刚刚多出来的那辆车」，看不见就**重试到看见为止**。
+
+        为什么不一次就放弃 —— 这是真机上踩过的：
+        buy_car.php 已经写成功（新车实例 ID 里那串时间戳正好是买的那一刻），
+        但**紧接着那一次 state.php 还没带上它**，差集定位直接落空，
+        结果是「买进来的车留在库里、这一步永远推不下去」，而且每轮都重来一遍。
+
+        为什么不用响应体里的车 ID：buy_car.php / trade_in.php 的响应结构
+        **没有实测依据**（游戏前端拿到响应后直接 loadFromServer 重载，
+        从不读响应里的车 ID），猜字段名等于赌；差集定位赌的是「服务端最终一致」，
+        这条可以用重试兜住。
+
+        仍然找不到时会把**实际看到的匹配数**打进日志 —— 只说「定位不到」的话，
+        下次还是只能靠猜到底是 0 辆还是 2 辆。
+        """
+        seen = 0
+        for attempt in range(1, self._EXP_FARM_FIND_TRIES + 1):
+            fresh = await self._exp_farm_refresh(client)
+            if fresh is not None:
+                rows = self._exp_farm_candidates(fresh, user_id, before_ids, car_id)
+                seen = len(rows)
+                if seen == 1:
+                    return rows[0]
+                if seen > 1:
+                    # 多出来不止一辆：再按「空闲」收窄一次，仍不唯一就不乱猜。
+                    idle = [c for c in rows if c.get("status") == "idle"]
+                    if len(idle) == 1:
+                        return idle[0]
+            if attempt < self._EXP_FARM_FIND_TRIES:
+                await asyncio.sleep(self._EXP_FARM_FIND_DELAY)
+        logger.warning(
+            f"[不可躺自动抢车位] 刷经验：{what}之后连续 {self._EXP_FARM_FIND_TRIES} 次"
+            f"刷新都没认出新出现的车（车型 carId={car_id}，匹配数 {seen}）。"
+            f"这笔{what}可能已经进了车库、只是没被认出来，"
+            f"请到「我的车库」确认一下再决定是否继续开这个开关")
+        return None
 
     async def _exp_farm_step(self, client: Any, state: dict,
                              cars_map: Dict[Any, dict], user_id: Any) -> str:
@@ -1100,14 +1142,10 @@ class ParkingBot(_PluginBase):
         self._shop_bought += 1
         steps.append(f"买 {lo_def.get('name')} {lo_price} 金")
 
-        fresh = await self._exp_farm_refresh(client)
-        if fresh is None:
-            logger.warning("[不可躺自动抢车位] 刷经验：购车后刷新状态失败，本轮到此为止")
-            return "；".join(steps)
-        bought = self._exp_farm_pick_new(fresh, user_id, before_ids, lo_def.get("id"))
+        bought = await self._exp_farm_find_new(
+            client, user_id, before_ids, lo_def.get("id"), "购车")
         if bought is None:
-            logger.warning("[不可躺自动抢车位] 刷经验：购车后定位不到新车实例，本轮到此为止")
-            return "；".join(steps)
+            return "；".join(steps) + "（新买的这辆没能认出来，车留在车库，本轮到此为止）"
 
         if not need_trade:
             # 以旧换新已经满了：这辆便宜车就留在车库里停车赚钱，不再换也不回收
@@ -1130,16 +1168,10 @@ class ParkingBot(_PluginBase):
         steps.append(f"换 {hi_def.get('name')} 补 {diff} 金")
 
         # --- 回收换来的那辆：把工位还回去，车位数回到本轮开始时的样子 ---
-        fresh = await self._exp_farm_refresh(client)
-        if fresh is None:
-            logger.warning("[不可躺自动抢车位] 刷经验：换新后刷新状态失败，"
-                           "换来的车留在库里（本轮不再回收）")
-            return "；".join(steps)
-        traded = self._exp_farm_pick_new(fresh, user_id, before_ids, hi_def.get("id"))
+        traded = await self._exp_farm_find_new(
+            client, user_id, before_ids, hi_def.get("id"), "换新")
         if traded is None:
-            logger.warning("[不可躺自动抢车位] 刷经验：换新后定位不到新车实例，"
-                           "换来的车留在库里（本轮不再回收）")
-            return "；".join(steps)
+            return "；".join(steps) + "（换来的这辆没能认出来，车留在车库，本轮不再回收）"
         result = await self._post(client, "recycle_car.php",
                                   {"carInstanceId": traded.get("id")})
         if not (result and result.get("success")):
