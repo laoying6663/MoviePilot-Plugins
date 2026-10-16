@@ -288,7 +288,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.52.0"
+    plugin_version = "1.52.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1534,10 +1534,16 @@ class ParkingBot(_PluginBase):
             # 主人时，这辆车就没机会停进后面那些还有空位的车位了。
             spot = None
             owner_key = ""
+            # 撞上限的候选在循环里就地收集：循环一结束 targets 就被 pop 空了，
+            # 再拿它统计「还剩几个候选 / 归几个车主」只会得到 0，日志会误导。
+            blocked_owners: set = set()
+            blocked_count = 0
             while targets:
                 cand = targets.pop(0)
                 cand_owner = str(cand.get("ownerId"))
                 if per_owner.get(cand_owner, 0) >= self._PARK_MAX_PER_OWNER:
+                    blocked_owners.add(cand_owner)
+                    blocked_count += 1
                     continue
                 spot, owner_key = cand, cand_owner
                 break
@@ -1548,17 +1554,12 @@ class ParkingBot(_PluginBase):
                 # 「当前没有可停的他人空余车位」，现在上限调到每家 1 辆之后，
                 # 「还有空车位、但都停在同几个人名下」也走这条路 ——
                 # 不写出来的话用户只会看到今天少赚，完全查不出是被上限卡住的。
-                _owners = {str(s.get("ownerId")) for s in private_targets}
-                _blocked = sorted({str(s.get("ownerId")) for s in targets}
-                                  & set(per_owner)) or sorted(
-                    str(s.get("ownerId")) for s in targets)
                 logger.info(
                     f"[不可躺自动抢车位] 还能停 {capacity - new_parked} 辆，"
-                    f"但候选车位只剩 {len(targets)} 个、且都归 "
-                    f"{len(_blocked)} 个已停满 {self._PARK_MAX_PER_OWNER} 辆的车主"
+                    f"但剩余 {blocked_count} 个候选车位都归 "
+                    f"{len(blocked_owners)} 个已停满 {self._PARK_MAX_PER_OWNER} 辆的车主"
                     f"（每家最多停 {self._PARK_MAX_PER_OWNER} 辆）→ 本轮少停 "
-                    f"{min(capacity - new_parked, len(idle) - new_parked)} 辆。"
-                    f"这些车主名下合计有 {len(_owners)} 个可用车位，"
+                    f"{min(capacity - new_parked, len(idle) - new_parked)} 辆，"
                     f"要停更多车需要更多不同的车位主人")
                 break
             result = await self._post(client, "park.php", {
