@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.0"
+    plugin_version = "1.50.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1259,6 +1259,31 @@ class ParkingBot(_PluginBase):
                 out.setdefault(str(pid), pct)
         return out
 
+    @classmethod
+    def _my_bonus_pct(cls, state: Optional[dict], game_data: Optional[dict],
+                      user_id: Any = None) -> int:
+        """
+        **我自己**车位的场景加成百分比。
+
+        自己的场景 id 在 state.php 的**顶层 currentBg**，不在 users[我的 id] 里。
+        游戏前端分得很清（js/modules/api.js 的 loadFromServer +
+        js/modules/render.js 的 applyBg）：
+
+            this.currentBg = data.currentBg || 'jiedao'    ← 自己，顶层字段
+            bgId = this.users[targetUserId].currentBg      ← 别人，才查 users
+
+        v1.50.0 一开始错从 users[我的 id] 里查 currentBg，那儿压根没有这个字段，
+        于是取到 0 —— 表现是「标题右边的 收益+N% 永远不显示」，而且不报任何错。
+        顶层拿不到时才退回 users[我的 id]（万一以后接口把字段挪了位置）。
+        """
+        st = state or {}
+        bg_id = str(st.get("currentBg") or "")
+        if bg_id:
+            return cls._bg_bonus_map(game_data).get(bg_id, 0)
+        if user_id is not None:
+            return cls._owner_bonus_map(st, game_data).get(str(user_id), 0)
+        return 0
+
     @staticmethod
     def _lookup_car(cars_map: Dict[Any, dict], car_id: Any) -> Optional[dict]:
         """按车辆实例上的 carId 找车型定义，数字/字符串两种键都试一次。"""
@@ -1995,12 +2020,12 @@ class ParkingBot(_PluginBase):
                 "title_name": str(mine.get("currentTitleName") or ""),
                 "title_color": str(titles.get("color") or _GOLD),
                 "titles": titles["owned"],
-                # 我自己车位的场景加成。currentBg 在 state.users[我的 id] 上，
-                # 加成百分比在 game_data.parkingBackgrounds 里 —— 和停车挑车位
-                # 用的是同一套查表（_owner_bonus_map）。取不到就是 0，标题旁
-                # 什么都不显示。
-                "spot_bonus_pct": self._owner_bonus_map(
-                    state, self._game_data).get(str(user_id), 0),
+                # 我自己车位的场景加成。**顶层 currentBg**（不是 users[我]，
+                # 那个位置没有这个字段），加成百分比在 game_data 的
+                # parkingBackgrounds 里。停车挑车位用的是同一张表
+                # （_bg_bonus_map），只是取值位置不同。
+                "spot_bonus_pct": self._my_bonus_pct(
+                    state, self._game_data, user_id),
                 "cars": cars,
                 "spots": spots,
                 # 他人空余私家车位数。车库页的「立即停到他人车位」按钮靠它决定
