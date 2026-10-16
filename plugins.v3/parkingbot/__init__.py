@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.4"
+    plugin_version = "1.50.5"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1736,11 +1736,17 @@ class ParkingBot(_PluginBase):
         client = AsyncRequestUtils(cookies=jar, timeout=20)
         url = self.SSO_URL
         chain: List[str] = []
+        hosts: List[str] = []
         try:
             for _ in range(6):  # 跳转链通常 2~3 跳，留足冗余
+                hosts.append(url.split("/")[2] if "://" in url else url)
                 resp = await client.get_res(url, allow_redirects=False)
                 if resp is None:
-                    logger.error(f"[不可躺自动抢车位] 主站 SSO 请求失败：{url}")
+                    # 原来这里只 return 空串、不设 _sso_error，外层只能报一句
+                    # 「未取到登录 Cookie」，把排查方向带偏 —— 明明是「主站那一步
+                    # 就没连上」，和「Cookie 拿到了但游戏不认」是两回事。
+                    self._sso_error = f"主站 SSO 第 {len(chain) + 1} 跳无响应（{url}）"
+                    logger.error(f"[不可躺自动抢车位] {self._sso_error}")
                     return ""
                 fresh = []
                 for name, value in resp.cookies.items():
@@ -1762,22 +1768,48 @@ class ParkingBot(_PluginBase):
                     break
                 url = urljoin(url, location)
         except Exception as err:
-            logger.error(f"[不可躺自动抢车位] 主站 SSO 换取 Cookie 异常：{err}")
+            self._sso_error = (f"主站 SSO 换取 Cookie 异常："
+                               f"{type(err).__name__}: {err}")
+            logger.error(f"[不可躺自动抢车位] {self._sso_error}")
             return ""
+        finally:
+            # 跳转链必须在这里打，而不是放在 try 之后 —— 中途 return / 抛异常
+            # 的那几条链恰恰是排查这条报错唯一有用的线索（「链走到第几跳断的」、
+            # 「有没有真的跳到 qcw 子域」），放在成功路径上等于永远打不出来。
+            logger.info(
+                "[不可躺自动抢车位] 主站 SSO 跳转链（共 %d 跳）：%s"
+                % (len(chain), " ‖ ".join(chain) or "（一跳都没走成）"))
+            logger.info(
+                "[不可躺自动抢车位] SSO 走过的域名：%s"
+                % (" → ".join(hosts) if hosts else "（无）")
+                + ("；已到达游戏子域" if any("qcw." in h for h in hosts)
+                   else "；**没有走到游戏子域 qcw.tangpt.top**")
+            )
 
         cookie = "; ".join(f"{name}={value}" for name, value in jar.items())
-        logger.info("[不可躺自动抢车位] 主站 SSO 跳转链：" + " ‖ ".join(chain))
+        logger.info("[不可躺自动抢车位] 本次带上的 Cookie 名（不回显取值）：%s"
+                    % (", ".join(sorted(jar)) or "（一个都没有）"))
 
-        # 回游戏验证：只有真的能过 state.php 鉴权才算换到
+        # 回游戏验证：只有真的能过 state.php 鉴权才算换到。
+        # ★probe 必须自己兜住异常：这里抛出去会一路掀翻 run_once，
+        # 用户看到的是「插件不跑了」而不是一条能定位的报错。
         probe = AsyncRequestUtils(cookies=self._parse_cookie_header(cookie), timeout=20)
-        state = await probe.get_json(f"{self.API_BASE}/state.php")
-        if not (state and state.get("success")):
-            reason = (state or {}).get("error") or "游戏接口无响应"
-            self._sso_error = f"主站 SSO 走完了但游戏仍判未登录（{reason}）"
+        state: Any = None
+        probe_err = ""
+        try:
+            state = await probe.get_json(f"{self.API_BASE}/state.php")
+        except Exception as err:
+            probe_err = f"{type(err).__name__}: {err}"
+        if not (isinstance(state, dict) and state.get("success")):
+            # (state or {}).get(...) 挡不住非字典响应：服务端回登录页/风控页时
+            # 这里会 AttributeError 掀翻整轮，而它恰恰是最该报清楚的那种情况。
+            detail = self._describe_probe(state, probe_err)
             logger.error(
-                f"[不可躺自动抢车位] {self._sso_error}；"
-                "已获取的 Cookie 不会缓存。跳转链见上一行 INFO。"
-            )
+                f"[不可躺自动抢车位] 换到 Cookie 后回游戏验证失败 —— {detail}。"
+                "已获取的 Cookie 不会缓存；上面的跳转链和域名那两行是排查入口。")
+            reason = (state.get("error") if isinstance(state, dict) else "") \
+                or probe_err or self._probe_reason(state)
+            self._sso_error = f"主站 SSO 走完了但游戏仍判未登录（{reason}）"
             return ""
 
         try:
@@ -1789,6 +1821,50 @@ class ParkingBot(_PluginBase):
             logger.warning(f"[不可躺自动抢车位] Cookie 缓存落盘失败：{err}")
         logger.info("[不可躺自动抢车位] 已通过主站 SSO 获取游戏会话 Cookie，并已缓存")
         return cookie
+
+    @staticmethod
+    def _probe_reason(state: Any) -> str:
+        """给用户看的那一句短原因（细节看日志）。同样是按响应形态分开的，
+        原来一律叫「游戏接口无响应」，用户看到只知道坏了，不知道坏在哪。"""
+        if state is None:
+            return "state.php 无响应（连不上或超时）"
+        if isinstance(state, str):
+            return ("游戏返回的是登录页 / 风控拦截页（Cookie 没被认下）"
+                    if "<" in state[:400] else "state.php 返回的不是 JSON")
+        if not isinstance(state, dict):
+            return f"state.php 返回类型异常：{type(state).__name__}"
+        return "state.php 返回空内容"
+
+    @staticmethod
+    def _describe_probe(state: Any, probe_err: str = "") -> str:
+        """
+        把 state.php 的失败响应描述成人能一眼判断的样子。
+
+        原来只有一句「游戏接口无响应」，把三种完全不同的失败揉成了一团：
+        连不上（None）、服务端回了登录页或风控页（字符串 / HTML）、
+        回了 JSON 但带 error。看到那句话根本不知道该查网络、查 Cookie 还是查服务端。
+
+        只描述**类型和结构**，不回显取值 —— 正文里可能夹带风控挑战 token，
+        超过 24 位的连续字母数字/下划线/连字符一律替换掉。
+        """
+        if probe_err:
+            return f"请求 state.php 抛异常 {probe_err}"
+        if state is None:
+            return "state.php 无响应（连接失败或超时，客户端拿到 None）"
+        if isinstance(state, str):
+            head = re.sub(r"[A-Za-z0-9_\-]{24,}", "<长串已隐去>",
+                          state[:120].replace("\n", " ").replace("\r", " "))
+            kind = ("疑似 HTML 页面（多半是登录页 / 风控拦截页，"
+                    "说明 Cookie 没被游戏站认下）" if "<" in state[:400]
+                    else "字符串（不是预期的 JSON）")
+            return f"{kind}，共 {len(state)} 字符，开头：{head!r}"
+        if not isinstance(state, dict):
+            return f"state.php 返回类型异常：{type(state).__name__}"
+        if state.get("success"):
+            return "state.php 返回 success=true（这一条不该走到失败分支）"
+        return ("state.php 返回 JSON 但 success 非真："
+                f"error={state.get('error')!r}，"
+                f"顶层键={sorted(state)[:10]}")
 
     @staticmethod
     def _scrape_redirect(resp: Any, base_url: str) -> str:
