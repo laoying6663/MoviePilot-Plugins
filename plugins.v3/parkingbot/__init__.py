@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.3"
+    plugin_version = "1.50.4"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -560,7 +560,11 @@ class ParkingBot(_PluginBase):
         self._auth_warned = False
 
         user_id = state.get("userId")
-        settings_map = state.get("gameSettings") or {}
+        # `or {}` 只挡得住 None / 空容器，挡不住字符串、列表这类真值 ——
+        # 那种情况下紧接着的 .get() 会抛 AttributeError，而 run_once 没有兜底 try，
+        # 整轮挪车/停车/买卖直接作废，用户界面上还什么提示都收不到（连
+        # _set_result 都执行不到）。和下面 userCars 的 isinstance 过滤同一个道理。
+        settings_map = self._settings_of(state)
         # 游戏允许的最短停车时长，低于它的挪车请求会被服务端拒绝
         min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"), 10, minimum=1)
         target_minutes = max(self._park_minutes, min_duration)
@@ -612,7 +616,7 @@ class ParkingBot(_PluginBase):
         def _recompute(state: dict) -> None:
             """按最新状态重算本轮要动的三类车辆与挪车时长门槛。"""
             nonlocal parked, idle, charity, min_duration, target_minutes, recomputed
-            settings_map = state.get("gameSettings") or {}
+            settings_map = self._settings_of(state)
             min_duration = self._to_int(settings_map.get("MIN_PARK_DURATION"),
                                         10, minimum=1)
             target_minutes = max(self._park_minutes, min_duration)
@@ -757,8 +761,8 @@ class ParkingBot(_PluginBase):
         """
         if not self._auto_trade:
             return ""
-        rules = state.get("gameSettings") or {}
-        mine = (state.get("users") or {}).get(user_id) or {}
+        rules = self._settings_of(state)
+        mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
         cash = self._to_int(mine.get("cash"), 0)
         my_cars = [c for c in (state.get("userCars") or [])
@@ -887,7 +891,7 @@ class ParkingBot(_PluginBase):
         if not self._auto_ticket:
             return ""
 
-        rules = state.get("gameSettings") or {}
+        rules = self._settings_of(state)
         min_ticket = self._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
         percent = self._to_int(rules.get("TICKET_OWNER_PERCENT"), 90,
                                 minimum=0, maximum=100)
@@ -999,8 +1003,8 @@ class ParkingBot(_PluginBase):
         """
         if not self._auto_buy:
             return ""
-        rules = state.get("gameSettings") or {}
-        mine = (state.get("users") or {}).get(user_id) or {}
+        rules = self._settings_of(state)
+        mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
         cash = self._to_int(mine.get("cash"), 0)
         max_cars = self._to_int(rules.get("MAX_CARS"), 10, minimum=1)
@@ -1283,6 +1287,32 @@ class ParkingBot(_PluginBase):
         if user_id is not None:
             return cls._owner_bonus_map(st, game_data).get(str(user_id), 0)
         return 0
+
+    @staticmethod
+    def _user_of(state: Any, user_id: Any) -> dict:
+        """
+        从 state.users 里取某个玩家的资料，取不到 / 结构不对一律当「没有」。
+
+        `(state.get("users") or {}).get(x) or {}` 这个写法挡不住 users 是
+        字符串或列表这类真值 —— 紧接着的 .get() 会抛 AttributeError，
+        而这些位置都在**渲染路径和 _record_round 的写入路径**上，没有兜底 try：
+        抛了就是整个插件页 500，或者整轮统计写不进去。
+
+        键类型也不保证（游戏那边 users 是对象，键可能是数字），两种都试一次。
+        """
+        users = state.get("users") if isinstance(state, dict) else None
+        if not isinstance(users, dict):
+            return {}
+        profile = users.get(str(user_id))
+        if profile is None and isinstance(user_id, (str, int, float, bool)):
+            profile = users.get(user_id)
+        return profile if isinstance(profile, dict) else {}
+
+    @staticmethod
+    def _settings_of(state: Any) -> dict:
+        """同上，给 gameSettings 用。返回的一定是字典，调用方可以放心 .get()。"""
+        rules = state.get("gameSettings") if isinstance(state, dict) else None
+        return rules if isinstance(rules, dict) else {}
 
     @staticmethod
     def _lookup_car(cars_map: Dict[Any, dict], car_id: Any) -> Optional[dict]:
@@ -1825,15 +1855,31 @@ class ParkingBot(_PluginBase):
 
         没有 / 解析不出 parkedTimestamp 时才退回 parkedTime，
         保证老接口结构下行为和以前完全一致。
+
+        换算出来的时刻还要过一道**合理性检查**：车辆 12 小时后会被系统清理，
+        所以真实的停入时刻不可能早于 30 天前、更不可能是未来。越界就说明
+        这个字段的**单位**和预期不一样（比如哪个端点给的是秒而不是毫秒）——
+        `fromtimestamp(1.79e9)` 会得到 1970 年，于是「已停时长」显示成几十年，
+        挪车按钮还会直接亮（够「停够时长」了），拿一个错得离谱的时间去覆盖
+        本来可用的 parkedTime 字符串，纯属倒扣分。
         """
         stamp = cls._to_int(holder.get("parkedTimestamp"), 0, minimum=0)
         if stamp > 0:
+            moment = None
             try:
-                return datetime.fromtimestamp(
+                moment = datetime.fromtimestamp(
                     stamp / 1000.0, cls._tz()).replace(tzinfo=None)
             except (OverflowError, OSError, ValueError) as err:
                 # 时间戳离谱（未来时间 / 负数溢出）不该让整页崩，退回字符串
                 logger.debug(f"[不可躺自动抢车位] parkedTimestamp 无法换算：{err}")
+            if moment is not None:
+                # 往回放宽到 30 天、往前往宽到 1 天：真实停放最多 12 小时
+                # （AUTO_REMOVE_HOURS），这个窗口足够宽松，只拦真正的量纲错误。
+                if -1440 < (cls._now_naive() - moment).total_seconds() < 432000:
+                    return moment
+                logger.debug(
+                    f"[不可躺自动抢车位] parkedTimestamp 量纲异常（{stamp}），"
+                    f"换算成 {moment} 明显不合理，改用 parkedTime")
         return cls._parse_time(holder.get("parkedTime"))
 
     def _parked_minutes(self, car: dict) -> float:
@@ -1995,10 +2041,10 @@ class ParkingBot(_PluginBase):
             # 两者互不依赖，并行拉取：各要 1.1 秒，串行就是 2.2 秒。
             # _load_game_context 已经挂过预取的话，这里直接取结果不重发。
             flash, titles, notif_count = await self._take_market_prefetch(client, state)
-            rules = state.get("gameSettings") or {}
+            rules = self._settings_of(state)
             max_earn = self._to_int(rules.get("MAX_EARN_PER_SPOT"), 3000, minimum=1)
             min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
-            mine = (state.get("users") or {}).get(user_id) or {}
+            mine = self._user_of(state, user_id)
             my_cars = [c for c in (state.get("userCars") or [])
                        if isinstance(c, dict) and str(c.get("userId")) == str(user_id)]
             my_spots = [s for s in (state.get("parkingSpots") or [])
@@ -2120,8 +2166,15 @@ class ParkingBot(_PluginBase):
 
             day_key = now.strftime("%Y-%m-%d")
             hour_key = str(now.hour)
-            if self._page_cache is not None:
-                daily = dict(self._page_cache.get("daily") or {})
+            # 判据必须是「**daily 这个键在不在**」，不能是「缓存对象是不是 None」。
+            # _page_cache 可能是残缺的：_record_round 兜底时只装 {"snapshot","history"}，
+            # 而插件刚重载、页面还没渲染过时点一下铃铛，_write_notifications 会装上
+            # 一份只有 {"snapshot"} 的缓存。原来判 `is not None`，于是这份残缺缓存
+            # 让下面拿到空字典，再由 async_save_data("daily", …) 把库里那几十天
+            # 的统计**整份覆盖掉**，而页面上一声不吭。
+            _cached_daily = (self._page_cache or {}).get("daily")
+            if isinstance(_cached_daily, dict):
+                daily = dict(_cached_daily)
             else:
                 stored_daily = await self.async_get_data("daily") or {}
                 daily = dict(stored_daily) if isinstance(stored_daily, dict) else {}
@@ -2150,16 +2203,14 @@ class ParkingBot(_PluginBase):
                 # 买卖/挪车这类操作不写执行历史（否则全是 0 停车 / 0 挪车的噪声行），
                 # 也不该顶掉「执行轮次」——但花费已经并进上面那个桶了。
                 #
-                # 缓存为 None（进程刚起还没打开过详情页）时，历史必须先从库里捞：
-                # 写成空的话，下一轮 run_once 看到缓存非空便拿这份空值整份覆盖回库，
-                # 落盘的 50 条历史会被清空。
+                # 同上：这里也必须按键判断，不能判缓存对象本身。
+                # 写成空的话，下一轮 run_once 看到缓存「有内容」便拿这份空值整份
+                # 覆盖回库，落盘的 50 条历史会被清空。
                 cache = self._page_cache
-                if cache is None:
+                if not isinstance((cache or {}).get("history"), list):
                     stored_h = await self.async_get_data("history") or []
-                    cache = {
-                        "history": list(stored_h) if isinstance(stored_h, list) else [],
-                        "daily": daily,
-                    }
+                    cache = {"history": list(stored_h) if isinstance(stored_h, list) else [],
+                             "daily": daily}
                 else:
                     cache["daily"] = daily
                 cache["snapshot"] = snapshot
@@ -2172,8 +2223,10 @@ class ParkingBot(_PluginBase):
             # 历史在内存里维护一份，避免每轮都读库。但插件重载会把模块重新执行、
             # 类属性复位，此时 _page_cache 为 None；若不先从数据库把历史捞回来，
             # 第一轮就会用「空历史 + 新增一条」覆盖掉落盘的 50 条记录。
-            if self._page_cache is not None:
-                history = list(self._page_cache.get("history") or [])
+            # 同样地，残缺缓存（缺 history 键）也得先从库里捞 —— 见上面 daily 那段。
+            _cached_h = (self._page_cache or {}).get("history")
+            if isinstance(_cached_h, list):
+                history = list(_cached_h)
             else:
                 stored = await self.async_get_data("history") or []
                 history = list(stored) if isinstance(stored, list) else []
@@ -2283,7 +2336,7 @@ class ParkingBot(_PluginBase):
         raw: dict = {}
         holders: List[Any] = [state]
         if isinstance(state, dict) and user_id is not None:
-            holders.append((state.get("users") or {}).get(user_id))
+            holders.append(ParkingBot._user_of(state, user_id))
         for holder in holders:
             if not isinstance(holder, dict):
                 continue
@@ -2800,7 +2853,7 @@ class ParkingBot(_PluginBase):
             return out
 
         definition = cls._lookup_car(cars_map, car.get("carId")) or {}
-        parker = (state.get("users") or {}).get(car.get("userId")) or {}
+        parker = cls._user_of(state, car.get("userId"))
         parked_at = cls._parked_at(spot)
         mins = max(0, int((now - parked_at).total_seconds() / 60)) if parked_at else 0
 
@@ -2855,7 +2908,7 @@ class ParkingBot(_PluginBase):
         car = next((c for c in cars if c.get("id") == car_id), None)
         if not car:
             return "已被占用"
-        owner = (state.get("users") or {}).get(owner_id) or {}
+        owner = ParkingBot._user_of(state, owner_id)
         who = owner.get("name") or "他人"
         if owner_id == spot.get("ownerId"):
             return "我的车辆"
@@ -4056,18 +4109,27 @@ class ParkingBot(_PluginBase):
         保存配置会触发插件重载，重载过程又会重新收集页面与仪表盘投影。
         若投影函数每次都查库，保存就会被数据库往返次数拖住。
         """
-        if self._page_cache is not None:
-            return (self._page_cache.get("snapshot") or {},
-                    self._page_cache.get("history") or [],
-                    self._page_cache.get("daily") or {})
-        snapshot = self.get_data("snapshot") or {}
-        history = self.get_data("history") or []
-        daily = self.get_data("daily") or {}
+        # 逐项判断而不是「缓存对象是不是 None」：_page_cache 可能是残缺的
+        # （只装了 snapshot 那一项）。这里只把**缺的那几项**从库里补齐，
+        # 有缓存的照旧走内存 —— 补齐粒度太粗会让统计页在下一轮之前一直空白。
+        cache = self._page_cache if isinstance(self._page_cache, dict) else {}
+        snapshot = cache.get("snapshot")
+        history = cache.get("history")
+        daily = cache.get("daily")
+        if not isinstance(snapshot, dict) or not isinstance(history, list) \
+                or not isinstance(daily, dict):
+            stored_h = self.get_data("history") or []
+            stored_d = self.get_data("daily") or {}
+            if not isinstance(history, list):
+                history = stored_h if isinstance(stored_h, list) else []
+            if not isinstance(daily, dict):
+                daily = stored_d if isinstance(stored_d, dict) else {}
         # 存档被写坏时（比如历史升级后结构变了）不能让整个详情页崩成 500，
         # 退化成空数据即可，页面仍能看到框架和区块。
         if not isinstance(snapshot, dict):
+            stored_s = self.get_data("snapshot")
+            snapshot = stored_s if isinstance(stored_s, dict) else {}
             logger.warning("[不可躺自动抢车位] 账户快照格式异常，已按空数据展示")
-            snapshot = {}
         if not isinstance(history, list):
             history = []
         if not isinstance(daily, dict):
@@ -4333,11 +4395,11 @@ class ParkingBot(_PluginBase):
             self._reply_data(sender, "❌ 获取状态失败", err)
             return
         user_id = state.get("userId")
-        rules = state.get("gameSettings") or {}
+        rules = self._settings_of(state)
         min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
         target = max(self._park_minutes, min_duration)
         ordered = self._ordered_my_cars(state, cars_map)
-        mine = (state.get("users") or {}).get(user_id) or {}
+        mine = self._user_of(state, user_id)
         cash = self._to_int(mine.get("cash"), 0)
         max_cars = self._to_int(rules.get("MAX_CARS"), 10, minimum=1)
 
@@ -4827,7 +4889,7 @@ class ParkingBot(_PluginBase):
         if str(car.get("userId")) == str(user_id):
             return _result({"success": False, "error": "自己停的车不用贴条"})
 
-        rules = state.get("gameSettings") or {}
+        rules = self._settings_of(state)
         min_ticket = self._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
         parked_at = self._parked_at(spot)
         mins = max(0, int((self._now_naive() - parked_at).total_seconds() / 60)) \
@@ -5150,7 +5212,7 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": "车型不存在"})
 
         user_id = state.get("userId")
-        mine = (state.get("users") or {}).get(user_id) or {}
+        mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
         cash = self._to_int(mine.get("cash"), 0)
         price = self._to_int(definition.get("price"), 0, minimum=0)
@@ -5162,7 +5224,7 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": f"金币不足，还差 {price - cash} 金"})
         owned = sum(1 for c in (state.get("userCars") or [])
                     if str(c.get("userId")) == str(user_id))
-        max_cars = self._to_int((state.get("gameSettings") or {}).get("MAX_CARS"), 10, minimum=1)
+        max_cars = self._to_int(self._settings_of(state).get("MAX_CARS"), 10, minimum=1)
         if owned >= max_cars:
             return _result({"success": False, "error": f"车辆已满（上限 {max_cars} 辆）"})
 
@@ -5228,7 +5290,7 @@ class ParkingBot(_PluginBase):
 
         if diff <= 0:
             return _result({"success": False, "error": "只能换更贵的车"})
-        mine = (state.get("users") or {}).get(user_id) or {}
+        mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
         cash = self._to_int(mine.get("cash"), 0)
         need_level = self._to_int(new_def.get("levelReq"), 1, minimum=1)
@@ -5272,7 +5334,7 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": "特卖场次不存在或已结束"})
 
         user_id = state.get("userId")
-        mine = (state.get("users") or {}).get(user_id) or {}
+        mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
         cash = self._to_int(mine.get("cash"), 0)
         if sale.get("level", 1) > level:
@@ -5281,7 +5343,7 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": f"金币不足，还差 {sale.get('price', 0) - cash} 金"})
         owned = sum(1 for c in (state.get("userCars") or [])
                     if str(c.get("userId")) == str(user_id))
-        max_cars = self._to_int((state.get("gameSettings") or {}).get("MAX_CARS"), 10, minimum=1)
+        max_cars = self._to_int(self._settings_of(state).get("MAX_CARS"), 10, minimum=1)
         if owned >= max_cars:
             return _result({"success": False, "error": f"车辆已满（上限 {max_cars} 辆）"})
 
@@ -5335,7 +5397,7 @@ class ParkingBot(_PluginBase):
         if car.get("status") == "idle":
             return _result({"success": False, "error": "该车辆当前不在停车中"})
 
-        rules = state.get("gameSettings") or {}
+        rules = self._settings_of(state)
         min_duration = self._to_int(rules.get("MIN_PARK_DURATION"), 10, minimum=1)
         minutes = self._parked_minutes(car)
         if minutes < min_duration:
