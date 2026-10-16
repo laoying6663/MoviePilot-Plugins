@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.1"
+    plugin_version = "1.50.2"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -1573,14 +1573,39 @@ class ParkingBot(_PluginBase):
             })
         return rows
 
+    @staticmethod
+    def _has_tz_offset(text: Any) -> bool:
+        """
+        时间串里有没有带时区偏移（结尾的 Z / +08:00 / +0800 / -05:00 …）。
+
+        判断依据是**原始字符串**，不是解析后的 datetime —— 解析后的对象已经被
+        统一成「MoviePilot 本地时间且无 tzinfo」，区分不出「本来就带偏移」和
+        「本来没带、我们当本地解释了」这两种来源。
+        """
+        t = str(text or "").strip()
+        if not t:
+            return False
+        if t.endswith(("Z", "z")):
+            return True
+        return bool(re.search(r"[+-]\d{2}:?\d{2}$", t))
+
     @classmethod
     def _notif_time(cls, raw: Any) -> str:
         """
         相对时间，口径照抄游戏前端的 _fmtTime：刚刚 / N分钟前 / N小时前 /
         N天前 / 更早就显示具体日期。
 
-        解析不了就原样返回，不显示「未知」——通知时间是后端给的，
-        猜不出来的时候如实显示比编一个占位强。
+        **notifications.php 的 created_at 是 UTC，不是本地时间**（实测）：
+        本地 22:56 跑的那一轮，接口下发的是 `"2026-10-16 14:56:11"`，
+        正好差 8 小时。而 state.php 的 parkedTime 是本地时间 ——
+        游戏服务端两个端点口径不一致，只能在各自消费的地方各自处理。
+
+        `_parse_time` 把**无偏移字符串一律当本地时间**（这是对的，
+        parkedTime 依赖它），直接拿它的结果去减会整块偏 8 小时：
+        面板把「刚刚」显示成「8小时前」，还完全不自知。
+
+        所以这里：原始串自带偏移的照旧（`_parse_time` 已经换算过）；
+        不带偏移的按 UTC 解释，再换算到 MoviePilot 时区。
         """
         text = str(raw or "").strip()
         if not text:
@@ -1588,6 +1613,9 @@ class ParkingBot(_PluginBase):
         when = cls._parse_time(text)
         if when is None:
             return text
+        if not cls._has_tz_offset(text):
+            when = when.replace(tzinfo=pytz.utc).astimezone(
+                cls._tz()).replace(tzinfo=None)
         minutes = int((cls._now_naive() - when).total_seconds() // 60)
         if minutes < 1:
             return "刚刚"
