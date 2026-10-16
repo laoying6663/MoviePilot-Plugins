@@ -112,6 +112,19 @@ class ShopFilterRequest(BaseModel):
     category: str = Field(default="", description="只看该分类；留空表示看全部车型")
 
 
+class ShopAffordRequest(BaseModel):
+    """车市「只看可买」开关的请求体。传的是**目标状态**而不是「切换」。"""
+
+    on: bool = Field(default=False, description="True=只看等级够且现金买得起的车型")
+
+
+class ShopSortRequest(BaseModel):
+    """车市排序档位的请求体。"""
+
+    sort: str = Field(default="ratio",
+                      description="排序档位：ratio 性价比 / price 价格 / earn 收益")
+
+
 class TradePickRequest(BaseModel):
     """车市卡片「以旧换新」按钮的请求体：先选旧车，再确认换。"""
 
@@ -275,7 +288,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.51.0"
+    plugin_version = "1.51.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -322,6 +335,14 @@ class ParkingBot(_PluginBase):
     # 必须给类级默认值 —— 详情页渲染可能在 __init_plugin_config__ 之前被调用。
     _cat = ""
     _trade_for = ""
+    # 车市页的「只看可买」和排序。**刻意不进存档**：用户要求每次打开恢复全部，
+    # 而且这两个只是看一眼行情的临时开关，记住反而会让人「忘了自己开着筛选」
+    # 而漏看车型。想恢复默认点一下就行，不需要多记一份状态。
+    _shop_afford = False
+    _shop_sort = "ratio"
+    # 车市可用的排序档位。ratio = 收益÷价格（性价比），默认按这个排。
+    _SHOP_SORTS = (("ratio", "性价比"), ("price", "价格低→高"),
+                   ("earn", "收益高→低"))
     # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
     # 切页签回来还在，和 _cat / _trade_for 一个套路。
     _title_open = False
@@ -449,6 +470,10 @@ class ParkingBot(_PluginBase):
         # 分类直接取快照里真实存在的分类名，不认任何外部输入。
         self._cat = str(saved_view.get("cat") or "").strip()
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
+        # 车市的「只看可买」/ 排序不进存档，每次打开恢复默认（理由见类属性注释）
+        # 车市的「只看可买」/ 排序不进存档，每次打开恢复默认（理由见类属性注释）
+        self._shop_afford = False
+        self._shop_sort = "ratio"
         self._title_open = bool(saved_view.get("title_open"))
         # 经验值 / 通知两个面板**故意不从存档读回**（v1.48.0）：
         # 用户要求每次打开插件页面默认都是收着的。这两个是「看一眼就走」的
@@ -2527,7 +2552,14 @@ class ParkingBot(_PluginBase):
                 break
         if not raw:
             return {}
-        today = cls._now_naive().strftime("%Y-%m-%d")
+        # ★键尾的日期必须用 **UTC**，不能跟 _now_naive()。
+        # 游戏那边拼键的是 `new Date().toISOString().split('T')[0]`，
+        # 而 toISOString() 返回的永远是 UTC —— 服务端写进去的键尾是 UTC 日期。
+        # 北京时间 00:00~08:00 之间，UTC 还是「昨天」，按本地日期去拼键
+        # 一个都匹配不上，整个「今日经验」直接变成空的（页面上七行全是「—/上限」）。
+        # 白天 08:00 之后两者相同，所以这个 bug 只在夜里犯，很容易被当成「偶尔抽风」。
+        # 面板要和游戏显示同一批数字，就得跟着游戏用 UTC。
+        today = datetime.now(pytz.utc).strftime("%Y-%m-%d")
         known = {key for key, _label, _fb in cls._EXP_SOURCES}
         prefix = f"{user_id}_" if user_id is not None else ""
         tail = f"_{today}"
@@ -2735,7 +2767,7 @@ class ParkingBot(_PluginBase):
             limit = cls._to_int(cfg.get(key), 0, minimum=0)
             if limit <= 0:
                 continue
-            got = cls._to_int(daily.get(key), 0) if key in daily else None
+            got = cls._to_int(daily.get(key), 0) if daily else None
             if got is not None:
                 got_total += got
             pct = int(round(got / limit * 100)) if (got is not None and limit > 0) else 0
@@ -2745,9 +2777,14 @@ class ParkingBot(_PluginBase):
                 "content": [
                     cls._text(label, {"fontSize": "12px",
                                       "color": "rgba(255,255,255,0.92)"}),
-                    # 缺这一项时显示「—/上限」而不是光一个「—」：
-                    # 游戏那边恒显示「已得/上限」，光显示「—」等于把上限也吞了，
-                    # 用户连「一天最多能拿多少」都看不到。
+                    # 「今天这一项一次都没拿」显示 0，和游戏那边一致
+                    # （游戏是 `dailyExp[key] || 0`，键不存在也当 0）。
+                    #
+                    # 只有整个 dailyExp 压根没拿到（接口失败 / 结构变了）才显示
+                    # 「—/上限」：那时候显示 0 等于撒谎说「你今天一分没拿」。
+                    # 两者别搞混 —— 这正是上面那个 UTC 键尾 bug 的表现：
+                    # 键没匹配上时 daily 本身是空的，七行会**全部**变成「—」，
+                    # 那不是「今天没进度」，是「今天的数据没读到」。
                     cls._text((f"—/{ParkingBot._fmt_num(limit)}" if got is None
                                else f"{ParkingBot._fmt_num(got)}"
                                     f"/{ParkingBot._fmt_num(limit)}"),
@@ -4780,6 +4817,24 @@ class ParkingBot(_PluginBase):
                 "description": "记录车市页当前选中的车型分类；分类名必须来自车型表，不认外部输入",
             },
             {
+                "path": "/shop_afford",
+                "endpoint": self.api_shop_afford,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "车市只看可买开关",
+                "response_model": ApiResult,
+                "description": "只看等级够得着且现金买得起的车型；不落盘，每次打开恢复全部",
+            },
+            {
+                "path": "/shop_sort",
+                "endpoint": self.api_shop_sort,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "车市排序档位",
+                "response_model": ApiResult,
+                "description": "按性价比 / 价格 / 收益排序；不落盘，每次打开恢复默认",
+            },
+            {
                 "path": "/trade_pick",
                 "endpoint": self.api_trade_pick,
                 "methods": ["POST"],
@@ -5415,6 +5470,25 @@ class ParkingBot(_PluginBase):
         self._cat = category
         await self._save_view({"cat": category})
         return _result({"success": True, "category": category or "全部"})
+
+    async def api_shop_afford(self, request: ShopAffordRequest) -> ApiResult:
+        """
+        车市「只看可买」开关。
+
+        **不落盘**：用户要求每次打开车市都恢复全部车型 —— 记住筛选状态
+        反而容易让人忘了自己开着筛选而漏看车型。
+        """
+        self._shop_afford = bool(getattr(request, "on", False))
+        return _result({"success": True, "afford": self._shop_afford})
+
+    async def api_shop_sort(self, request: ShopSortRequest) -> ApiResult:
+        """车市排序档位。同样不落盘。"""
+        key = str(getattr(request, "sort", "") or "").strip()
+        if key not in dict(self._SHOP_SORTS):
+            return _result({"success": False,
+                            "error": f"未知排序：{key or '空'}"})
+        self._shop_sort = key
+        return _result({"success": True, "sort": key})
 
     async def api_trade_pick(self, request: TradePickRequest) -> ApiResult:
         """
@@ -6157,6 +6231,55 @@ class ParkingBot(_PluginBase):
             "content": pills,
         }
 
+    def _shop_filter_row(self, afford_api: str, sort_api: str,
+                        sort_label: str) -> dict:
+        """
+        车市第二排工具条：「只看可买」开关 + 排序档位。
+
+        和上面那排分类胶囊是同一套机制 —— 页面上只有 events.click 能用，
+        所以「搜索框」在这个页面上根本没法做（输入没有事件能触发），
+        能做的只有这种点一下就整页重渲染的筛选/排序开关。
+
+        两个状态都**不落盘**：用户明确要求每次打开恢复全部。
+        """
+        def _pill(label, active, api, params, accent=_SHOP_LOCK):
+            return {
+                "component": "div",
+                "props": {"style": {
+                    "flex": "0 0 auto",
+                    "padding": "5px 12px",
+                    "borderRadius": "13px",
+                    "fontSize": "12px",
+                    "whiteSpace": "nowrap",
+                    "cursor": "pointer",
+                    "userSelect": "none",
+                    "color": "#FFFFFF" if active else "#CCCCCC",
+                    "backgroundColor": (
+                        "rgba(255,215,0,0.28)" if active
+                        else "rgba(255,255,255,0.08)"),
+                    "border": (f"1px solid {accent}" if active
+                               else "1px solid rgba(255,255,255,0.15)"),
+                }},
+                "content": [ParkingBot._text(label, {})],
+                "events": {"click": {"api": api, "method": "post",
+                                     "params": params}},
+            }
+
+        pills = [_pill(
+            "✓ 只看可买" if self._shop_afford else "只看可买",
+            self._shop_afford, afford_api,
+            {"on": not self._shop_afford})]
+        for key, label in self._SHOP_SORTS:
+            pills.append(_pill(
+                f"排序：{label}", key == self._shop_sort, sort_api,
+                {"sort": key}, accent=_GOLD))
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "flexWrap": "wrap", "gap": "8px",
+                                "marginBottom": "12px"}},
+            "content": pills,
+        }
+
     @staticmethod
     def _grid(items: List[dict]) -> dict:
         """车市卡片排布。游戏是两列栅格，这里用可换行的 flex 近似。"""
@@ -6327,6 +6450,32 @@ class ParkingBot(_PluginBase):
             "旧车必须是空闲车，且要换成更贵的车型；金币不够的那辆按钮会置灰",
             content, accent=_GOLD)
 
+    @classmethod
+    def _shop_sort_key(cls, mode: str):
+        """
+        车市排序键。
+
+        默认「性价比」= 每分钟收益 ÷ 价格 —— 同样一笔钱能买到多少收益，
+        这是买车时唯一真正要比较的量。只按价格排会把一堆便宜的老车顶到最前面，
+        只按收益排又会全是不买得起的豪车。
+
+        价格 0 的条目（游戏的初始车）不能直接除：分母兜成 1 会让它算出
+        「每分钟白赚 5 金」，性价比直接冲到榜首都 —— 而它压根买不了。
+        所以先用一个 0/1 把买不了的甩到最后，再按比值排。
+        """
+        if mode == "price":
+            return lambda c: (cls._to_int(c.get("price"), 0),
+                              -cls._to_int(c.get("earn"), 0))
+        if mode == "earn":
+            return lambda c: (-cls._to_int(c.get("earn"), 0),
+                              cls._to_int(c.get("price"), 0))
+        # ratio（默认）：买不了的排最后；然后性价比降序，比值相同则便宜的排前面
+        return lambda c: (
+            0 if cls._to_int(c.get("price"), 0) > 0 else 1,
+            -(cls._to_int(c.get("earn"), 0)
+              / cls._to_int(c.get("price"), 0)) if cls._to_int(c.get("price"), 0) > 0 else 0,
+            cls._to_int(c.get("price"), 0))
+
     def _build_shop(self, snapshot: dict) -> List[dict]:
         """
         构建车市区块：选旧车面板 → 限时特卖 → 分类胶囊 + 车型卡片。
@@ -6349,6 +6498,8 @@ class ParkingBot(_PluginBase):
         flash_api = f"plugin/{pid}/buy_flash"
         pick_api = f"plugin/{pid}/trade_pick"
         filter_api = f"plugin/{pid}/shop_filter"
+        afford_api = f"plugin/{pid}/shop_afford"
+        sort_api = f"plugin/{pid}/shop_sort"
 
         price_by_id = {str(c.get("id")): self._to_int(c.get("price"), 0) for c in catalog}
         idle_cars = [c for c in cars if c.get("status") == "空闲"]
@@ -6419,6 +6570,17 @@ class ParkingBot(_PluginBase):
                        if not current or str(c.get("category") or "") == current]
             if not visible:
                 visible = catalog
+            # 「只看可买」：等级够得着**且**现金买得起，两条一起才算。
+            # 分开做两个开关反而更难用 —— 用户真正要的是「点进去就能买」的那一批。
+            if self._shop_afford:
+                _aff = [c for c in visible
+                        if self._to_int(c.get("level"), 1, minimum=1) <= level
+                        and self._to_int(c.get("price"), 0) <= cash]
+                # 一辆都筛不出来时保留原列表：空白的车市页比全量列表更没用，
+                # 底部会写明「当前条件下没有可买的车型」。
+                if _aff:
+                    visible = _aff
+            visible = sorted(visible, key=self._shop_sort_key(self._shop_sort))
             items = []
             for car in visible:
                 price = self._to_int(car.get("price"), 0)
@@ -6464,11 +6626,23 @@ class ParkingBot(_PluginBase):
                 items.append(self._item(
                     str(car.get("name", "未知车型")), lines, actions,
                     image=car.get("image") or "", locked=locked))
+            _n_aff = sum(1 for c in catalog
+                         if self._to_int(c.get("level"), 1, minimum=1) <= level
+                         and self._to_int(c.get("price"), 0) <= cash)
+            _sort_label = dict(self._SHOP_SORTS).get(self._shop_sort, "性价比")
+            _sub = (f"当前金币 {ParkingBot._fmt_num(cash)}，车辆 {owned_count}/{car_max} 辆；"
+                    f"按钮直接扣金币，可用性在后端还会再校验一次。")
+            if self._shop_afford:
+                _sub += (f" 当前按「只看可买」过滤：等级够 + 现金够的 "
+                         f"{_n_aff} 辆（现在列的是 {len(visible)} 辆）。")
+                if _n_aff == 0:
+                    _sub += " 你的等级或金币目前买不起任何一辆。"
             blocks.append(self._card(
                 "车市",
-                f"当前金币 {ParkingBot._fmt_num(cash)}，车辆 {owned_count}/{car_max} 辆；"
-                f"按钮直接扣金币，可用性在后端还会再校验一次",
-                [self._cat_pills(categories, current, filter_api), self._grid(items)], accent=_GOLD,
+                _sub,
+                [self._cat_pills(categories, current, filter_api),
+                 self._shop_filter_row(afford_api, sort_api, _sort_label),
+                 self._grid(items)], accent=_GOLD,
             ))
         # 车型表拿不到（game_data.php 失败）时上面两段都不会产出。
         # 仍然要给出这张卡：车市页需要一个兜底标题，否则切到车市会是一片空白。
