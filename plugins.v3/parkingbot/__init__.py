@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.49.0"
+    plugin_version = "1.50.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -394,6 +394,13 @@ class ParkingBot(_PluginBase):
     # 注释写明「并行执行，但每个之间间隔 200ms 避免过于密集」。
     # 单请求约 1.1 秒，所以 5 张从串行的 5.5 秒降到约 1.9 秒。
     _TICKET_STAGGER = 0.2
+    # 同一个车位主人名下最多停我几辆车。
+    # 场景加成（game_data.parkingBackgrounds 的 bonusPercent，最高的沙滩/牛来是 5%）
+    # 会让停车目标天然往少数几个买了场景的玩家身上挤。纯按加成排序的话，
+    # 名下 10 辆车可能全部停在同一个人那儿 —— 对方一眼就能看到「他所有车都在我这儿」，
+    # 批量驱离和举报都不用挑目标。这条上限就是为挡住这个：吃加成，但别把
+    # 所有车押在一个人身上。剩下的名额自然分给下一个高加成的人。
+    _PARK_MAX_PER_OWNER = 2
     # 默认值必须写在类上：run_once 里会直接读 self._auto_ticket，
     # 而插件实例并非任何时刻都保证刚跑过 init_plugin（热重载中间态、
     # 派生实例等），缺属性会 AttributeError 让整轮作废。默认关，最保守。
@@ -714,6 +721,7 @@ class ParkingBot(_PluginBase):
         new_parked = await self._park_idle_cars(
             client, idle, self._dict_rows(state.get("parkingSpots")), user_id,
             max(0, self._max_cars - still_parked),
+            state,
         )
         if new_parked:
             # 刚停出去的车在服务端已占位，这份 state 里还显示着「空闲」
@@ -1066,12 +1074,25 @@ class ParkingBot(_PluginBase):
         parking_spots: List[dict],
         user_id: Any,
         capacity: int,
+        state: Optional[dict] = None,
     ) -> int:
         """
         把空闲车辆停到他人空闲的私家车位。
 
-        车辆按每分钟收益从高到低出队，优先用收益高的车；目标车位在候选集中随机挑选，
-        避免所有车辆长期压在同一个车位主人身上而被针对。
+        车辆按每分钟收益从高到低出队，优先用收益高的车。
+
+        车位选择是**加成分层优先 + 每主人限额的混合**：
+        - 先按场景加成从高到低排（游戏规则：最终收益 = 基础收益 x (1 + 加成%)，
+          加成属于**车位**，所以停进 5% 的车位自己收益多 5%）；
+        - 同一加成档内保持随机 —— sort 是稳定的，所以先 shuffle 再按加成排序，
+          档内就是原来的随机顺序，原先「避免所有车长期压在同一个人身上」的意图还在；
+        - 再加一道每个车位主人最多 _PARK_MAX_PER_OWNER 辆的硬上限。
+          光靠前两条挡不住这个：5% 场景要 5000 金币，全服买的人可能就那么两三个，
+          10 辆车全压过去反而把「被针对」的风险顶满。撞上限的车位直接跳过，
+          名额让给下一个高加成的人。
+
+        场景加成拿不到时（game_data 没缓存 / 停车收益）一律按 0 处理，
+        排序退化成全随机，和这个功能上线之前的行为完全一致。
         """
         if capacity <= 0 or not idle:
             return 0
@@ -1085,16 +1106,36 @@ class ParkingBot(_PluginBase):
         if not targets:
             logger.info("[不可躺自动抢车位] 当前没有可停的他人空余私家车位")
             return 0
+
+        owner_bonus = self._owner_bonus_map(state, self._game_data)
+        # 先随机再按加成排序：稳定排序保证「加成档内随机、档间高者优先」。
         random.shuffle(targets)
+        targets.sort(key=lambda s: owner_bonus.get(str(s.get("ownerId")), 0),
+                     reverse=True)
 
         cars_map = await self._load_cars_map(client)
         idle.sort(key=lambda c: self._earn_per_min(c, cars_map), reverse=True)
 
         new_parked = 0
+        per_owner: Dict[str, int] = {}
         for car in idle:
             if new_parked >= capacity or not targets:
                 break
-            spot = targets.pop(0)
+            # 撞上限的车位要**就地跳过、拿同一辆车去试下一个车位**。
+            # 直接 continue 换下一辆车会白丢车：候选里前几个正好是同一个停满的
+            # 主人时，这辆车就没机会停进后面那些还有空位的车位了。
+            spot = None
+            owner_key = ""
+            while targets:
+                cand = targets.pop(0)
+                cand_owner = str(cand.get("ownerId"))
+                if per_owner.get(cand_owner, 0) >= self._PARK_MAX_PER_OWNER:
+                    continue
+                spot, owner_key = cand, cand_owner
+                break
+            if spot is None:
+                # 剩下的候选全被上限挡完了，这辆车和后面的都停不进去
+                break
             result = await self._post(client, "park.php", {
                 "userCarId": car.get("id"),
                 "spotId": spot.get("id"),
@@ -1102,9 +1143,11 @@ class ParkingBot(_PluginBase):
             if not result or not result.get("success"):
                 logger.warning(f"[不可躺自动抢车位] 停车失败：{(result or {}).get('error') or '未知原因'}")
                 continue
+            per_owner[owner_key] = per_owner.get(owner_key, 0) + 1
             new_parked += 1
             logger.info(
-                f"[不可躺自动抢车位] 车辆 {car.get('id')} 已停入车位 {spot.get('id')}，"
+                f"[不可躺自动抢车位] 车辆 {car.get('id')} 已停入车位 {spot.get('id')}"
+                f"（车主 {owner_key}，场景加成 +{owner_bonus.get(owner_key, 0)}%），"
                 f"收益 {self._earn_per_min(car, cars_map)} 金/分钟"
             )
         return new_parked
@@ -1157,6 +1200,64 @@ class ParkingBot(_PluginBase):
             self._cars_cache = cars
             self._cars_cache_at = time.monotonic()
         return self._cars_cache or {}
+
+    @staticmethod
+    def _bg_bonus_map(game_data: Optional[dict]) -> Dict[str, int]:
+        """
+        场景 id → 停车收益加成百分比。
+
+        游戏规则原文：「最终收益 = 基础收益 + 基础收益 x 加成百分比。例如加成 20%，
+        基础收益 100 金，则实际获得 120 金。」—— 也就是说**封顶先算、加成后乘**，
+        单车位上限 3000 在 5% 车位上实际是 3150。
+
+        数据在 game_data.php 的 parkingBackgrounds 里，和车型表同一份响应
+        （_load_cars_map 已经把整份存进 _game_data），不额外发请求。
+        拿不到就返回空表，后面一律按 0 处理，等于退回改动前的纯随机选车位。
+
+        这里刻意做成**接收 game_data 的静态方法**而不是读 self._game_data 的
+        classmethod：_game_data 是实例属性（类上只有 None 的默认值），
+        用 cls._game_data 读永远拿到 None，场景表会恒为空 —— 功能静默失效，
+        不报任何错。
+        """
+        out: Dict[str, int] = {}
+        for item in (game_data or {}).get("parkingBackgrounds") or []:
+            if not isinstance(item, dict):
+                continue
+            bg_id = item.get("id")
+            if bg_id is None:
+                continue
+            out[str(bg_id)] = ParkingBot._to_int(item.get("bonusPercent"), 0,
+                                                  minimum=0)
+        return out
+
+    @classmethod
+    def _owner_bonus_map(cls, state: Optional[dict],
+                         game_data: Optional[dict] = None) -> Dict[str, int]:
+        """
+        玩家 id（统一按字符串）→ 他名下车位的收益加成百分比。
+
+        场景的 currentBg 在 **state.php 的 users 里**，每个玩家一条
+        （游戏前端画 🔥 时读的就是 users[id].currentBg，见 js/modules/parking.js）。
+
+        users 的键类型不保证 —— 游戏那边是对象，键可能是数字，而车位上的
+        ownerId 是另一套类型。所以两种都登记一遍：dict 的键，以及资料自身的 id。
+        只认其中一种的话，很可能整张表全查不到、加成静默变成 0，
+        表现为「功能好像没生效」却没有任何报错。
+        """
+        bonus_map = cls._bg_bonus_map(game_data)
+        users = (state or {}).get("users")
+        out: Dict[str, int] = {}
+        if not isinstance(users, dict):
+            return out
+        for uid, profile in users.items():
+            if not isinstance(profile, dict):
+                continue
+            pct = bonus_map.get(str(profile.get("currentBg") or ""), 0)
+            out[str(uid)] = pct
+            pid = profile.get("id")
+            if pid is not None:
+                out.setdefault(str(pid), pct)
+        return out
 
     @staticmethod
     def _lookup_car(cars_map: Dict[Any, dict], car_id: Any) -> Optional[dict]:
@@ -1894,6 +1995,12 @@ class ParkingBot(_PluginBase):
                 "title_name": str(mine.get("currentTitleName") or ""),
                 "title_color": str(titles.get("color") or _GOLD),
                 "titles": titles["owned"],
+                # 我自己车位的场景加成。currentBg 在 state.users[我的 id] 上，
+                # 加成百分比在 game_data.parkingBackgrounds 里 —— 和停车挑车位
+                # 用的是同一套查表（_owner_bonus_map）。取不到就是 0，标题旁
+                # 什么都不显示。
+                "spot_bonus_pct": self._owner_bonus_map(
+                    state, self._game_data).get(str(user_id), 0),
                 "cars": cars,
                 "spots": spots,
                 # 他人空余私家车位数。车库页的「立即停到他人车位」按钮靠它决定
@@ -3010,7 +3117,7 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _card(title: str, subtitle: str, content: List[dict],
-              accent: str = _CYAN) -> dict:
+              accent: str = _CYAN, badges: Optional[List[dict]] = None) -> dict:
         """
         统一的信息卡片外壳。
 
@@ -3023,6 +3130,9 @@ class ParkingBot(_PluginBase):
         「8px 圆点 + 8px 间隔」这 16px，副标题也跟着缩进同样距离，两行左缘对齐。
         内距从「14 14 4」改成四边等距 16px —— 原来的底距比其它三边少 10px，
         卡片底部看着总是贴得太紧。
+
+        badges 挂在标题文字后面那一行的右端（``marginLeft: auto`` 顶到右边），
+        用来放「我的车位 收益+5%」这种状态标。不给就不渲染，布局和以前一样。
         """
         head: List[dict] = []
         if title:
@@ -3038,6 +3148,10 @@ class ParkingBot(_PluginBase):
                     ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "700",
                                              "color": "rgba(255,255,255,0.92)",
                                              "letterSpacing": "0.3px"}),
+                    # 状态标顶到标题行右端。flex 行里放第三个子项是可以的
+                    # （横排有富余宽度时不会像「来源行塞进度条」那样被压没），
+                    # 但它自带 marginLeft:auto，窄屏时也会先让给标题而不是被挤扁。
+                    *(badges or []),
                 ],
             })
         if subtitle:
@@ -3595,6 +3709,28 @@ class ParkingBot(_PluginBase):
                 "props": {"style": {"display": "flex", "flexDirection": "column",
                                     "alignItems": "center"}},
                 "content": [fine, btn, hint]}
+
+    @classmethod
+    def _spot_bonus_badges(cls, snapshot: dict) -> List[dict]:
+        """
+        「我的车位」标题右端的状态标：我这个车位的场景收益加成。
+
+        抄游戏网页版的画法（js/modules/parking.js 的 myBonusHint + 每个车位上的
+        bonus-torch）：标题旁写 `收益+N%`，金色。没换场景（加成 0）就**不画** ——
+        游戏那边也是 myBonusPct > 0 才显示，没加成的停车场挂一个「收益+0%」纯属噪音。
+
+        这个加成的作用是：别人把车停进我的车位时，他每分钟多拿 N%。
+        所以它是「我这个车位对别人有没有吸引力」的指标 —— 页面把它挂在
+        标题上，用户一眼就能看出自己的车位在别人眼里值多少。
+        """
+        pct = cls._to_int((snapshot or {}).get("spot_bonus_pct"), 0, minimum=0)
+        if pct <= 0:
+            return []
+        badge = cls._badge(f"收益+{pct}%", _GOLD)
+        # marginLeft:auto —— _badge 是通用徽章不带定位，这里在标题那一行的
+        # flex 容器里把它顶到右端（贴着卡片右内边距）。
+        badge["props"]["style"]["marginLeft"] = "auto"
+        return [badge]
 
     @staticmethod
     def _spot_grid(spots: List[dict], api: str, charity_api: str = "") -> dict:
@@ -6240,7 +6376,9 @@ class ParkingBot(_PluginBase):
                 "我的车位",
                 "私家车位被别人的车停够规定时长后可以贴条，罚款按停车收益分成给自己",
                 [self._spot_grid(self._dict_rows(snapshot.get("spots")), ticket_api,
-                                 charity_api)], accent=_CYAN), howto_card]
+                                 charity_api)],
+                accent=_CYAN,
+                badges=self._spot_bonus_badges(snapshot)), howto_card]
         elif tab == "shop":
             sections = self._build_shop(snapshot)
         elif tab == "garage":
