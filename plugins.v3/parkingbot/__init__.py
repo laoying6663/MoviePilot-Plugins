@@ -275,7 +275,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.50.2"
+    plugin_version = "1.50.3"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -916,7 +916,7 @@ class ParkingBot(_PluginBase):
             # 自己停自己车位上的车不贴
             if str(car.get("userId")) == str(user_id):
                 continue
-            parked_at = self._parse_time(spot.get("parkedTime"))
+            parked_at = self._parked_at(spot)
             mins = max(0, int((self._now_naive() - parked_at).total_seconds() / 60)) \
                 if parked_at else 0
             if mins < min_ticket:
@@ -1807,13 +1807,42 @@ class ParkingBot(_PluginBase):
                 jar[name] = value
         return jar
 
+    @classmethod
+    def _parked_at(cls, holder: dict) -> Optional[datetime]:
+        """
+        取「停入时刻」，车辆和车位都走这一个入口。
+
+        **优先用 parkedTimestamp（epoch 毫秒）** —— 游戏前端自己就是这么算的：
+        - 车：`uc.parkedTimestamp || new Date(uc.parkedTime).getTime()`
+          （js/modules/render.js、parking.js 共用这个写法）
+        - 车位：`spot.parkedTimestamp ? Math.floor((self.now() - spot.parkedTimestamp) / 60000) : 0`
+          —— 车位那边**根本不用 parkedTime**
+
+        它是绝对时刻，不受服务端时区配置影响。而 `parkedTime` 只是个字符串，
+        时区口径得靠猜：同一个游戏站的 `notifications.php` 的 `created_at`
+        是 UTC，`state.php` 的 `parkedTime` 却是本地（v1.50.2 刚踩过这个）。
+        既然游戏自己给了绝对时间戳，就没道理去猜字符串。
+
+        没有 / 解析不出 parkedTimestamp 时才退回 parkedTime，
+        保证老接口结构下行为和以前完全一致。
+        """
+        stamp = cls._to_int(holder.get("parkedTimestamp"), 0, minimum=0)
+        if stamp > 0:
+            try:
+                return datetime.fromtimestamp(
+                    stamp / 1000.0, cls._tz()).replace(tzinfo=None)
+            except (OverflowError, OSError, ValueError) as err:
+                # 时间戳离谱（未来时间 / 负数溢出）不该让整页崩，退回字符串
+                logger.debug(f"[不可躺自动抢车位] parkedTimestamp 无法换算：{err}")
+        return cls._parse_time(holder.get("parkedTime"))
+
     def _parked_minutes(self, car: dict) -> float:
         """
         计算车辆已停放的分钟数。
 
         时间无法解析时返回 0 —— 宁可多停一轮，也不发出必然被服务端拒绝的挪车请求。
         """
-        moment = self._parse_time(car.get("parkedTime"))
+        moment = self._parked_at(car)
         if moment is None:
             return 0.0
         return max(0.0, (self._now_naive() - moment).total_seconds() / 60)
@@ -1979,7 +2008,7 @@ class ParkingBot(_PluginBase):
 
             cars = []
             for car in my_cars:
-                parked_at = self._parse_time(car.get("parkedTime"))
+                parked_at = self._parked_at(car)
                 mins = max(0, (self._now_naive() - parked_at).total_seconds() / 60) if parked_at else 0
                 rate = self._earn_per_min(car, cars_map)
                 status = car.get("status")
@@ -2772,7 +2801,7 @@ class ParkingBot(_PluginBase):
 
         definition = cls._lookup_car(cars_map, car.get("carId")) or {}
         parker = (state.get("users") or {}).get(car.get("userId")) or {}
-        parked_at = cls._parse_time(spot.get("parkedTime"))
+        parked_at = cls._parked_at(spot)
         mins = max(0, int((now - parked_at).total_seconds() / 60)) if parked_at else 0
 
         out.update({
@@ -4800,7 +4829,7 @@ class ParkingBot(_PluginBase):
 
         rules = state.get("gameSettings") or {}
         min_ticket = self._to_int(rules.get("MIN_TICKET_TIME"), 5, minimum=0)
-        parked_at = self._parse_time(spot.get("parkedTime"))
+        parked_at = self._parked_at(spot)
         mins = max(0, int((self._now_naive() - parked_at).total_seconds() / 60)) \
             if parked_at else 0
         if mins < min_ticket:
