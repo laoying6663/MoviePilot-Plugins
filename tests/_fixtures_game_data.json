@@ -1,0 +1,61 @@
+{
+  "_comment": "从 https://qcw.tangpt.top/api/game_data.php 实测抓下来的真实响应（2026-10-16）。cars 只保留两条代表性车型，levelTable / expConfig / gameRules 是原样拷贝。测试用这个夹具断言，不靠手写的近似值。",
+  "success": true,
+  "cars": [
+    {"id": 1, "name": "奥拓", "price": 800, "earnPerMin": 6, "category": "代步车", "levelReq": 1, "image": "assets/cars/aotuo.png"},
+    {"id": 160, "name": "幻影", "price": 916500, "earnPerMin": 86, "category": "传奇车", "levelReq": 15, "image": "assets/cars/7akid643fo.png"}
+  ],
+  "categories": ["代步车", "普通私家车", "精致私家车", "高级私家车", "酷车一族", "高级车", "尊贵车", "贵族车", "传奇车"],
+  "levelTable": [
+    {"level": 1, "expReq": 0},
+    {"level": 2, "expReq": 50},
+    {"level": 3, "expReq": 150},
+    {"level": 4, "expReq": 350},
+    {"level": 5, "expReq": 650},
+    {"level": 6, "expReq": 1100},
+    {"level": 7, "expReq": 1700},
+    {"level": 8, "expReq": 2500},
+    {"level": 9, "expReq": 3600},
+    {"level": 10, "expReq": 5000},
+    {"level": 11, "expReq": 7000},
+    {"level": 12, "expReq": 9500},
+    {"level": 13, "expReq": 13000},
+    {"level": 14, "expReq": 17500},
+    {"level": 15, "expReq": 23000},
+    {"level": 16, "expReq": 30000},
+    {"level": 17, "expReq": 40000},
+    {"level": 18, "expReq": 55000},
+    {"level": 19, "expReq": 75000},
+    {"level": 20, "expReq": 100000}
+  ],
+  "expConfig": {
+    "park": 15,
+    "ticket": 15,
+    "report": 10,
+    "buy": 100,
+    "tradeIn": 30,
+    "parkDailyLimit": 150,
+    "ticketDailyLimit": 90,
+    "reportDailyLimit": 100,
+    "buyDailyLimit": 300,
+    "tradeInDailyLimit": 300
+  },
+  "gameRules": {
+    "MAX_CARS": 10,
+    "PRIVATE_SPOTS": 3,
+    "CHARITY_SPOTS": 1,
+    "MAX_EARN_PER_SPOT": 3000,
+    "MIN_PARK_DURATION": 10,
+    "AUTO_REMOVE_HOURS": 12,
+    "INITIAL_CASH": 1500,
+    "USED_SHOP_OPEN_COST": 5000,
+    "MIN_TICKET_TIME": 5,
+    "REPORT_FINE": 500,
+    "CHARITY_EXP_PER_MIN": 3,
+    "CHARITY_EXP_DAILY_LIMIT": 300,
+    "MAX_CHARITY_SPOTS": 1,
+    "TICKET_OWNER_PERCENT": 70,
+    "RECYCLE_RATE": 80,
+    "AUTO_REMOVE_EARN_PERCENT": 40
+  }
+}
