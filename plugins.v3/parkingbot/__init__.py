@@ -314,7 +314,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.53.0"
+    plugin_version = "1.53.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -3007,6 +3007,14 @@ class ParkingBot(_PluginBase):
     # 而 levelTable 和 expConfig 只在 game_data.php 里有（state.php 不返回）。
     # 所以它们跟着车型表走同一份缓存，不额外发请求。
     @staticmethod
+    def _fmt_reset_clock(hour: int) -> str:
+        """把每日重置时刻写成「HH:00」。
+
+        只认 0~23，其余一律按 0 处理 —— 脏配置不该让界面上出现「25:00」。
+        """
+        return "%02d:00" % (hour if 0 <= hour <= 23 else 0)
+
+    @staticmethod
     def _exp_level_table(game_data: dict) -> List[dict]:
         """取等级表 [{level, expReq}]，按 level 升序。
 
@@ -3073,10 +3081,14 @@ class ParkingBot(_PluginBase):
         # ★键尾的日期必须用 **UTC**，不能跟 _now_naive()。
         # 游戏那边拼键的是 `new Date().toISOString().split('T')[0]`，
         # 而 toISOString() 返回的永远是 UTC —— 服务端写进去的键尾是 UTC 日期。
-        # 北京时间 00:00~08:00 之间，UTC 还是「昨天」，按本地日期去拼键
-        # 一个都匹配不上，整个「今日经验」直接变成空的（页面上七行全是「—/上限」）。
-        # 白天 08:00 之后两者相同，所以这个 bug 只在夜里犯，很容易被当成「偶尔抽风」。
-        # 面板要和游戏显示同一批数字，就得跟着游戏用 UTC。
+        #
+        # ★别图省事改成「北京时间减 8 小时」：那在 MoviePilot 时区恰好是 UTC+8 时
+        # 等价，一旦宿主配成别的时区就悄悄算错日期，「今日经验」整片变「—」。
+        # 正确做法是**按 UTC 取日期算，界面和文案一律用北京时间表述** ——
+        # 换算过来就是「每天 08:00 换日」（见 _EXP_DAY_RESET_HOUR）。
+        #
+        # 插件自己产生的所有时间（统计分桶、页面显示、停入时长）都已经是
+        # _now_naive() 的北京时间，全插件只有这一处必须碰 UTC。
         today = datetime.now(pytz.utc).strftime("%Y-%m-%d")
         known = {key for key, _label, _fb in cls._EXP_SOURCES}
         prefix = f"{user_id}_" if user_id is not None else ""
@@ -3145,6 +3157,16 @@ class ParkingBot(_PluginBase):
     # 经验来源：键名、顺序、名称全部照抄游戏前端 showExpDetail 的 actions 数组。
     # 第三项是游戏自己写的兜底默认值（`limit: e.xxxDailyLimit || 默认`），
     # 后端没给这个键时游戏照样显示一个数，这里跟着用同一套默认值，
+    # 经验每日重置时刻（**北京时间**）。
+    #
+    # 游戏的 dailyExp 键由前端 `new Date().toISOString().split('T')[0]` 拼，
+    # toISOString() 永远是 UTC，所以游戏是按 **UTC 0 点**换日。换算成北京时间
+    # 就是 **08:00**（北京 = UTC+8，中国无夏令时）。
+    #
+    # ★插件对用户讲的时间一律是北京时间，这个常量就是「UTC 那个日界」在
+    # 北京时间里的说法 —— 界面、提示、文档都引用它，不要在别处再写死一个 08:00。
+    _EXP_DAY_RESET_HOUR = 8
+
     # 页面上永远 7 行，不会少行也不会显示 0。
     #   键 → 上限取自 expConfig.<键>DailyLimit（game_data.php 实测有前 5 个，
     #   charity_park / charity 后端根本没给，正好落到游戏自己的默认值 50 / 200）
@@ -3263,6 +3285,16 @@ class ParkingBot(_PluginBase):
                 f"升级到 Lv.{pg['cur'] + 1}",
                 {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
                  "marginTop": "6px"}))
+
+        # ★下面每一项的「今日」都是**北京时间 %02d:00 到次日 %02d:00** 这一段，
+        # 不是自然日 00:00~24:00。游戏按 UTC 分日（前端 addExp 用 toISOString 拼键），
+        # UTC 0 点换算成北京时间就是 %02d:00。不写出来的话，凌晨看着「今天还早」，
+        # 结果进度条在早上就清零了，只会以为插件算错。
+        _rst = cls._EXP_DAY_RESET_HOUR
+        prog.append(cls._text(
+            f"每日经验在 {ParkingBot._fmt_reset_clock(_rst)}（北京时间）重置",
+            {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+             "marginTop": "6px"}))
 
         rows: List[dict] = [{"component": "div", "props": {"style": {
             "padding": "10px 12px", "borderRadius": "12px",
@@ -7854,7 +7886,9 @@ class ParkingBot(_PluginBase):
                 # 这里把原因说出来；只有真满额了才叫「已停手」。
                 + ("　（两项都已刷满，已停手）" if buy_done and trade_done
                    else "　（未刷满却没执行：车库满且没有可回收的空闲车，"
-                        "或金币不够垫差价——详见插件日志）"),
+                        f"或金币不够垫差价——详见插件日志；每日 "
+                        f"{self._fmt_reset_clock(self._EXP_DAY_RESET_HOUR)} "
+                        "北京时间重置）"),
                 {"fontSize": "12px", "color": _CYAN, "marginTop": "6px",
                  "lineHeight": "1.6"}))
 
