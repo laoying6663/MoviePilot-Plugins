@@ -288,7 +288,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.52.1"
+    plugin_version = "1.52.2"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -851,6 +851,13 @@ class ParkingBot(_PluginBase):
         """
         if not self._auto_trade:
             return ""
+        if self._exp_farm_active(state, user_id):
+            # ★见 _exp_farm_active 的注释：刷经验期间换新会把刚买的便宜车
+            # 换成贵车，实测一轮净支出从 400 变成 22860。必须整轮跳过。
+            logger.info(
+                "[不可躺自动抢车位] 本轮跳过自动以旧换新：正在刷购车/以旧换新经验，"
+                "换新会挑走刚买的那辆便宜车（经验满了之后自动恢复）")
+            return ""
         rules = self._settings_of(state)
         mine = self._user_of(state, user_id)
         level = self._to_int(mine.get("level"), 1, minimum=1)
@@ -944,6 +951,36 @@ class ParkingBot(_PluginBase):
         rules = (game_data or {}).get("gameRules") if isinstance(game_data, dict) else None
         rules = rules if isinstance(rules, dict) else {}
         return min(100, cls._to_int(rules.get("RECYCLE_RATE"), 80, minimum=0))
+
+    def _exp_farm_active(self, state: dict, user_id: Any) -> bool:
+        """
+        刷购车/以旧换新经验此刻是不是正在进行中（开关开着且两项经验还没都满）。
+
+        ★这段时间**不能**让「自动买车 / 自动以旧换新」碰车，两个都会被挡掉：
+
+        - `_auto_trade_one` 挑的是**每分钟收益最低的空闲车**。刷经验刚买的那辆
+          奥拓只有 6 金/分，正好是最「便宜」的目标，会被它抢先换成收益最高的
+          奥迪A8（49 金/分）。
+        - `_auto_buy_one` 是「有空位就买收益最高的」。刷经验循环末尾会回收掉换来的
+          车、把空位还回来，下一轮它就把这个空位买成 A8。
+
+        实测这个冲突不是「看起来别扭」，是**真的烧钱**。真机记录（2026-10-17，
+        两个开关同时开，一天下来）：
+
+            bought    3        买了 3 辆奥托（800）
+            diff  340500       = 3 × 113500，而 113500 + 800 = 114300 = 奥迪A8 的价
+            recycled 274320    = 3 × 91440 = 3 辆 A8 的回收价（80%）
+            净损失 68580 —— 而设计里一轮只该净亏 400，差了 57 倍
+
+        买的还是那辆最便宜的车、经验照拿，钱全赔进去。
+
+        刷经验满了之后这里自动放行，自动买车/换新恢复正常 —— 那时候它们没有
+        「刚买的便宜车」可抢。
+        """
+        if not self._exp_farm:
+            return False
+        need_buy, need_trade = self._exp_farm_need(state, user_id, self._game_data)
+        return bool(need_buy or need_trade)
 
     @classmethod
     def _exp_farm_need(cls, state: dict, user_id: Any,
@@ -1357,6 +1394,14 @@ class ParkingBot(_PluginBase):
         每轮最多买一辆。返回一句执行摘要，供详情页展示。
         """
         if not self._auto_buy:
+            return ""
+        if self._exp_farm_active(state, user_id):
+            # ★刷经验循环末尾会把空位还回来，这一轮「有空位就买收益最高的」
+            # 会正好买成 A8，把工位占掉，下一轮刷经验就得再回收一辆。
+            # 实测和自动换新是同一个坑（见 _exp_farm_active）。
+            logger.info(
+                "[不可躺自动抢车位] 本轮跳过自动买车：正在刷购车/以旧换新经验，"
+                "买车会占掉刚腾出来的工位（经验满了之后自动恢复）")
             return ""
         rules = self._settings_of(state)
         mine = self._user_of(state, user_id)
