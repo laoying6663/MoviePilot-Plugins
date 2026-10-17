@@ -163,6 +163,26 @@ class CharitySpotRequest(BaseModel):
     action: str = Field(default="", description="set 设为爱心车位；unset 恢复私家车位")
 
 
+class PersonalSubRequest(BaseModel):
+    """个性化页的二级页签：场景 / 皮皮秀。"""
+
+    sub: str = Field(default="scene", description="scene 场景；show 皮皮秀")
+
+
+class BgActionRequest(BaseModel):
+    """场景卡片：购买或切换使用。"""
+
+    bg_id: str = Field(description="场景 ID，如 jiedao2 / shatan")
+    action: str = Field(default="", description="buy 购买并启用；select 切换使用")
+
+
+class QqShowActionRequest(BaseModel):
+    """皮皮秀卡片：购买或切换穿戴。"""
+
+    qqshow_id: Any = Field(default=0, description="皮皮秀 ID")
+    action: str = Field(default="", description="buy 购买并穿戴；select 切换穿戴")
+
+
 class ExpDetailRequest(BaseModel):
     """
     展开 / 收起经验值详情面板。面板是纯展示，没有别的入参。
@@ -270,6 +290,12 @@ _ICONS = {
     "stats": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
               'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
               'stroke-linejoin="round"><path d="M4 20V9.5M10 20V4M16 20v-7M22 20H2"/></svg>'),
+    # 个性化：一颗星 + 一颗小圆点（场景/皮皮秀都是「装扮」类目）
+    "personal": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
+                 'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" '
+                 'stroke-linejoin="round"><path d="M11 3.4l1.9 5.1 5.1 1.9-5.1 1.9'
+                 'L11 17.5l-1.9-5.2L4 10.4l5.1-1.9L11 3.4Z"/>'
+                 '<circle cx="18.6" cy="17.4" r="2.2"/></svg>'),
 }
 
 
@@ -288,7 +314,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.52.2"
+    plugin_version = "1.53.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -328,9 +354,12 @@ class ParkingBot(_PluginBase):
     # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
     _PLUGIN_ID = "ParkingBot"
     _TABS = (("spots", "我的车位"), ("shop", "车市"),
-             ("garage", "我的车库"), ("stats", "数据统计"))
+             ("garage", "我的车库"), ("stats", "数据统计"),
+             ("personal", "个性化"))
     _tab = "spots"
     _day = ""
+    # 个性化页的子页（场景 / 皮皮秀）。和一级页签一样只记内存 + 防抖落盘。
+    _personal_sub = "scene"
     # 车市页的两个临时状态：选中的车型分类、正在「选旧车换新」的目标车型。
     # 必须给类级默认值 —— 详情页渲染可能在 __init_plugin_config__ 之前被调用。
     _cat = ""
@@ -492,6 +521,9 @@ class ParkingBot(_PluginBase):
             saved_view = {}
         saved_tab = str(saved_view.get("tab") or "").strip()
         self._tab = saved_tab if saved_tab in dict(self._TABS) else "spots"
+        # 个性化页的二级页签（场景 / 皮皮秀）。只认这两个值，其余一律回「场景」。
+        saved_sub = str(saved_view.get("personal_sub") or "").strip()
+        self._personal_sub = saved_sub if saved_sub in ("scene", "show") else "scene"
         # 车市页的两个临时状态：选中的车型分类、以及正在「选旧车换新」的目标车型。
         # 分类直接取快照里真实存在的分类名，不认任何外部输入。
         self._cat = str(saved_view.get("cat") or "").strip()
@@ -2798,6 +2830,44 @@ class ParkingBot(_PluginBase):
                         "image": self._asset_url(item.get("image")),
                     }
                     for item in sorted(cars_map.values(), key=lambda c: self._to_int(c.get("price"), 0))
+                ],
+                # ---------- 个性化：场景 / 皮皮秀 ----------
+                # 两个目录都来自 game_data.php（和车型表同一份缓存），
+                # 拥有状态来自 state.php：
+                #   场景   ownedBgs（已购 id 列表）+ **state 顶层** currentBg（使用中）
+                #   皮皮秀 ownedQqShows（已购 id）+ users[我].qqShowId（穿戴中）
+                # ★两者取值位置刻意不同：currentBg 在顶层（v1.50.2 踩过，
+                # users[我] 里根本没有这个字段）；qqShowId 反过来只在 users[我] 里。
+                "current_bg": str(state.get("currentBg") or ""),
+                "owned_bgs": [str(x) for x in (state.get("ownedBgs") or [])
+                              if isinstance(x, (str, int))],
+                "qqshow_id": self._to_int(mine.get("qqShowId"), 0),
+                "gender": str(mine.get("gender") or ""),
+                "owned_qqshows": [i for i in (
+                    self._to_int(x, 0) for x in (state.get("ownedQqShows") or [])
+                ) if i > 0],
+                "bgs": [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "name": str(item.get("name") or "未命名场景"),
+                        "price": self._to_int(item.get("price"), 0, minimum=0),
+                        "bonus": self._to_int(item.get("bonusPercent"), 0, minimum=0),
+                        # 有的场景 preview 是空串，退回 file（游戏 renderBgSelector 同口径）
+                        "image": self._asset_url(item.get("preview") or item.get("file")),
+                    }
+                    for item in ((self._game_data or {}).get("parkingBackgrounds") or [])
+                    if isinstance(item, dict) and item.get("id")
+                ],
+                "qqshows": [
+                    {
+                        "id": self._to_int(item.get("id"), 0),
+                        "name": str(item.get("name") or "未命名皮皮秀"),
+                        "price": self._to_int(item.get("price"), 0, minimum=0),
+                        "gender": str(item.get("gender") or "U"),
+                        "image": self._asset_url(item.get("file")),
+                    }
+                    for item in ((self._game_data or {}).get("qqShows") or [])
+                    if isinstance(item, dict) and self._to_int(item.get("id"), 0) > 0
                 ],
                 "flash": flash,
                 "notifUnread": notif_unread,
@@ -5293,6 +5363,33 @@ class ParkingBot(_PluginBase):
                 "description": "记录详情页当前展示的区块；渲染器随后会重新拉取页面，只下发这一块",
             },
             {
+                "path": "/personal_sub",
+                "endpoint": self.api_set_personal_sub,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "个性化子页切换",
+                "response_model": ApiResult,
+                "description": "切换个性化页的「场景 / 皮皮秀」两个子页；渲染器随后重拉页面",
+            },
+            {
+                "path": "/bg_action",
+                "endpoint": self.api_bg_action,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "场景购买 / 切换",
+                "response_model": ApiResult,
+                "description": "购买走 buy_bg.php（服务端扣金币）；切换使用改 currentBg 后 saveState",
+            },
+            {
+                "path": "/qqshow_action",
+                "endpoint": self.api_qqshow_action,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "皮皮秀购买 / 穿戴",
+                "response_model": ApiResult,
+                "description": "游戏无独立购买接口，按前端 selectQqShow 的做法改 cash/qqShowId 后 saveState 全量回写",
+            },
+            {
                 "path": "/shop_filter",
                 "endpoint": self.api_shop_filter,
                 "methods": ["POST"],
@@ -5414,6 +5511,184 @@ class ParkingBot(_PluginBase):
             saved["day"] = day
         await self._save_view(saved)
         return _result({"success": True, "name": dict(self._TABS)[tab]})
+
+    async def api_set_personal_sub(self, request: PersonalSubRequest) -> ApiResult:
+        """个性化页的二级页签：场景 / 皮皮秀。和一级页签同一套「记住 → 重渲染」。"""
+        sub = str(getattr(request, "sub", "") or "").strip().lower()
+        if sub not in ("scene", "show"):
+            return _result({"success": False, "error": f"未知子页：{sub}"})
+        self._personal_sub = sub
+        await self._save_view({"personal_sub": sub})
+        return _result({"success": True,
+                        "name": "场景" if sub == "scene" else "皮皮秀"})
+
+    async def _save_state_patch(self, client: Any, mutate) -> Tuple[bool, str]:
+        """
+        按游戏前端 saveState 的方式改 state：**先拉最新 → 改 → 全量回写**。
+
+        ★state.php 的 POST 是**全量覆盖** —— 游戏 api.js 的 saveState 一次传
+        users / userCars / parkingSpots / dailyExp / currentBg / ownedBgs /
+        ownedQqShows 七个字段。所以这里必须先 GET 一份最新状态再改，
+        绝不能拿快照里那份旧 state 回写：那样会把刚停车/挪车的结果整份盖掉。
+
+        返回 (是否成功, 失败原因)。
+        """
+        try:
+            fresh = await client.get_json(f"{self.API_BASE}/state.php")
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 个性化操作读取状态失败：{err}")
+            return False, "读取游戏状态失败"
+        if not fresh or not fresh.get("success"):
+            return False, str((fresh or {}).get("error") or "读取游戏状态失败")
+        try:
+            mutate(fresh)
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 个性化操作修改状态失败：{err}")
+            return False, "本地状态修改失败"
+        payload = {
+            "users": fresh.get("users") or {},
+            "userCars": fresh.get("userCars") or [],
+            "parkingSpots": fresh.get("parkingSpots") or [],
+            "dailyExp": fresh.get("dailyExp") or {},
+            "currentBg": fresh.get("currentBg") or "",
+            "ownedBgs": fresh.get("ownedBgs") or [],
+            "ownedQqShows": fresh.get("ownedQqShows") or [],
+        }
+        result = await client.post_json(f"{self.API_BASE}/state.php", json=payload)
+        if not result or not result.get("success"):
+            return False, str((result or {}).get("error") or "保存游戏状态失败")
+        return True, ""
+
+    async def api_bg_action(self, request: BgActionRequest) -> ApiResult:
+        """
+        场景（停车场背景）：购买或切换使用。
+
+        购买走 buy_bg.php —— 游戏前端 buyBg 就是打这个接口，服务端会校验
+        金币并扣款；切换使用和游戏前端 changeBg 一样，改 currentBg 后 saveState。
+        """
+        action = str(getattr(request, "action", "") or "").strip().lower()
+        bg_id = str(getattr(request, "bg_id", "") or "").strip()
+        if action not in ("buy", "select") or not bg_id:
+            return _result({"success": False, "error": "参数不完整"})
+        client, state, _cars, err, _extra = await self._load_game_context(prefetch=False)
+        if not state:
+            return _result({"success": False, "error": err})
+
+        bgs = ((self._game_data or {}).get("parkingBackgrounds") or [])
+        bg = next((b for b in bgs if isinstance(b, dict)
+                   and str(b.get("id")) == bg_id), None)
+        if not bg:
+            return _result({"success": False, "error": "场景不存在"})
+        price = self._to_int(bg.get("price"), 0, minimum=0)
+        name = str(bg.get("name") or bg_id)
+
+        if action == "buy":
+            result = await client.post_json(
+                f"{self.API_BASE}/buy_bg.php", json={"bgId": bg_id})
+            if not result or not result.get("success"):
+                return _result({"success": False,
+                                "error": (result or {}).get("error") or "购买失败"})
+            note = f"已购买场景「{name}」，花费 {self._fmt_num(price)} 金"
+        else:
+            owned = {str(x) for x in (state.get("ownedBgs") or [])}
+            if price > 0 and bg_id not in owned:
+                return _result({"success": False, "error": "尚未购买这个场景"})
+            ok, reason = await self._save_state_patch(
+                client, lambda st: st.__setitem__("currentBg", bg_id))
+            if not ok:
+                return _result({"success": False, "error": reason})
+            note = f"已切换场景为「{name}」"
+
+        await self._refresh_snapshot(client, note)
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "message": note})
+
+    async def api_qqshow_action(self, request: QqShowActionRequest) -> ApiResult:
+        """
+        皮皮秀：购买并穿戴 / 切换穿戴。
+
+        ★游戏**没有独立的购买接口** —— 前端 selectQqShow 是「本地扣金币 +
+        改 users[我].qqShowId + ownedQqShows，再 saveState 全量 POST」。
+        这里照同一套做（先拉最新 state 再改），没有别的服务端接口可用。
+        再点一次当前穿戴款 = 切回该性别的免费默认款，和游戏前端一致。
+        """
+        action = str(getattr(request, "action", "") or "").strip().lower()
+        qs_id = self._to_int(getattr(request, "qqshow_id", 0), 0)
+        if action not in ("buy", "select") or qs_id <= 0:
+            return _result({"success": False, "error": "参数不完整"})
+        client, state, _cars, err, _extra = await self._load_game_context(prefetch=False)
+        if not state:
+            return _result({"success": False, "error": err})
+
+        shows = ((self._game_data or {}).get("qqShows") or [])
+        show = next((q for q in shows if isinstance(q, dict)
+                     and self._to_int(q.get("id"), 0) == qs_id), None)
+        if not show:
+            return _result({"success": False, "error": "皮皮秀不存在"})
+        mine = self._user_of(state, state.get("userId"))
+        gender = str(mine.get("gender") or "")
+        q_gender = str(show.get("gender") or "U")
+        if gender and q_gender not in (gender, "U"):
+            return _result({"success": False, "error": "该皮皮秀与你的性别不匹配"})
+        price = self._to_int(show.get("price"), 0, minimum=0)
+        owned = {self._to_int(x, 0) for x in (state.get("ownedQqShows") or [])}
+        current = self._to_int(mine.get("qqShowId"), 0)
+        cash = self._to_int(mine.get("cash"), 0)
+
+        if action == "buy" and qs_id not in owned and price > 0:
+            if cash < price:
+                return _result({"success": False,
+                                "error": f"金币不足，还差 {price - cash} 金"})
+
+            def _buy(st: dict) -> None:
+                me = self._user_of(st, st.get("userId"))
+                if not me:
+                    raise ValueError("找不到玩家资料")
+                me["cash"] = self._to_int(me.get("cash"), 0) - price
+                me["qqShowId"] = qs_id
+                owned_list = st.get("ownedQqShows")
+                owned_list = owned_list if isinstance(owned_list, list) else []
+                if qs_id not in [self._to_int(x, 0) for x in owned_list]:
+                    owned_list.append(qs_id)
+                st["ownedQqShows"] = owned_list
+
+            ok, reason = await self._save_state_patch(client, _buy)
+            if not ok:
+                return _result({"success": False, "error": reason})
+            note = f"已购买皮皮秀「{show.get('name')}」，花费 {self._fmt_num(price)} 金"
+            await self._refresh_snapshot(client, note)
+            self._set_result(note)
+            logger.info(f"[不可躺自动抢车位] {note}")
+            return _result({"success": True, "message": note})
+
+        # 购买已拥有的款式 ⇒ 等价于直接穿戴；其余走 select
+        default_id = 0
+        for q in shows:
+            if not isinstance(q, dict):
+                continue
+            if (str(q.get("gender") or "") == gender
+                    and self._to_int(q.get("price"), 0) == 0):
+                default_id = self._to_int(q.get("id"), 0)
+                break
+        if qs_id == current:
+            target = default_id          # 再点当前款 = 恢复默认
+        else:
+            if price > 0 and qs_id not in owned:
+                return _result({"success": False, "error": "尚未购买这个皮皮秀"})
+            target = qs_id
+
+        ok, reason = await self._save_state_patch(
+            client, lambda st: self._user_of(st, st.get("userId")).__setitem__(
+                "qqShowId", target))
+        if not ok:
+            return _result({"success": False, "error": reason})
+        note = ("已恢复默认皮皮秀" if qs_id == current
+                else f"皮皮秀已更换为「{show.get('name')}」")
+        await self._refresh_snapshot(client, note)
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "message": note})
 
     async def _save_view(self, patch: Dict[str, Any]) -> None:
         """
@@ -6791,15 +7066,31 @@ class ParkingBot(_PluginBase):
     @staticmethod
     def _item(title: str, lines: List[Tuple[str, str]],
               actions: Optional[List[dict]] = None,
-              accent: str = _CYAN, image: str = "", locked: bool = False) -> dict:
+              accent: str = _CYAN, image: str = "", locked: bool = False,
+              badge: str = "") -> dict:
         """
         车市里的一辆车：照抄游戏 .car-card。
 
         结构和网页版一致 —— 车图居中最大、名字、金币价格、每分钟收益、
         ✓ 已拥有 N 辆，最后一行是并排的按钮。等级不足的整张卡压到半透明，
         按钮换成「需要 Lv.N」，和游戏的 .car-card.locked 一个做法。
+
+        badge 是右上角的实心小标签（个性化页用它标「使用中」）；
+        不传就完全不渲染，车市卡片的布局一个像素都不变。
         """
         content = []
+        if badge:
+            content.append({
+                "component": "div",
+                "props": {"style": {
+                    "position": "absolute", "top": "10px", "right": "10px",
+                    "padding": "2px 9px", "borderRadius": "999px",
+                    "fontSize": "10px", "fontWeight": "bold",
+                    "backgroundColor": accent, "color": "#1A1A2E",
+                    "letterSpacing": "0.3px",
+                }},
+                "content": [ParkingBot._text(badge, {})],
+            })
         if image:
             content.append({
                 "component": "div",
@@ -6837,6 +7128,8 @@ class ParkingBot(_PluginBase):
                 "padding": "14px",
                 "borderRadius": "12px",
                 "textAlign": "center",
+                # 角标要用绝对定位，容器必须是定位上下文
+                "position": "relative",
                 "border": f"1px solid {ParkingBot._alpha(accent, 0.34)}",
                 "backgroundColor": "rgba(255,255,255,0.04)",
                 "opacity": "0.5" if locked else "1",
@@ -7154,6 +7447,157 @@ class ParkingBot(_PluginBase):
                             {"fontSize": "13px", "opacity": "0.8"})], accent=_GOLD,
             ))
         return blocks
+
+    def _personal_page(self, snapshot: dict) -> List[dict]:
+        """
+        个性化页：把游戏里分开的「场景店」（停车场背景）和「show 场」
+        （皮皮秀 / QQ 秀）合并成一个分类。
+
+        数据全部读快照：目录来自 game_data.php（bgs / qqshows），拥有状态来自
+        state.php（owned_bgs / owned_qqshows + current_bg / qqshow_id）。
+        渲染路径不发请求 —— 和车市/车库同一套「快照即页面」的做法。
+
+        四态与游戏网页一致：
+          使用中（金框+金标）→ 已拥有（青框+青标，可切换）→ 未购买（价格+购买）
+          → 金币不足（红标+置灰按钮）
+        """
+        pid = getattr(self, "plugin_id", None) or self._PLUGIN_ID
+        sub_api = f"plugin/{pid}/personal_sub"
+        bg_api = f"plugin/{pid}/bg_action"
+        qs_api = f"plugin/{pid}/qqshow_action"
+
+        bgs = self._dict_rows(snapshot.get("bgs"))
+        qqshows = self._dict_rows(snapshot.get("qqshows"))
+        owned_bgs = {str(x) for x in (snapshot.get("owned_bgs") or [])}
+        owned_qs = {self._to_int(x, 0) for x in (snapshot.get("owned_qqshows") or [])}
+        current_bg = str(snapshot.get("current_bg") or "")
+        current_qs = self._to_int(snapshot.get("qqshow_id"), 0)
+        gender = str(snapshot.get("gender") or "")
+        cash = self._to_int(snapshot.get("cash"), 0)
+        sub = self._personal_sub if self._personal_sub in ("scene", "show") else "scene"
+
+        def _sub_tab(key: str, label: str) -> dict:
+            active = key == sub
+            return {
+                "component": "div",
+                "props": {"style": {
+                    "flex": "0 0 auto", "padding": "7px 18px",
+                    "borderRadius": "999px", "fontSize": "13px",
+                    "whiteSpace": "nowrap", "cursor": "pointer",
+                    "userSelect": "none", "fontWeight": "bold" if active else "normal",
+                    "color": "#7FF6FF" if active else "#CCCCCC",
+                    "backgroundColor": (
+                        "rgba(34,211,238,0.18)" if active else "rgba(255,255,255,0.08)"),
+                    "border": (f"1px solid {_CYAN}" if active
+                               else "1px solid rgba(255,255,255,0.15)"),
+                }},
+                "content": [ParkingBot._text(label, {})],
+                "events": {"click": {"api": sub_api, "method": "post",
+                                     "params": {"sub": key}}},
+            }
+
+        subnav = {
+            "component": "div",
+            "props": {"style": {"display": "flex", "gap": "8px",
+                                "marginBottom": "12px", "flexWrap": "wrap"}},
+            "content": [_sub_tab("scene", "🏞️ 场景"),
+                        _sub_tab("show", "🧍 皮皮秀")],
+        }
+
+        items: List[dict] = []
+
+        def _state(item_id: Any, owned_ids: set, current_id: Any,
+                   price: int) -> Tuple[str, str, str, str]:
+            """(accent, badge, 状态文案, 状态色) —— 四态判定只写这一份。"""
+            if str(item_id) == str(current_id):
+                return _GOLD, "使用中", "使用中", _GOLD
+            if item_id in owned_ids or price == 0:
+                return _CYAN, "已拥有", "✓ 已购买", _SHOP_OWNED
+            if price > cash:
+                return (_SHOP_LOCK, "金币不足",
+                        f"未购买 · 还差 {self._fmt_num(price - cash)} 金", _SHOP_LOCK)
+            return _PURPLE, "", "未购买", "rgba(255,255,255,0.62)"
+
+        if sub == "scene":
+            for bg in bgs:
+                bg_id = str(bg.get("id") or "")
+                price = self._to_int(bg.get("price"), 0, minimum=0)
+                bonus = self._to_int(bg.get("bonus"), 0, minimum=0)
+                accent, badge, state_text, state_color = _state(
+                    bg_id, owned_bgs, current_bg, price)
+                using = bg_id == current_bg
+                lines: List[Any] = [self._coin(self._fmt_num(price), size=14,
+                                               color=_GOLD)]
+                if bonus > 0:
+                    lines.append((f"收益 +{bonus}%（仅私家车位）", _AMBER))
+                lines.append((state_text, state_color))
+                actions = None
+                if using:
+                    actions = None
+                elif bg_id in owned_bgs or price == 0:
+                    actions = [self._action_btn("切换使用", bg_api,
+                                                {"action": "select", "bg_id": bg_id})]
+                else:
+                    actions = [self._action_btn(
+                        "购买" if price <= cash else "金币不足", bg_api,
+                        {"action": "buy", "bg_id": bg_id},
+                        disabled=price > cash)]
+                items.append(self._item(
+                    str(bg.get("name") or "未命名场景"), lines, actions,
+                    accent=accent, image=str(bg.get("image") or ""),
+                    badge=badge))
+            if not items:
+                items.append(self._text(
+                    "场景数据未加载（下一轮执行成功后自动补上）",
+                    {"fontSize": "13px", "opacity": "0.7"}))
+            title = "场景"
+            subtitle = ("停车场背景。收益加成只对**私家车位**生效（爱心车位不受影响）；"
+                        "金色标签＝当前使用中，青色＝已拥有可切换。")
+        else:
+            for qs in qqshows:
+                q_gender = str(qs.get("gender") or "U")
+                # 游戏前端只列「匹配自己性别 + 通用款」；拿不到性别时不做过滤
+                if gender and q_gender not in (gender, "U"):
+                    continue
+                qs_id = self._to_int(qs.get("id"), 0)
+                price = self._to_int(qs.get("price"), 0, minimum=0)
+                accent, badge, state_text, state_color = _state(
+                    qs_id, owned_qs, current_qs, price)
+                using = qs_id == current_qs
+                lines = [self._coin(self._fmt_num(price), size=14, color=_GOLD)]
+                lines.append((state_text, state_color))
+                actions = None
+                if using:
+                    actions = None
+                elif qs_id in owned_qs or price == 0:
+                    actions = [self._action_btn("切换使用", qs_api,
+                                                {"action": "select",
+                                                 "qqshow_id": qs_id})]
+                else:
+                    actions = [self._action_btn(
+                        "购买" if price <= cash else "金币不足", qs_api,
+                        {"action": "buy", "qqshow_id": qs_id},
+                        disabled=price > cash)]
+                items.append(self._item(
+                    str(qs.get("name") or "未命名皮皮秀"), lines, actions,
+                    accent=accent, image=str(qs.get("image") or ""),
+                    badge=badge))
+            if not items:
+                items.append(self._text(
+                    "皮皮秀数据未加载（下一轮执行成功后自动补上）",
+                    {"fontSize": "13px", "opacity": "0.7"}))
+            title = "皮皮秀"
+            subtitle = ("QQ 秀形象。购买后立刻穿戴；再点当前穿戴款可切回默认。"
+                        + (f"（已按性别 {gender} 过滤）" if gender else ""))
+
+        return [self._card(
+            title, subtitle,
+            [subnav, self._grid(items),
+             self._text("状态：金色＝使用中，青色＝已拥有（可切换），灰色＝未购买",
+                        {"fontSize": "11px", "opacity": "0.55",
+                         "marginTop": "4px"})],
+            accent=_PURPLE,
+        )]
 
     def _nav_row(self, current: str) -> dict:
         """
@@ -7491,6 +7935,9 @@ class ParkingBot(_PluginBase):
                               self._to_int(snapshot.get("parked_total"), 0),
                               self._to_int(snapshot.get("car_max"), 1),
                               park_api, unpark_api)], accent=_PURPLE)]
+        elif tab == "personal":
+            # 场景（停车场背景）+ 皮皮秀（QQ 秀）合并成一个分类
+            sections = self._personal_page(snapshot)
         else:
             sections = [self._stats_page(daily, history, today_earned)]
 
