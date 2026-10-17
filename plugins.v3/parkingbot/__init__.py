@@ -235,12 +235,16 @@ _GREEN = "#00E676"
 _PINK = "#FF4D6D"
 _AMBER = "#FFB300"
 _MUTED = "rgba(255,255,255,0.62)"
-# 车市卡片单独用游戏 style.css 里的原始值，不跟通用配色混：卡片价格是 #ffd700、
-# 收益是纯绿 #0f0、「已拥有 N 辆」是青色 #0df、等级不足是玫红 #e94560。
-# 这几个值是从 qcw.tangpt.top/style.css 的 .car-card / .category-tab 抄的。
-_SHOP_EARN = "#00FF00"
-_SHOP_OWNED = "#00DDFF"
-_SHOP_LOCK = "#E94560"
+# 次级文字（表格表头、10~11px 说明）。原来散着 0.32 / 0.45 / 0.46 / 0.48 / 0.50
+# 五个档，同一个语义五种深浅，肉眼分不出、维护还得猜该用哪个。实测在 #0E1014
+# 底上：0.32 → 2.85:1（过不了 WCAG AA 的 4.5:1），0.45 → 4.54:1（擦线过，无余量），
+# 0.48 → 5.02:1。统一收成 0.55（6.21:1）—— 留出余量，层级仍靠 _MUTED(0.62) 和
+# 正文(0.92) 拉开。
+_DIM = "rgba(255,255,255,0.55)"
+# 车市卡片原先单抄了一套游戏 style.css 的原始值（收益 #0f0、已拥有 #0df、
+# 等级不足 #e94560），和上面 6 个主色只差几个色阶，肉眼分不出、维护要记两套。
+# 已并进主色板：收益→_GREEN、已拥有→_CYAN、等级不足→_PINK。
+# 顺带修掉纯绿 #00FF00 在深底上过刺眼的问题（_GREEN 是 #00E676）。
 # 统计页「其中贴条」专用色：玫红偏橙，贴合处罚语义，
 # 也和金色（挪车收益）、粉色（支出）、绿色（净收）都拉得开
 _TICKET_C = "#FF7A9C"
@@ -273,6 +277,53 @@ _GAME_BASE = "https://qcw.tangpt.top/"
 # 交给 CSS 的 background-color，渐变值会被丢掉，所以底色另外用实色兜住。
 _HATCH = ("repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 10px,"
           " rgba(255,255,255,0.015) 10px 20px)")
+
+# ---------- UI 设计令牌（v1.54.0）----------
+# 面板亮度阶梯：放弃「白叠加」，改用不透明 hex。
+# 原来全站只有 rgba(255,255,255,.03/.035/.04/.045/.05/.07/.10) 七档，
+# 叠在 #0E1014 上相对亮度只差 8%（.03 与 .035 只差 0.5%，肉眼不可分），
+# 页面实际上是一个大平面，区块只能靠标题前那颗 8px 圆点区分。
+# 换成不透明 hex 后相邻档稳定差 1.09~1.12:1 —— 可辨，但不抢内容。
+S0 = "#0E1014"          # 页面底（宿主背景，插件不自己画）
+S1 = "#161A20"          # L1 大区块卡
+S2 = "#1E232B"          # L2 内嵌槽（指标块 / 页签凹槽 / 元信息胶囊）
+S3 = "#262C36"          # L3 浮起可交互（车卡 / 未选中 pill）
+SEL_BG = "#1B3A42"      # 选中态底（统一青调，不再用玫红/金当选中色）
+
+# 边框三档，和面一一对应
+L1 = "rgba(255,255,255,0.08)"
+L2 = "rgba(255,255,255,0.06)"
+L3 = "rgba(255,255,255,0.10)"
+
+# 材质三件套：换成平底后，靠「顶部高光 + 内阴影 + 外投影」把厚度补回来。
+# 只换平底不加高光，页面会比改前更死 —— 所以这几个常量和 S1~S3 必须同一次提交。
+_HL = "linear-gradient(180deg, rgba(255,255,255,0.05) 0, rgba(255,255,255,0) 88px)"
+_SH1 = "inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 24px rgba(0,0,0,0.26)"
+_SH2 = "inset 0 1px 2px rgba(0,0,0,0.42)"
+_SH3 = "inset 0 1px 0 rgba(255,255,255,0.07), 0 2px 6px rgba(0,0,0,0.34)"
+
+# 圆角四档：6（角标/代码块）/ 10（内嵌槽、pill、表格行）/ 14（所有卡片）/ 999（真圆）
+R_SM, R_MD, R_CARD, R_FULL = "6px", "10px", "14px", "999px"
+
+# 可点元素最小高度。44px 是移动端拇指热区的下限，现有组件实测 22~40px 全线偏小。
+# 一律用 minHeight 撑，不加 padding —— 胶囊的视觉尺寸保持不变。
+TAP_H = "44px"
+
+# 按钮四态。原来每个按钮各写一套色值（白底 / 青描边 / 玫红底 / 灰底），
+# 同一个「次要操作」在车市和车库里长得不一样，用户得重新认一遍。
+# 收敛成四档语义后，调用处只回答「这是几级操作」，颜色不再由调用点决定。
+_BTN = {
+    "primary": {"color": "#04222B", "backgroundColor": "#22D3EE",
+                "border": "1px solid #22D3EE"},
+    "secondary": {"color": "#8DF3FF", "backgroundColor": "transparent",
+                  "border": "1px solid rgba(34,211,238,0.40)"},
+    "danger": {"color": "#FFFFFF", "backgroundColor": "rgba(255,77,109,0.85)",
+               "border": "1px solid rgba(255,77,109,0.90)"},
+    "ghost": {"color": "rgba(255,255,255,0.82)", "backgroundColor": S3,
+              "border": f"1px solid {L3}"},
+}
+# 老调用点传的是业务语义（buy / trade），映射到四态，避免逐个改调用处。
+_LEGACY_KIND = {"buy": "primary", "trade": "secondary"}
 
 _ICONS = {
     "spots": ('<svg viewBox="0 0 24 24" width="@SIZE@" height="@SIZE@" fill="none" '
@@ -314,7 +365,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.53.1"
+    plugin_version = "1.53.2"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -353,9 +404,13 @@ class ParkingBot(_PluginBase):
     # ---------- 详情页区块 ----------
     # 详情页按区块互斥展示：顶部按钮 POST /tab 记住当前区块，重新拉页时只下发这一块。
     _PLUGIN_ID = "ParkingBot"
-    _TABS = (("spots", "我的车位"), ("shop", "车市"),
-             ("garage", "我的车库"), ("stats", "数据统计"),
-             ("personal", "个性化"))
+    # 页签文案统一 2 个字：5 个页签在 360px 宽的弹窗里要挤进单行，
+    # 「我的车位」「数据统计」这种 4 字标签会逼出换行（换行后高度翻倍、
+    # 选中态凹槽被切成两段）。2 字 + 16px 图标刚好 5 个排得下，
+    # 顺序也按用户心智重排：自己的（车位/车库）→ 交易的（车市）→ 看的（数据/装扮）。
+    _TABS = (("spots", "车位"), ("garage", "车库"),
+             ("shop", "车市"), ("stats", "数据"),
+             ("personal", "装扮"))
     _tab = "spots"
     _day = ""
     # 个性化页的子页（场景 / 皮皮秀）。和一级页签一样只记内存 + 防抖落盘。
@@ -3211,7 +3266,7 @@ class ParkingBot(_PluginBase):
                                 "gap": "4px"}},
             "content": [
                 cls._text("等级", {"fontSize": "11px",
-                                  "color": "rgba(255,255,255,0.45)"}),
+                                  "color": _DIM}),
                 cls._text(f"Lv.{pg['cur']}", {"fontSize": "12px",
                                               "fontWeight": "bold",
                                               "color": "#FFFFFF"}),
@@ -3225,7 +3280,7 @@ class ParkingBot(_PluginBase):
             head.append(cls._exp_fill(pg["percent"], "4px"))
             head.append(cls._text(
                 f"{ParkingBot._fmt_num(pg['exp'])}/{ParkingBot._fmt_num(pg['next'])}",
-                {"fontSize": "10px", "color": "rgba(255,255,255,0.45)",
+                {"fontSize": "10px", "color": _DIM,
                  "marginTop": "2px"}))
         return {
             "component": "div",
@@ -3283,7 +3338,7 @@ class ParkingBot(_PluginBase):
             prog.append(cls._text(
                 f"还需 {ParkingBot._fmt_num(pg['remain'])} 经验"
                 f"升级到 Lv.{pg['cur'] + 1}",
-                {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+                {"fontSize": "11px", "color": _DIM,
                  "marginTop": "6px"}))
 
         # ★下面每一项的「今日」都是**北京时间 %02d:00 到次日 %02d:00** 这一段，
@@ -3293,7 +3348,7 @@ class ParkingBot(_PluginBase):
         _rst = cls._EXP_DAY_RESET_HOUR
         prog.append(cls._text(
             f"每日经验在 {ParkingBot._fmt_reset_clock(_rst)}（北京时间）重置",
-            {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+            {"fontSize": "11px", "color": _DIM,
              "marginTop": "6px"}))
 
         rows: List[dict] = [{"component": "div", "props": {"style": {
@@ -3496,7 +3551,7 @@ class ParkingBot(_PluginBase):
                 {"fontSize": "11px", "color": "#e94560", "marginLeft": "6px"}))
         head.append(cls._text(
             "清空请回游戏网页",
-            {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+            {"fontSize": "11px", "color": _DIM,
              "marginLeft": "auto"}))
 
         if not rows:
@@ -3525,7 +3580,7 @@ class ParkingBot(_PluginBase):
                                              "color": "rgba(255,255,255,0.92)"}),
                                   cls._text(cls._notif_time(item.get("time")),
                                             {"fontSize": "11px",
-                                             "color": "rgba(255,255,255,0.45)",
+                                             "color": _DIM,
                                              "marginTop": "2px"}),
                               ]},
                          ]}]
@@ -3549,7 +3604,7 @@ class ParkingBot(_PluginBase):
         if hidden > 0:
             more.append(cls._text(
                 f"仅显示最近 {cls._NOTIF_SHOW} 条，还有 {hidden} 条，回游戏网页看全部",
-                {"fontSize": "11px", "color": "rgba(255,255,255,0.45)",
+                {"fontSize": "11px", "color": _DIM,
                  "marginTop": "10px", "textAlign": "center"}))
 
         # 底部两个按钮：全部已读（写游戏侧，但不删东西，和游戏弹窗一样不带
@@ -4027,11 +4082,19 @@ class ParkingBot(_PluginBase):
             "props": {"style": {
                 "flex": "1 1 0",
                 "minWidth": "128px",
-                "margin": "0 8px 8px 0",
+                # gutter 由容器的 gap 提供，子项自己不带右边距 ——
+                # 老写法是子项 margin-right:8px + 容器 margin-right:-8px 抵掉，
+                # 数学上宽度一样，但容器盒子会比父级宽 8px、把页面 scrollWidth
+                # 顶出去（每页都多 8px 横向溢出）。
+                "margin": "0",
                 "padding": "12px 14px",
-                "borderRadius": "14px",
-                "border": "1px solid rgba(255,255,255,0.10)",
-                "backgroundColor": "rgba(255,255,255,0.03)",
+                # 14px 是测试锁定的圆角值（空快照用例要求页面上至少一个 14px 圆角节点），
+                # 全站圆角收敛到 14 之后这里正好自然符合，不要改成 12。
+                "borderRadius": R_CARD,
+                "border": f"1px solid {L2}",
+                # L2 内嵌槽：比 L1 卡片更深一档，指标块看起来是「嵌进卡片里」的
+                "backgroundColor": S2,
+                "boxShadow": _SH2,
                 "display": "flex",
                 "alignItems": "center",
                 "gap": "10px",
@@ -4057,9 +4120,12 @@ class ParkingBot(_PluginBase):
                      ParkingBot._text(label, {"fontSize": "11px", "fontWeight": "700",
                                               "letterSpacing": "0.5px",
                                               "color": "rgba(255,255,255,0.62)"}),
-                     # 数字等宽：跳数时宽度不抖（tabular-nums 只影响数字字形）
-                     ParkingBot._text(value, {"fontSize": "23px", "fontWeight": "700",
+                     # 数字等宽：跳数时宽度不抖（tabular-nums 只影响数字字形）。
+                     # whiteSpace:nowrap —— 「距下次运行」的值可达「1 小时 20 分钟后」，
+                     # 23px 字号在 87px 可用宽内会折成两行，把 2×2 网格的上下行撑得不一样高。
+                     ParkingBot._text(value, {"fontSize": "24px", "fontWeight": "700",
                                               "color": color, "lineHeight": "1.15",
+                                              "whiteSpace": "nowrap",
                                               "fontVariantNumeric": "tabular-nums"}),
                  ]},
             ],
@@ -4091,9 +4157,12 @@ class ParkingBot(_PluginBase):
                 "props": {"style": {"display": "flex", "alignItems": "center",
                                     "gap": "8px", "marginBottom": "3px"}},
                 "content": [
+                    # 语义色条：原来是 8×8 圆点（64px²），在 14px 圆角卡里几乎看不见。
+                    # 改成 3×16 竖条，和 _stat 左侧那根同构 ——
+                    # 全站「左色条 = 语义」从此是一条规则，而不是两套画法。
                     {"component": "span",
-                     "props": {"style": {"width": "8px", "height": "8px",
-                                         "borderRadius": "999px", "flex": "0 0 auto",
+                     "props": {"style": {"width": "3px", "height": "16px",
+                                         "borderRadius": "2px", "flex": "0 0 auto",
                                          "backgroundColor": accent}}},
                     ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "700",
                                              "color": "rgba(255,255,255,0.92)",
@@ -4108,15 +4177,22 @@ class ParkingBot(_PluginBase):
             head.append(ParkingBot._text(subtitle, {
                 "fontSize": "12px", "color": "rgba(255,255,255,0.62)",
                 "lineHeight": "1.55", "marginBottom": "12px",
-                "paddingLeft": "16px" if title else "0"}))
+                # 缩进 = 竖条 3 + gap 8 = 11px。原来是 16（给 8px 圆点留的），
+                # 改竖条后必须同步，否则标题与副标题左缘会错开 5px。
+                "paddingLeft": "11px" if title else "0"}))
         return {
             "component": "div",
-            "props": {"style": {
+            "props": {"class": "pb-card", "style": {
                 "marginBottom": "12px",
                 "padding": "16px",
-                "borderRadius": "16px",
-                "border": "1px solid rgba(255,255,255,0.10)",
-                "backgroundColor": "rgba(255,255,255,0.045)",
+                "borderRadius": R_CARD,
+                "border": f"1px solid {L1}",
+                "backgroundColor": S1,
+                # 顶部 88px 渐隐高光：平底卡片唯一的「受光」痕迹，成本一条 backgroundImage
+                "backgroundImage": _HL,
+                "boxShadow": _SH1,
+                # 顶线用负 margin 顶到两缘，没有 overflow:hidden 就会溢出圆角
+                "overflow": "hidden",
             }},
             "content": [*head, *content],
         }
@@ -4131,13 +4207,15 @@ class ParkingBot(_PluginBase):
                 "alignItems": "center",
                 "gap": "5px",
                 "padding": "3px 9px",
-                "borderRadius": "999px",
-                "backgroundColor": "rgba(255,255,255,0.03)",
-                "border": "1px solid rgba(255,255,255,0.10)",
+                "borderRadius": R_FULL,
+                "backgroundColor": S2,
+                "border": f"1px solid {L2}",
                 "fontSize": "11px",
             }},
             "content": [
-                ParkingBot._text(label, {"color": "rgba(255,255,255,0.32)"}),
+                # label 原来是 0.32，在 #161A20 上只有 2.5:1，不达 WCAG AA。
+                # 提到 0.55（约 6.8:1）—— 它仍然是「弱」的那一档，但读得清。
+                ParkingBot._text(label, {"color": "rgba(255,255,255,0.55)"}),
                 ParkingBot._text(value, {"color": "rgba(255,255,255,0.62)"}),
             ],
         }
@@ -4197,7 +4275,8 @@ class ParkingBot(_PluginBase):
             "component": "div",
             "props": {"style": {"marginTop": "8px"}},
             "content": [
-                ParkingBot._text(label, {"fontSize": "11px", "opacity": "0.55"}),
+                ParkingBot._text(label, {"fontSize": "11px",
+                                         "color": "rgba(255,255,255,0.55)"}),
                 ParkingBot._text(value, {"fontSize": "15px", "fontWeight": "bold",
                                          "color": color, "marginTop": "1px"}),
             ],
@@ -4245,19 +4324,95 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _badge(text: str, color: str) -> dict:
-        """状态徽章：小圆角底 + 同色文字，游戏里「停车中」那种。"""
+        """状态徽章：小圆角底 + 同色文字，游戏里「停车中」那种。
+
+        圆角跟 _badge 之外的胶囊分开一档（R_MD 而不是 R_FULL）：徽章是「贴在
+        某块内容上的标签」，全圆会让它看起来像按钮；再补 1px 同色描边，
+        深色底上纯靠 16% 填充会糊成一片、认不出边界。
+        """
         return {
             "component": "div",
             "props": {"style": {
                 "display": "inline-block",
                 "padding": "3px 10px",
-                "borderRadius": "6px",
+                "borderRadius": R_MD,
                 "fontSize": "12px",
                 "fontWeight": "bold",
                 "color": color,
                 "backgroundColor": ParkingBot._alpha(color, 0.16),
+                "border": f"1px solid {ParkingBot._alpha(color, 0.24)}",
             }},
             "text": text,
+        }
+
+    @staticmethod
+    def _empty(icon: str, title: str, hint: str = "") -> dict:
+        """
+        统一空态：虚线框 + 大图标 + 标题 + 一句解释。
+
+        原来每个页面各写各的「XX 数据未加载」纯文字（车市、场景、皮皮秀、
+        车库各一份），字号和透明度都不一样，看起来像四种不同的「出错了」。
+        空态本身就是一种设计状态，得长一个样：虚线框说明「这里本该有内容」，
+        图标给一点情绪，hint 说清「为什么空、什么时候会有」。
+        """
+        content: List[dict] = [
+            {"component": "div",
+             "props": {"style": {"fontSize": "26px", "lineHeight": "1",
+                                 "opacity": "0.55"}},
+             "text": icon},
+            ParkingBot._text(title, {"fontSize": "13px", "fontWeight": "bold",
+                                     "color": "rgba(255,255,255,0.74)"}),
+        ]
+        if hint:
+            content.append(ParkingBot._text(
+                hint, {"fontSize": "11px", "lineHeight": "1.65",
+                       "color": _DIM}))
+        return {
+            "component": "div",
+            "props": {"class": "pb-empty", "style": {
+                "display": "flex", "flexDirection": "column",
+                "alignItems": "center", "justifyContent": "center",
+                "gap": "7px", "padding": "26px 18px",
+                "borderRadius": R_CARD,
+                "border": f"1px dashed {L3}",
+                "backgroundColor": "rgba(255,255,255,0.02)",
+                "textAlign": "center",
+            }},
+            "content": content,
+        }
+
+    @staticmethod
+    def _kv_grid(pairs: List[Tuple[str, Any, str]]) -> dict:
+        """
+        两列信息网格：把「标签在上、值在下」的字段压成 2 列。
+
+        车库卡片原来是 4~5 个 _kv 竖着排，一张卡光字段就 180px 高，
+        三辆车要滑三屏才能看完。两列之后高度砍半，且「盈利速率 / 已停时长」
+        「车位类型 / 累计收益」自然成对，扫读比竖排一条条往下找快得多。
+
+        value 允许传节点（金币图标那种自带样式的），传字符串就按普通值渲染。
+        """
+        cells = []
+        for label, value, color in pairs:
+            body = value if isinstance(value, dict) else ParkingBot._text(
+                value, {"fontSize": "13px", "fontWeight": "bold", "color": color,
+                        "marginTop": "1px", "overflow": "hidden",
+                        "textOverflow": "ellipsis", "whiteSpace": "nowrap"})
+            cells.append({
+                "component": "div",
+                "props": {"style": {"flex": "1 1 40%", "minWidth": "0"}},
+                "content": [
+                    ParkingBot._text(label, {"fontSize": "10px",
+                                             "letterSpacing": "0.3px",
+                                             "color": _DIM}),
+                    body,
+                ],
+            })
+        return {
+            "component": "div",
+            "props": {"style": {"display": "flex", "flexWrap": "wrap",
+                                "gap": "8px 12px", "marginTop": "9px"}},
+            "content": cells,
         }
 
     @staticmethod
@@ -4277,7 +4432,6 @@ class ParkingBot(_PluginBase):
                 "props": {"style": {
                     "flex": "0 0 auto",
                     "minWidth": "118px",
-                    "margin": "0 8px 8px 0",
                     "padding": "10px 14px",
                     "borderRadius": "12px",
                     "cursor": "pointer",
@@ -4300,22 +4454,22 @@ class ParkingBot(_PluginBase):
         return {
             "component": "div",
             "props": {"style": {"display": "flex", "overflowX": "auto",
-                                "marginRight": "-8px", "paddingBottom": "2px"}},
+                                "gap": "8px", "paddingBottom": "10px"}},
             "content": cards,
         }
 
     @staticmethod
     def _hour_chart(hours: Dict[str, Any]) -> dict:
         """
-        24 小时收益折线图。
+        24 小时收益柱状图。
 
-        用内联 SVG 画折线 + 渐变面积，数据点用绝对定位的 div 画（不用 <circle>：
-        绘图区靠 preserveAspectRatio="none" 横向拉满，圆会被压成椭圆），
-        不用图表库 —— 插件页是声明式 JSON，引不了 ApexCharts，SVG 在任何宿主上都能出来。
+        用纯 div 画（24 根竖柱 + 几条 1px 网格线），不用图表库也不用 SVG：
+        插件页是声明式 JSON，引不了 ApexCharts；而这个图只需要「高度 = 数值」，
+        一排 flex 子项就能画完，还比 SVG 省掉横向拉伸描边的麻烦。
 
-        绘图区上层再铺 24 条隐形热区，每小时一条：宿主渲染器 PageRender 对 props 是
-        v-bind 全量透传、没有白名单，所以 title 会原样落成 <div title="…">，由浏览器
-        弹原生提示。JSON 模式下没有 JS 执行口、也没有注入 CSS 的口子，自绘 tooltip
+        每根柱子的外层就是热区：宿主渲染器 PageRender 对 props 是 v-bind 全量
+        透传、没有白名单，所以 title 会原样落成 <div title="…">，由浏览器弹原生
+        提示。JSON 模式下没有 JS 执行口、也没有注入 CSS 的口子，自绘 tooltip
         做不出来，这是唯一能给逐小时数据加悬停提示的办法。
         """
         # _to_int 兜底脏数据（"x" / inf / nan 都回落 0），保证下面不会出现 NaN / Infinity。
@@ -4347,77 +4501,67 @@ class ParkingBot(_PluginBase):
                 return 100.0
             return 100.0 - (value / scale_top) * span
 
-        xs = [i / 23 * 100.0 for i in range(24)]
-        ys = [y_pct(v) for v in values]
-        pts = " ".join(f"{x:.2f},{y:.2f}" for x, y in zip(xs, ys))
-        area_d = ("M " + " L ".join(f"{x:.2f},{y:.2f}" for x, y in zip(xs, ys))
-                  + f" L {xs[-1]:.2f},100 L {xs[0]:.2f},100 Z")
-        grid = "".join(
-            f'<line x1="0" y1="{y_pct(t):.2f}" x2="100" y2="{y_pct(t):.2f}" '
-            f'stroke="rgba(255,255,255,0.07)" stroke-width="1" '
-            f'vector-effect="non-scaling-stroke"/>'
-            for t in ticks)
-        svg = (
-            '<svg viewBox="0 0 100 100" preserveAspectRatio="none" '
-            'style="position:absolute;inset:0;width:100%;height:100%;overflow:visible">'
-            '<defs><linearGradient id="parkingHourArea" x1="0" y1="0" x2="0" y2="1">'
-            '<stop offset="0" stop-color="#00E676" stop-opacity="0.45"/>'
-            '<stop offset="1" stop-color="#00E676" stop-opacity="0"/>'
-            '</linearGradient></defs>'
-            f'{grid}'
-            f'<path d="{area_d}" fill="url(#parkingHourArea)" stroke="none"/>'
-            f'<polyline points="{pts}" fill="none" stroke="#00E676" stroke-width="2" '
-            f'stroke-linejoin="round" stroke-linecap="round" '
-            f'vector-effect="non-scaling-stroke"/>'
-            '</svg>')
+        # ---------- 24 根竖柱 ----------
+        # 原来是「SVG 折线 + 渐变面积 + 24 个绝对定位圆点」。在手机宽度上折线有两个
+        # 硬问题：①圆点 6px、相邻间距只有 14px 左右，峰谷密的地方连成一条毛边；
+        # ②折线的斜率要读者自己做除法才能换算成「几点挣得多」，而竖柱的高度
+        # 本身就是数值，扫一眼就知道哪几个小时有钱。
+        # 竖柱同时兼任热区：每根柱子的外层就是原来那 24 条隐形热区，
+        # title / height:100% / cursor:help 三要件一个没动。
+        bars: List[dict] = []
+        for hour, value in enumerate(values):
+            h_pct = (value / scale_top * span) if scale_top > 0 else 0.0
+            is_peak = (peak > 0 and hour == peak_hour)
+            bars.append({
+                "component": "div",
+                "props": {
+                    "title": (f"{hour:02d}:00 — 收益 {ParkingBot._fmt_num(value)} 金币"
+                              if value else f"{hour:02d}:00 — 无收益"),
+                    "style": {"flex": "1 1 0", "height": "100%", "cursor": "help",
+                              "display": "flex", "alignItems": "flex-end",
+                              "justifyContent": "center", "minWidth": "0"},
+                },
+                "content": [{
+                    "component": "div",
+                    "props": {"style": {
+                        "width": "100%", "maxWidth": "9px",
+                        # 空小时给一根 2% 的暗色「桩」：完全留白会让人以为图表缺了一段，
+                        # 有桩才读得出「这个小时有格子、只是没收益」。
+                        "height": (f"{h_pct:.2f}%" if value else "2%"),
+                        "borderRadius": "2px 2px 0 0",
+                        "backgroundColor": _GOLD if is_peak else _GREEN,
+                        "opacity": "1" if value else "0.18",
+                    }},
+                }],
+            })
 
-        dots = [{"component": "div", "props": {"style": {
-            "position": "absolute", "left": f"{x:.2f}%", "top": f"{y:.2f}%",
-            "width": "6px", "height": "6px", "borderRadius": "50%",
-            "transform": "translate(-50%, -50%)",
-            "backgroundColor": (_GOLD if (peak > 0 and i == peak_hour) else _GREEN),
-        }}} for i, (x, y) in enumerate(zip(xs, ys))]
-
-        # 24 条隐形热区：title 文案逐字保持，cursor:help，带 height 键（三要件都被测试锁定）。
-        hotspots = [{"component": "div", "props": {
-            "title": (f"{hour:02d}:00 — 收益 {ParkingBot._fmt_num(value)} 金币"
-                      if value else f"{hour:02d}:00 — 无收益"),
-            "style": {"flex": "1 1 0", "height": "100%", "cursor": "help"},
-        }} for hour, value in enumerate(values)]
-
-        plot_children: List[dict] = [
-            {"component": "span", "props": {"style": {
-                "position": "absolute", "inset": "0", "display": "block"}}, "html": svg},
-            *dots,
-        ]
-        # 峰值常显胶囊。水平夹取到 [6%, 94%]：贴边时改同向对齐，不居中，
-        # 免得贴右边缘时溢出卡片；峰值点在绘图区上 1/3 时改放到点下方。
-        if peak > 0:
-            px, py = xs[peak_hour], ys[peak_hour]
-            left = min(94.0, max(6.0, px))
-            tx = "0%" if px < 6.0 else ("-100%" if px > 94.0 else "-50%")
-            ty = "58%" if py < 100.0 / 3.0 else "-135%"
-            plot_children.append({"component": "div", "props": {"style": {
-                "position": "absolute", "left": f"{left:.2f}%", "top": f"{py:.2f}%",
-                "transform": f"translate({tx}, {ty})", "whiteSpace": "nowrap",
-                "padding": "2px 8px", "borderRadius": "10px", "fontSize": "11px",
-                "fontWeight": "bold", "color": _GOLD,
-                "backgroundColor": "rgba(255,215,0,0.16)",
-                "border": "1px solid rgba(255,215,0,0.5)",
-            }}, "content": [ParkingBot._text(
-                f"{peak_hour:02d}:00 · {ParkingBot._fmt_num(peak)} 金币", {})]})
-
-        plot_children.append({"component": "div", "props": {"style": {
-            "position": "absolute", "inset": "0", "display": "flex"}},
-            "content": hotspots})
+        # 网格线用 1px 绝对定位 div 画，不再走 SVG：竖柱模式下没有需要横向拉伸的
+        # 路径了，而 SVG 的 preserveAspectRatio="none" 会把 1px 描边一起拉伸。
+        grid = [{"component": "div", "props": {"style": {
+            "position": "absolute", "left": "0", "right": "0",
+            "top": f"{min(99.6, y_pct(t)):.2f}%", "height": "1px",
+            "backgroundColor": "rgba(255,255,255,0.07)",
+        }}} for t in ticks]
 
         plot = {"component": "div",
-                "props": {"style": {"position": "relative", "height": f"{plot_h}px"}},
-                "content": plot_children}
+                "props": {"style": {
+                    "position": "relative", "height": f"{plot_h}px",
+                    "display": "flex", "alignItems": "flex-end", "gap": "2px"}},
+                # 网格线在前、柱子在后：absolute 的子节点不参与 flex 排布，
+                # 顺序只影响绘制层级，不影响柱子的宽度分配。
+                "content": [*grid, *bars]}
 
-        x_labels = [{"component": "div", "props": {"style": {
-            "fontSize": "11px", "color": "rgba(255,255,255,0.48)"}},
-            "text": f"{h:02d}:00"} for h in range(0, 24, 4)]
+        # X 轴刻度做成 24 个等宽槽位、只在整 4 点写标签：折线时代用
+        # space-between 排 6 个标签，标签中心并不落在对应小时的位置上，
+        # 竖柱有明确的「列」之后这种错位就很显眼。
+        x_labels: List[dict] = []
+        for hour in range(24):
+            slot = {"component": "div", "props": {"style": {
+                "flex": "1 1 0", "textAlign": "center", "fontSize": "11px",
+                "color": _DIM, "whiteSpace": "nowrap"}}}
+            if hour % 4 == 0:
+                slot["text"] = f"{hour:02d}:00"
+            x_labels.append(slot)
 
         # 图下常显摘要 —— 移动端唯一能逐日读到的信息入口。纯 _text，不带 title / cursor，
         # 免得干扰热区计数。
@@ -4438,7 +4582,7 @@ class ParkingBot(_PluginBase):
                          "display": "block", "width": "10px", "height": "3px",
                          "borderRadius": "2px", "backgroundColor": _GREEN}}},
                      ParkingBot._text("收益", {"fontSize": "11px",
-                                               "color": "rgba(255,255,255,0.48)"})]},
+                                               "color": _DIM})]},
                 # 主行：Y 轴刻度列 + 右列（绘图区 + X 轴）
                 {"component": "div", "props": {"style": {"display": "flex", "gap": "6px"}},
                  "content": [
@@ -4448,7 +4592,7 @@ class ParkingBot(_PluginBase):
                       "content": [{"component": "div", "props": {"style": {
                           "position": "absolute", "right": "2px",
                           "top": f"{y_pct(t):.2f}%", "transform": "translateY(-50%)",
-                          "fontSize": "11px", "color": "rgba(255,255,255,0.48)"}},
+                          "fontSize": "11px", "color": _DIM}},
                           "text": ParkingBot._fmt_num(t)} for t in ticks]},
                      {"component": "div", "props": {"style": {"flex": "1 1 0"}},
                       "content": [
@@ -4527,7 +4671,7 @@ class ParkingBot(_PluginBase):
             # 当日收支
             {"component": "div",
              "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                 "marginRight": "-8px", "marginBottom": "12px"}},
+                                 "gap": "8px", "marginBottom": "12px"}},
              "content": [
                  self._stat("当日收益", day_earned, _GOLD),
                  self._stat("其中贴条", day_fined(current), _TICKET_C),
@@ -4539,7 +4683,7 @@ class ParkingBot(_PluginBase):
             # 本月收支
             {"component": "div",
              "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                 "marginRight": "-8px", "marginBottom": "12px"}},
+                                 "gap": "8px", "marginBottom": "12px"}},
              "content": [
                  self._stat("本月收益", m_earned, _GOLD),
                  self._stat("其中贴条", sum(day_fined(d) for d in month_days), _TICKET_C),
@@ -4555,18 +4699,25 @@ class ParkingBot(_PluginBase):
                        f"换车 {self._to_int(bucket.get('traded'), 0)} 次",
                        [self._hour_chart(hours)], accent=_GREEN),
             # 每日明细
+            # 窄屏（360px）下 5 列挤在一行，表头「换车差价」会被省略号吃掉、
+            # 「2026-10-18」也截断成「2026-10-1…」。表头收到 2 字、日期只留
+            # 月-日（跨年那几天仍在最近 60 天内，靠「本月」区块能对上月份）。
+            #
+            # 只铺最近 14 天：原来 30 行在 390px 宽下就是 1500px 的连续滚动，
+            # 而且渲染器没有 JS、折叠不了，滑到底只剩手指累。14 天覆盖「最近
+            # 两周」这个真正会回看的窗口，更早的去「本月」汇总看总量。
             self._card(
                 "每日明细",
-                f"共 {len(days)} 天，最多保留 60 天",
+                f"显示最近 {min(len(days), 14)} 天 · 共 {len(days)} 天，最多保留 60 天",
                 [self._table(
-                    ["日期", "收益", "买车", "换车差价", "净收"],
-                    [[d,
+                    ["日期", "收益", "买车", "换车", "净收"],
+                    [[ParkingBot._short_day(d),
                       str(day_row(d)[0]),
                       str(self._to_int((daily[d] or {}).get("spent"), 0)),
                       str(self._to_int((daily[d] or {}).get("diff"), 0)),
                       str(day_row(d)[2])]
-                     for d in days[:30]],
-                    ["3", "2", "2", "2", "2"],
+                     for d in days[:14]],
+                    ["2.2", "1", "1", "1", "1"],
                     ["left", "right", "right", "right", "right"])], accent=_GREEN),
             # 买卖汇总
             self._card(
@@ -4586,10 +4737,11 @@ class ParkingBot(_PluginBase):
                 "最近 10 轮",
                 "单轮执行明细（最多保留 50 轮）",
                 [self._table(["时间", "新停放", "挪走", "收益(金币)"],
-                             [[i.get("time", ""), str(i.get("parked", 0)),
+                             [[self._short_day(i.get("time", "")),
+                               str(i.get("parked", 0)),
                                str(i.get("moved", 0)), str(i.get("earned", 0))]
                               for i in history[:10]],
-                             ["2", "1", "1", "1"],
+                             ["2.4", "1", "1", "1.2"],
                              ["left", "center", "center", "right"])], accent=_GREEN))
         return {"component": "div", "props": {"style": {}}, "content": blocks}
 
@@ -4634,17 +4786,18 @@ class ParkingBot(_PluginBase):
             return None
         ready = bool(spot.get("ticketReady"))
         wait = ParkingBot._to_int(spot.get("ticketWait"), 0)
-        btn = {
+        # 热区与视觉解耦：外层 44px 容器挂 events（拇指点得准），
+        # 内层胶囊仍是 26px（车位卡 295px 等高不被撑破）。
+        inner = {
             "component": "div",
             "props": {"style": {
                 "display": "inline-flex", "alignItems": "center", "gap": "4px",
-                "marginTop": "8px", "padding": "5px 12px", "fontSize": "11px",
-                "fontWeight": "bold", "borderRadius": "14px", "userSelect": "none",
+                "padding": "5px 12px", "fontSize": "11px",
+                "fontWeight": "bold", "borderRadius": R_FULL, "userSelect": "none",
                 "whiteSpace": "nowrap",
-                "cursor": "pointer" if ready else "not-allowed",
-                "color": "#FFFFFF" if ready else "rgba(255,255,255,0.5)",
-                "backgroundColor": ("rgba(233,69,96,0.85)" if ready
-                                    else "rgba(233,69,96,0.22)"),
+                "color": "#FFFFFF" if ready else _DIM,
+                "backgroundColor": ("rgba(255,77,109,0.85)" if ready
+                                    else "rgba(255,77,109,0.22)"),
             }},
             "content": [
                 {"component": "span",
@@ -4653,13 +4806,23 @@ class ParkingBot(_PluginBase):
                 ParkingBot._text("贴条", {}),
             ],
         }
+        btn = {
+            "component": "div",
+            "props": {"style": {
+                "display": "flex", "alignItems": "center", "justifyContent": "center",
+                "minHeight": TAP_H, "marginTop": "-2px",
+                "cursor": "pointer" if ready else "not-allowed",
+                "userSelect": "none",
+            }},
+            "content": [inner],
+        }
         if ready:
             btn["events"] = {"click": {
                 "api": api, "method": "post",
                 "params": {"spot_id": spot.get("spotId")}}}
         hint = ParkingBot._text(
             f"再等 {wait} 分钟可贴条" if not ready else "已到可贴条时长",
-            {"fontSize": "10px", "opacity": "0.6", "marginTop": "4px"})
+            {"fontSize": "11px", "color": "rgba(255,255,255,0.55)", "marginTop": "2px"})
         fine = ParkingBot._coin(
             ParkingBot._fmt_num(spot.get("ticketFine")), size=12, color=_GOLD,
             bold=True, label="贴条收益",
@@ -4742,14 +4905,17 @@ class ParkingBot(_PluginBase):
                     })
                     toggle.append(ParkingBot._text(
                         "重新按分钟产金币" if is_charity else "不产金币 · 仅贡献经验",
-                        {"fontSize": "10px", "color": "rgba(255,255,255,0.45)",
+                        {"fontSize": "10px", "color": _DIM,
                          "marginTop": "6px"}))
                 cards.append({
                     "component": "div",
                     "props": {"style": {
-                        "flex": "1 1 46%",
+                        # 150px 基准：宽屏自然排到 3~4 列，窄屏仍能放两张。
+                        # 原来是 46%，任何宽度都锁死 2 列 —— 720px 以上时单卡被拉到
+                        # 340×295，里面只有一个 56px 车图，空白超过 60%。
+                        "flex": "1 1 150px",
                         "minWidth": "150px",
-                        "margin": "0 8px 8px 0",
+                        "margin": "0",
                         "padding": "12px",
                         "borderRadius": "14px",
                         # 车位卡统一等高：空闲卡与占用卡共用同一个 minHeight。
@@ -4829,17 +4995,20 @@ class ParkingBot(_PluginBase):
             cards.append({
                 "component": "div",
                 "props": {"style": {
-                    "flex": "1 1 46%",
+                    "flex": "1 1 150px",
                     "minWidth": "150px",
-                    "margin": "0 8px 8px 0",
+                    "margin": "0",
                     "padding": "12px",
-                    "borderRadius": "14px",
+                    "borderRadius": R_CARD,
                     # 与空闲卡共用同一套等高写法（详见空闲卡处的注释）。
                     "boxSizing": "border-box",
                     "minHeight": "295px",
                     "border": ("1px solid rgba(255,77,109,0.30)" if charity
                                else "1px solid rgba(255,215,0,0.30)"),
-                    "backgroundColor": "rgba(255,255,255,0.05)",
+                    # 占用卡是 L3 浮起面（里面有内容、可贴条），空闲卡是 L2 凹槽 ——
+                    # 一眼能分出「这个位子有没有人」。
+                    "backgroundColor": S3,
+                    "boxShadow": _SH3,
                     "textAlign": "center",
                 }},
                 "content": [
@@ -4867,9 +5036,24 @@ class ParkingBot(_PluginBase):
         return {
             "component": "div",
             "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                "marginRight": "-8px"}},
+                                "gap": "8px"}},
             "content": cards,
         }
+
+    @staticmethod
+    def _short_day(value: Any) -> str:
+        """
+        "2026-10-18" → "10-18"；"2026-10-18 04:30:00" → "10-18 04:30"。
+
+        窄屏表格里日期列只占 ~60px，完整日期一定被省略号截断，
+        截断后「10-1…」反而比「10-18」更没用。不认得的格式原样返回。
+        """
+        text = str(value or "").strip()
+        if len(text) >= 19 and text[4] == "-" and text[10] == " ":
+            return text[5:16]
+        if len(text) == 10 and text[4] == "-":
+            return text[5:]
+        return text
 
     @staticmethod
     def _table(headers: List[str], rows: List[List[Any]],
@@ -6547,12 +6731,15 @@ class ParkingBot(_PluginBase):
             "props": {"style": {
                 "display": "inline-flex", "alignItems": "center", "gap": "4px",
                 "padding": "5px 12px", "fontSize": "11px", "fontWeight": "bold",
-                "borderRadius": "14px", "whiteSpace": "nowrap",
+                # 44px 热区：原来 26px，在手机上要瞄准才能点中
+                "minHeight": TAP_H,
+                "borderRadius": R_FULL, "whiteSpace": "nowrap",
                 "userSelect": "none", "border": "none",
                 "cursor": "pointer" if can else "not-allowed",
-                "color": "#04222B" if can else "rgba(255,255,255,0.45)",
-                "backgroundColor": ("#FFFFFF" if can
-                                    else "rgba(255,255,255,0.10)"),
+                # 主行动一律走主色底 + 深字。原来是白底 —— 白色不是色板成员，
+                # 而且是页面上最亮的元素，会把青色主色压过去。
+                "color": "#04222B" if can else _DIM,
+                "backgroundColor": (_CYAN if can else S3),
             }},
             "content": [
                 {"component": "span",
@@ -6661,7 +6848,7 @@ class ParkingBot(_PluginBase):
                 "borderRadius": "14px", "whiteSpace": "nowrap",
                 "userSelect": "none", "border": "none",
                 "cursor": "pointer" if can else "not-allowed",
-                "color": "#04281A" if can else "rgba(255,255,255,0.45)",
+                "color": "#04281A" if can else _DIM,
                 "backgroundColor": (_GREEN if can
                                     else "rgba(255,255,255,0.10)"),
             }},
@@ -6686,15 +6873,27 @@ class ParkingBot(_PluginBase):
         """
         cards = []
         for position, item in enumerate(cars, start=1):
-            idle = item.get("status") == "空闲"
+            # 状态归一：游戏 state.php 现在给的是中文（「空闲」/「停车中」），
+            # 但徽章原来是直接 str(status) 打出去的 —— 上游哪天改成英文枚举，
+            # 卡片上就会冒出一个 `parked`。这里统一映射成中文，认不出来的
+            # 英文/空值退回「停车中」，宁可含糊也不要露原始代码。
+            raw_status = str(item.get("status") or "").strip()
+            status_key = raw_status.lower()
+            if raw_status == "空闲" or status_key in ("idle", "free", "empty"):
+                status_label = "空闲"
+            elif raw_status:
+                status_label = raw_status if not status_key.isascii() else "停车中"
+            else:
+                status_label = "停车中"
+            idle = status_label == "空闲"
             minutes = ParkingBot._to_int(item.get("mins"), 0)
             can_unpark = (not idle) and minutes >= min_duration
             if idle:
-                button_text, status_color = "空闲中", "#9E9E9E"
+                button_text = "空闲中"
             elif can_unpark:
-                button_text, status_color = "立即挪车", _GREEN
+                button_text = "立即挪车"
             else:
-                button_text, status_color = f"还需 {min_duration - minutes} 分钟", _AMBER
+                button_text = f"还需 {min_duration - minutes} 分钟"
 
             # 序号兜底取列表位置：插件刚升级时页面上可能还是上一版写的快照，
             # 那种快照没有 no 字段，直接取会渲染成「/挪车 None」。
@@ -6714,39 +6913,48 @@ class ParkingBot(_PluginBase):
                 "component": "div",
                 "props": {"style": {"flex": "1 1 auto", "minWidth": "0"}},
                 "content": [
-                    ParkingBot._text(name, {"fontSize": "17px", "fontWeight": "bold"}),
-                    ParkingBot._kv("盈利速率", f"{item.get('rate', 0)} 金/分钟", _GREEN),
-                    ParkingBot._kv(
-                        "当前状态" if idle else "车位类型",
-                        "当前未停放" if idle
-                        else ("爱心车位（赚经验，不产金币）"
-                              if item.get("charity") else "私家车位"),
-                        _PURPLE if item.get("charity") else _CYAN),
-                    # 爱心车位结算的是经验不是金币，累计收益那栏得说清单位，
-                    # 否则一个 0 会被当成「白停了半天」。
-                    ParkingBot._kv(
-                        "当前状态" if idle else "累计收益",
-                        "当前未停放" if idle else
-                        (f"{ParkingBot._fmt_num(item.get('exp'))} exp"
-                         if item.get("charity") else
-                         ParkingBot._coin(ParkingBot._fmt_num(item.get("gain")),
-                                          size=13, align="left")),
-                        _PURPLE if item.get("charity") else _GOLD),
-                    ParkingBot._kv(
-                        "已停时长" if not idle else "说明",
-                        f"{minutes} 分钟" if not idle else "可立即停到他人车位",
-                        "rgba(255,255,255,0.75)"),
+                    # 车名 + 状态徽章同一行：状态是这张卡最该先看到的信息，
+                    # 原来它被压在底部按钮旁边，得扫完整卡才看得见「这车停没停」。
+                    {"component": "div",
+                     "props": {"style": {"display": "flex", "alignItems": "center",
+                                         "gap": "8px", "flexWrap": "wrap"}},
+                     "content": [
+                         ParkingBot._text(name, {"fontSize": "16px",
+                                                 "fontWeight": "bold"}),
+                         ParkingBot._badge(
+                             status_label,
+                             # 徽章的颜色跟着「状态」走，不跟「能不能挪」走：
+                             # 用按钮的动作色会让「停车中」也变成琥珀色（待处理感）。
+                             "#9E9E9E" if idle
+                             else (_PURPLE if item.get("charity") else _CYAN)),
+                     ]},
+                    ParkingBot._kv_grid([
+                        ("盈利速率", f"{item.get('rate', 0)} 金/分", _GREEN),
+                        ("已停时长", f"{minutes} 分钟" if not idle else "—",
+                         "rgba(255,255,255,0.75)"),
+                        ("车位类型", "当前未停放" if idle
+                         else ("爱心车位" if item.get("charity") else "私家车位"),
+                         _PURPLE if item.get("charity") else _CYAN),
+                        # 爱心车位结算的是经验不是金币，累计收益那栏得说清单位，
+                        # 否则一个 0 会被当成「白停了半天」。
+                        ("累计收益", "—" if idle else
+                         (f"{ParkingBot._fmt_num(item.get('exp'))} exp"
+                          if item.get("charity") else
+                          ParkingBot._coin(ParkingBot._fmt_num(item.get("gain")),
+                                           size=13, align="left")),
+                         _PURPLE if item.get("charity") else _GOLD),
+                    ]),
                     # 停在谁名下：车位主人可能哪天就换车了，看名字比看 ID 有用。
-                    *([ParkingBot._kv(
-                        "停在", str(item.get("ownerName") or "（车主未知）"),
-                        "rgba(255,255,255,0.75)")]
+                    *([ParkingBot._text(
+                        f"停在 {item.get('ownerName')} 的车位",
+                        {"fontSize": "11px", "marginTop": "7px",
+                         "color": _DIM})]
                       if not idle and item.get("ownerName") else []),
                     {"component": "div",
                      "props": {"style": {"marginTop": "10px",
                                          "display": "flex", "alignItems": "center",
                                          "gap": "8px", "flexWrap": "wrap"}},
                      "content": [
-                         ParkingBot._badge(str(item.get("status", "")), status_color),
                          ParkingBot._unpark_btn(number, can_unpark, button_text,
                                                 unpark_api),
                          *([ParkingBot._park_btn(number, free_spots, api)]
@@ -6759,11 +6967,12 @@ class ParkingBot(_PluginBase):
                 "props": {"style": {
                     "flex": "1 1 300px",
                     "minWidth": "270px",
-                    "margin": "0 8px 8px 0",
-                    "padding": "12px 14px 10px",
-                    "borderRadius": "14px",
-                    "border": "1px solid rgba(255,255,255,0.10)",
-                    "backgroundColor": "rgba(255,255,255,0.045)",
+                    "margin": "0",
+                    "padding": "12px 14px 12px",
+                    "borderRadius": R_CARD,
+                    "border": f"1px solid {L2}",
+                    # 车库卡是「卡片里的卡片」，比外层卡片再深一档
+                    "backgroundColor": S2,
                     "display": "flex",
                     "gap": "12px",
                 }},
@@ -6773,7 +6982,7 @@ class ParkingBot(_PluginBase):
         return {
             "component": "div",
             "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                "marginRight": "-8px"}},
+                                "gap": "8px"}},
             "content": cards,
         }
 
@@ -6849,7 +7058,7 @@ class ParkingBot(_PluginBase):
                     "display": "flex", "alignItems": "center", "gap": "10px",
                     "padding": "10px", "marginBottom": "6px", "borderRadius": "8px",
                     "cursor": "pointer", "backgroundColor": "rgba(255,255,255,0.05)",
-                    "border": (f"1px solid {_SHOP_LOCK}" if active
+                    "border": (f"1px solid {_PINK}" if active
                                else "1px solid transparent"),
                 }},
                 "content": [
@@ -6944,18 +7153,22 @@ class ParkingBot(_PluginBase):
     def _action_btn(label: str, api: str, params: Dict[str, Any],
                     kind: str = "buy", disabled: bool = False) -> dict:
         """
-        车市卡片底部的小按钮，样式照抄游戏 .car-btn：
+        车市 / 个性化 / 工具条共用的操作按钮。
 
-        购买是白底深字（#fff / #1a1a2e），以旧换新是透明底 + 青框青字
-        （#0df 配 rgba(0,210,255,0.4) 描边）。disabled 时整颗压暗并且不挂事件，
-        页面上灰掉的按钮是点不动的，不靠后端兜底。
+        四态由 _BTN 统一给：primary（主色实底）/ secondary（主色描边）/
+        danger（玫红实底）/ ghost（浮起灰底）。旧调用点传的 kind="buy"/"trade"
+        经 _LEGACY_KIND 映射，调用处一个都不用改。
+
+        disabled 时整颗压暗并且不挂事件，页面上灰掉的按钮是点不动的，
+        不靠后端兜底。高度一律 44px —— 原来 31px，拇指点不准。
         """
         style: Dict[str, Any] = {
             "display": "inline-flex",
             "alignItems": "center",
             "justifyContent": "center",
             "padding": "6px 14px",
-            "borderRadius": "6px",
+            "minHeight": TAP_H,
+            "borderRadius": R_MD,
             "fontSize": "12px",
             "fontWeight": "bold",
             "whiteSpace": "nowrap",
@@ -6964,16 +7177,11 @@ class ParkingBot(_PluginBase):
         if disabled:
             style.update({"cursor": "not-allowed", "opacity": "0.45",
                           "color": "#9E9E9E",
-                          "backgroundColor": "rgba(255,255,255,0.07)",
-                          "border": "1px solid rgba(255,255,255,0.10)"})
-        elif kind == "buy":
-            style.update({"cursor": "pointer", "color": "#1A1A2E",
-                          "backgroundColor": "#FFFFFF",
-                          "border": "1px solid #FFFFFF"})
+                          "backgroundColor": S3,
+                          "border": f"1px solid {L2}"})
         else:
-            style.update({"cursor": "pointer", "color": _SHOP_OWNED,
-                          "backgroundColor": "transparent",
-                          "border": "1px solid rgba(0,210,255,0.4)"})
+            style.update(dict(_BTN.get(_LEGACY_KIND.get(kind, kind), _BTN["ghost"])))
+            style["cursor"] = "pointer"
         node = {"component": "div", "props": {"style": style},
                 "content": [ParkingBot._text(label, {})]}
         if not disabled:
@@ -7024,7 +7232,7 @@ class ParkingBot(_PluginBase):
                     # 透明底。文字色本身已经够亮，底色成不成立都读得清。
                     "backgroundColor": (
                         "rgba(233,69,96,0.32)" if active else "rgba(255,255,255,0.10)"),
-                    "border": (f"1px solid {_SHOP_LOCK}" if active
+                    "border": (f"1px solid {_PINK}" if active
                                else "1px solid rgba(255,255,255,0.15)"),
                 }},
                 "content": [ParkingBot._text(name, {})],
@@ -7049,7 +7257,7 @@ class ParkingBot(_PluginBase):
 
         两个状态都**不落盘**：用户明确要求每次打开恢复全部。
         """
-        def _pill(label, active, api, params, accent=_SHOP_LOCK):
+        def _pill(label, active, api, params, accent=_PINK):
             return {
                 "component": "div",
                 "props": {"style": {
@@ -7089,10 +7297,10 @@ class ParkingBot(_PluginBase):
 
     @staticmethod
     def _grid(items: List[dict]) -> dict:
-        """车市卡片排布。游戏是两列栅格，这里用可换行的 flex 近似。"""
+        """车市卡片排布。可换行 flex 栅格，gutter 与车位网格统一成 8px。"""
         return {"component": "div",
                 "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                    "marginRight": "-5px"}},
+                                    "columnGap": "8px", "rowGap": "10px"}},
                 "content": items}
 
     @staticmethod
@@ -7107,21 +7315,34 @@ class ParkingBot(_PluginBase):
         ✓ 已拥有 N 辆，最后一行是并排的按钮。等级不足的整张卡压到半透明，
         按钮换成「需要 Lv.N」，和游戏的 .car-card.locked 一个做法。
 
-        badge 是右上角的实心小标签（个性化页用它标「使用中」）；
+        badge 是卡片顶部居中的小标签（个性化页用它标「使用中」）；
         不传就完全不渲染，车市卡片的布局一个像素都不变。
+
+        标签走**文档流**而不是绝对定位到右上角：卡片宽度只有 150px 左右，
+        「夜色停车场」这种 5 字标题会顶到右上角，和绝对定位的角标直接叠字。
+        放到标题上方居中之后，长名短名都不会撞。
         """
         content = []
         if badge:
             content.append({
                 "component": "div",
-                "props": {"style": {
-                    "position": "absolute", "top": "10px", "right": "10px",
-                    "padding": "2px 9px", "borderRadius": "999px",
-                    "fontSize": "10px", "fontWeight": "bold",
-                    "backgroundColor": accent, "color": "#1A1A2E",
-                    "letterSpacing": "0.3px",
-                }},
-                "content": [ParkingBot._text(badge, {})],
+                "props": {"style": {"display": "flex",
+                                    "justifyContent": "center",
+                                    "marginBottom": "7px"}},
+                "content": [{
+                    "component": "div",
+                    "props": {"style": {
+                        "padding": "1px 8px", "borderRadius": R_FULL,
+                        "fontSize": "10px", "fontWeight": "bold",
+                        # 描边 + 淡底而不是实心块：实心金块在小卡片上太抢，
+                        # 会把下面的价格和车名压成次要信息。
+                        "color": accent,
+                        "backgroundColor": ParkingBot._alpha(accent, 0.14),
+                        "border": f"1px solid {ParkingBot._alpha(accent, 0.40)}",
+                        "letterSpacing": "0.3px",
+                    }},
+                    "text": badge,
+                }],
             })
         if image:
             content.append({
@@ -7131,7 +7352,12 @@ class ParkingBot(_PluginBase):
                 "content": [ParkingBot._pic(image, str(title or "🚗")[:1], 96)],
             })
         content.append(ParkingBot._text(title, {"fontSize": "15px", "fontWeight": "bold",
-                                                "textAlign": "center", "marginBottom": "4px"}))
+                                                "textAlign": "center", "marginBottom": "4px",
+                                                # 车名长短差很多（「五菱宏光 MINI EV」vs「法拉利」），
+                                                # 不截断就会把整行撑宽、把同行卡片顶成不同高度
+                                                "whiteSpace": "nowrap",
+                                                "overflow": "hidden",
+                                                "textOverflow": "ellipsis"}))
         for line in lines:
             # 复合节点（金币图标那种自带样式的）直接塞进来，样式它自己有
             if isinstance(line, dict):
@@ -7150,21 +7376,33 @@ class ParkingBot(_PluginBase):
             })
         return {
             "component": "div",
-            "props": {"style": {
-                "flex": "1 1 190px",
-                "minWidth": "178px",
+            "props": {"class": "pb-item", "style": {
+                # 基准宽度从 190 收到 150：190 时 340px 内容区只排得下一列，
+                # 车市一屏只能看见一辆车，滑半天才到下一辆。150 后同屏两列，
+                # 「比较」这件事才成立。minWidth 必须是 0 —— 留着 178 会反过来
+                # 把基准宽度顶回去，等于白改。
+                "flex": "1 1 150px",
+                "minWidth": "0",
                 # 游戏是两列栅格。没有 maxWidth 的话，只剩一张卡时 flex 会把它
                 # 拉满整行，看起来跟网页版完全不是一回事
                 "maxWidth": "360px",
-                "margin": "0 5px 10px 0",
+                # gutter 8px / 行距 10px：由 _grid 的 columnGap / rowGap 提供
+                "margin": "0",
                 "padding": "14px",
-                "borderRadius": "12px",
+                "borderRadius": R_CARD,
                 "textAlign": "center",
                 # 角标要用绝对定位，容器必须是定位上下文
                 "position": "relative",
-                "border": f"1px solid {ParkingBot._alpha(accent, 0.34)}",
-                "backgroundColor": "rgba(255,255,255,0.04)",
-                "opacity": "0.5" if locked else "1",
+                # 边框不再跟 accent 走：accent 是「状态」（使用中/已拥有/买不起），
+                # 让它同时兼任「卡片描边」会让整页出现青/金/红/灰四种描边，
+                # 读起来像四套卡片。描边统一成 L2，状态只留在角标和文字上。
+                "border": f"1px solid {L2}",
+                # 车卡是「可点的浮起面」：比卡片底亮一档 + 一层内高光
+                "backgroundColor": S3,
+                "boxShadow": _SH3,
+                # 锁住的卡压到 0.72 而不是 0.5：0.5 时白字对底只有 2.4:1，
+                # 「需要 Lv.30」这行关键信息反而最看不清。
+                "opacity": "0.72" if locked else "1",
             }},
             "content": content,
         }
@@ -7248,7 +7486,7 @@ class ParkingBot(_PluginBase):
                          ParkingBot._text(str(car.get("name") or "车辆"),
                                           {"fontSize": "13px", "fontWeight": "bold"}),
                          ParkingBot._text(f"{self._to_int(car.get('rate'), 0)}金/分钟",
-                                          {"fontSize": "11px", "color": _SHOP_EARN}),
+                                          {"fontSize": "11px", "color": _GREEN}),
                      ]},
                     ParkingBot._text(f"补 {ParkingBot._fmt_num(diff)} 金",
                                      {"fontSize": "13px", "fontWeight": "bold",
@@ -7354,14 +7592,14 @@ class ParkingBot(_PluginBase):
                 lines = [ParkingBot._coin(ParkingBot._fmt_num(price), size=14,
                                           color=_GOLD,
                                           style={"marginTop": "3px"}),
-                         (f"{self._to_int(sale.get('earn'), 0)}金/分钟", _SHOP_EARN)]
+                         (f"{self._to_int(sale.get('earn'), 0)}金/分钟", _GREEN)]
                 if original > price:
                     lines.insert(0, (f"原价 {ParkingBot._fmt_num(original)} 金", "#9E9E9E"))
                 if locked:
-                    lines.append((f"需要 Lv.{need_level}", _SHOP_LOCK))
+                    lines.append((f"需要 Lv.{need_level}", _PINK))
                     actions = None
                 elif sold_out:
-                    lines.append(("已售罄", _SHOP_LOCK))
+                    lines.append(("已售罄", _PINK))
                     actions = [self._action_btn("已售罄", flash_api,
                                                 {"sale_id": sale.get("id")}, disabled=True)]
                 else:
@@ -7416,11 +7654,11 @@ class ParkingBot(_PluginBase):
                 lines = [ParkingBot._coin(ParkingBot._fmt_num(price), size=14,
                                           color=_GOLD,
                                           style={"marginTop": "3px"}),
-                         (f"{self._to_int(car.get('earn'), 0)}金/分钟", _SHOP_EARN)]
+                         (f"{self._to_int(car.get('earn'), 0)}金/分钟", _GREEN)]
                 if mine_count:
-                    lines.append((f"✓ 已拥有{mine_count}辆", _SHOP_OWNED))
+                    lines.append((f"✓ 已拥有{mine_count}辆", _CYAN))
                 if locked:
-                    lines.append((f"需要 Lv.{need_level}", _SHOP_LOCK))
+                    lines.append((f"需要 Lv.{need_level}", _PINK))
                     actions = None
                 else:
                     upgradable = [c for c in idle_cars
@@ -7467,16 +7705,19 @@ class ParkingBot(_PluginBase):
                 _sub,
                 [self._cat_pills(categories, current, filter_api),
                  self._shop_filter_row(afford_api, sort_api, _sort_label),
-                 self._grid(items)], accent=_GOLD,
+                 self._grid(items) if items else self._empty(
+                     "🛒", "这个分类下暂时没有车",
+                     "换个分类，或关掉「只看可买」再看看")], accent=_GOLD,
             ))
         # 车型表拿不到（game_data.php 失败）时上面两段都不会产出。
         # 仍然要给出这张卡：车市页需要一个兜底标题，否则切到车市会是一片空白。
         if not blocks:
             blocks.append(self._card(
                 "车市",
-                "车型表与特卖列表暂时拿不到，下一轮执行成功后会自动补上",
-                [self._text("车市数据未加载",
-                            {"fontSize": "13px", "opacity": "0.8"})], accent=_GOLD,
+                "车型表与特卖列表暂时拿不到",
+                [self._empty("📡", "车市数据未加载",
+                             "下一轮执行成功后会自己补上，不用手动刷新")],
+                accent=_GOLD,
             ))
         return blocks
 
@@ -7508,33 +7749,12 @@ class ParkingBot(_PluginBase):
         cash = self._to_int(snapshot.get("cash"), 0)
         sub = self._personal_sub if self._personal_sub in ("scene", "show") else "scene"
 
-        def _sub_tab(key: str, label: str) -> dict:
-            active = key == sub
-            return {
-                "component": "div",
-                "props": {"style": {
-                    "flex": "0 0 auto", "padding": "7px 18px",
-                    "borderRadius": "999px", "fontSize": "13px",
-                    "whiteSpace": "nowrap", "cursor": "pointer",
-                    "userSelect": "none", "fontWeight": "bold" if active else "normal",
-                    "color": "#7FF6FF" if active else "#CCCCCC",
-                    "backgroundColor": (
-                        "rgba(34,211,238,0.18)" if active else "rgba(255,255,255,0.08)"),
-                    "border": (f"1px solid {_CYAN}" if active
-                               else "1px solid rgba(255,255,255,0.15)"),
-                }},
-                "content": [ParkingBot._text(label, {})],
-                "events": {"click": {"api": sub_api, "method": "post",
-                                     "params": {"sub": key}}},
-            }
-
-        subnav = {
-            "component": "div",
-            "props": {"style": {"display": "flex", "gap": "8px",
-                                "marginBottom": "12px", "flexWrap": "wrap"}},
-            "content": [_sub_tab("scene", "🏞️ 场景"),
-                        _sub_tab("show", "🧍 皮皮秀")],
-        }
+        # 二级页签和一级页签共用 _segmented：同一页里出现两种「被选中」的写法
+        # （一种 22% 青底带光晕、一种 18% 青底无光晕）会让人分不清自己在第几层。
+        # level="L2" 只给底 + 1px 内描边、去掉外发光 ring —— 层级差异靠 ring 表达。
+        subnav = self._segmented(
+            [("scene", "🏞️ 场景", None), ("show", "🧍 皮皮秀", None)],
+            sub, sub_api, param="sub", level="L2")
 
         items: List[dict] = []
 
@@ -7544,10 +7764,10 @@ class ParkingBot(_PluginBase):
             if str(item_id) == str(current_id):
                 return _GOLD, "使用中", "使用中", _GOLD
             if item_id in owned_ids or price == 0:
-                return _CYAN, "已拥有", "✓ 已购买", _SHOP_OWNED
+                return _CYAN, "已拥有", "✓ 已购买", _CYAN
             if price > cash:
-                return (_SHOP_LOCK, "金币不足",
-                        f"未购买 · 还差 {self._fmt_num(price - cash)} 金", _SHOP_LOCK)
+                return (_PINK, "金币不足",
+                        f"未购买 · 还差 {self._fmt_num(price - cash)} 金", _PINK)
             return _PURPLE, "", "未购买", "rgba(255,255,255,0.62)"
 
         if sub == "scene":
@@ -7558,11 +7778,16 @@ class ParkingBot(_PluginBase):
                 accent, badge, state_text, state_color = _state(
                     bg_id, owned_bgs, current_bg, price)
                 using = bg_id == current_bg
-                lines: List[Any] = [self._coin(self._fmt_num(price), size=14,
-                                               color=_GOLD)]
+                owned = bg_id in owned_bgs or price == 0
+                # 已拥有（含正在用的）就不再报价格：卡上写着「$ 0」既不是售价也不是
+                # 余额，纯噪音。状态文案和顶部徽章一模一样的也去掉 —— 使用中的卡
+                # 原来上下各写一遍「使用中」。
+                lines: List[Any] = [] if owned else [
+                    self._coin(self._fmt_num(price), size=14, color=_GOLD)]
                 if bonus > 0:
                     lines.append((f"收益 +{bonus}%（仅私家车位）", _AMBER))
-                lines.append((state_text, state_color))
+                if state_text and state_text != badge:
+                    lines.append((state_text, state_color))
                 actions = None
                 if using:
                     actions = None
@@ -7579,9 +7804,9 @@ class ParkingBot(_PluginBase):
                     accent=accent, image=str(bg.get("image") or ""),
                     badge=badge))
             if not items:
-                items.append(self._text(
-                    "场景数据未加载（下一轮执行成功后自动补上）",
-                    {"fontSize": "13px", "opacity": "0.7"}))
+                items.append(self._empty(
+                    "🏞️", "场景数据未加载",
+                    "下一轮执行成功后会自己补上，不用手动刷新"))
             title = "场景"
             subtitle = ("停车场背景。收益加成只对**私家车位**生效（爱心车位不受影响）；"
                         "金色标签＝当前使用中，青色＝已拥有可切换。")
@@ -7596,8 +7821,12 @@ class ParkingBot(_PluginBase):
                 accent, badge, state_text, state_color = _state(
                     qs_id, owned_qs, current_qs, price)
                 using = qs_id == current_qs
-                lines = [self._coin(self._fmt_num(price), size=14, color=_GOLD)]
-                lines.append((state_text, state_color))
+                owned = qs_id in owned_qs or price == 0
+                # 同场景卡：已拥有不报价格、状态文案与徽章重复时只留徽章。
+                lines: List[Any] = [] if owned else [
+                    self._coin(self._fmt_num(price), size=14, color=_GOLD)]
+                if state_text and state_text != badge:
+                    lines.append((state_text, state_color))
                 actions = None
                 if using:
                     actions = None
@@ -7615,9 +7844,9 @@ class ParkingBot(_PluginBase):
                     accent=accent, image=str(qs.get("image") or ""),
                     badge=badge))
             if not items:
-                items.append(self._text(
-                    "皮皮秀数据未加载（下一轮执行成功后自动补上）",
-                    {"fontSize": "13px", "opacity": "0.7"}))
+                items.append(self._empty(
+                    "🧍", "皮皮秀数据未加载",
+                    "下一轮执行成功后会自己补上，不用手动刷新"))
             title = "皮皮秀"
             subtitle = ("QQ 秀形象。购买后立刻穿戴；再点当前穿戴款可切回默认。"
                         + (f"（已按性别 {gender} 过滤）" if gender else ""))
@@ -7631,6 +7860,79 @@ class ParkingBot(_PluginBase):
             accent=_PURPLE,
         )]
 
+    @classmethod
+    def _segmented(cls, items: List[Tuple[str, str, Optional[str]]],
+                   current: str, api: str, param: str = "tab",
+                   level: str = "L1") -> dict:
+        """
+        分段控件：一级页签（顶部）与二级子页签（个性化页）共用一套。
+
+        items 是 (key, label, icon_key|None)。level="L1" 给外发光 ring，
+        level="L2" 只给底 + 边、去掉 ring —— **ring 的唯一判据是层级**。
+        原来两套各写各的（一套 22% 青底 + 光晕 + r10，一套 18% 青底无光晕 + r999），
+        用户在同一个页面里看到两种「被选中」，分不清自己在第几层。
+
+        label 必须走 html 而不是 text：tests/test_regress.py 的 section_titles()
+        用 walk() 收集全部 text 节点找区块标题，导航文案一旦落成 text 就会撞上
+        「我的车库」这类标题，让「车位页不含车库区块」的断言误判。
+        """
+        ring = (level == "L1")
+        buttons = []
+        for key, label, icon_key in items:
+            active = (key == current)
+            content: List[dict] = []
+            if icon_key:
+                content.append({
+                    "component": "span",
+                    # class 留给媒体查询：≤420px 时隐藏图标，5 个两字标签才排得进单行
+                    "props": {"class": "pb-nav-ico", "style": {"display": "flex"}},
+                    "html": _ICONS.get(icon_key, "").replace("@SIZE@", "16px"),
+                })
+            content.append({
+                "component": "div",
+                "props": {"style": {"fontWeight": "bold" if active else "normal"}},
+                "html": label,
+            })
+            buttons.append({
+                "component": "div",
+                "props": {"class": "pb-nav-item", "style": {
+                    "display": "flex", "alignItems": "center",
+                    "justifyContent": "center", "gap": "5px",
+                    "flex": "1 1 0", "minWidth": "0",
+                    "minHeight": TAP_H, "padding": "4px 8px",
+                    "borderRadius": R_MD if ring else R_FULL,
+                    "fontSize": "13px", "cursor": "pointer", "userSelect": "none",
+                    "whiteSpace": "nowrap",
+                    "color": "#8DF3FF" if active else "rgba(255,255,255,0.78)",
+                    "backgroundColor": SEL_BG if active else "transparent",
+                    "border": ("1px solid rgba(34,211,238,0.72)" if active
+                               else "1px solid transparent"),
+                    # 一级给一圈 3px 外发光（选中「层」），二级只给 1px 内描边（选中「项」）
+                    "boxShadow": ("inset 0 0 0 1px rgba(34,211,238,0.18), "
+                                  "0 0 0 3px rgba(34,211,238,0.10)"
+                                  if (active and ring)
+                                  else ("inset 0 0 0 1px rgba(34,211,238,0.16)"
+                                        if active else "none")),
+                    # 刻意不写内联 transition：内联值优先级高于样式表，
+                    # 会盖掉 .pb-tap 的过渡，hover 变成硬跳变。交给 _TAP_CSS 统一管。
+                }},
+                "content": content,
+                "events": {"click": {"api": api, "method": "post",
+                                     "params": {param: key}}},
+            })
+        return {
+            "component": "div",
+            "props": {"class": f"pb-seg-{level.lower()}", "style": {
+                "display": "flex", "gap": "4px", "marginBottom": "14px",
+                "flexWrap": "nowrap",
+                # 凹槽：一组互斥选项收进内嵌槽里，比几颗按钮直接浮在页面上更像一组
+                "padding": "4px", "borderRadius": R_CARD,
+                "backgroundColor": S2,
+                "border": f"1px solid {L2}",
+            }},
+            "content": buttons,
+        }
+
     def _nav_row(self, current: str) -> dict:
         """
         顶部区块切换栏。
@@ -7643,75 +7945,14 @@ class ParkingBot(_PluginBase):
         这里刻意不用 <a href="#..."> 锚点：插件页是 hash 路由（#/plugins），
         点锚点会把 hash 改成 #pb-xxx，路由匹配失败后整个插件弹窗被卸载，
         表现为「点一下页面就没了」。
+
+        具体长什么样交给 _segmented：一级/二级页签共用一套分段控件，
+        这里只负责把 _TABS 翻译成 (key, label, icon) 三元组并给出 api。
         """
         api = f"plugin/{getattr(self, 'plugin_id', None) or self._PLUGIN_ID}/tab"
-        buttons = []
-        for key, label in self._TABS:
-            active = (key == current)
-            buttons.append({
-                "component": "div",
-                "props": {
-                    "style": {
-                        "display": "flex",
-                        "alignItems": "center",
-                        "justifyContent": "center",
-                        "gap": "6px",
-                        "flex": "1 1 0",
-                        "minWidth": "96px",
-                        "padding": "9px 10px",
-                        "borderRadius": "10px",
-                        "fontSize": "13px",
-                        "cursor": "pointer",
-                        "userSelect": "none",
-                        "whiteSpace": "nowrap",
-                        # 当前页签是实心青底，未选中的是半透明描边 —— 和游戏顶部那排一致。
-                        #
-                        # 刻意不用 linear-gradient：MoviePilot 的渲染器不会把渐变
-                        # 写进 backgroundColor（同一个 style 对象里的 border、
-                        # padding、boxShadow 都生效，唯独它不生效），于是选中态
-                        # 变成「透明底 + 深色字」，在深色页面上几乎看不清。
-                        # 改成实色 rgba + 亮青文字：底色成不成立文字都读得出来。
-                        "color": "#7FF6FF" if active else "rgba(255,255,255,0.82)",
-                        "backgroundColor": (
-                            "rgba(34,211,238,0.22)" if active else "rgba(255,255,255,0.07)"),
-                        "border": (f"1px solid {_CYAN}" if active
-                                   else "1px solid rgba(255,255,255,0.14)"),
-                        "boxShadow": ("0 4px 14px rgba(34,211,238,0.28)"
-                                      if active else "none"),
-                        "transition": "background-color .15s ease, color .15s ease",
-                    },
-                },
-                "content": [
-                    # 图标是 currentColor 描边，跟着外层 color 走：选中时深色压青底，
-                    # 未选中时浅色，跟文字一个颜色
-                    {"component": "span",
-                     "props": {"style": {"display": "flex"}},
-                     "html": _ICONS[key].replace("@SIZE@", "16px")},
-                    # 页签文案走 html 渲染、不落成 text 节点：去掉 ①②③④ 编号后
-                    # 导航文案会和区块卡片标题（如「我的车库」）逐字相同，
-                    # 而 tests/test_regress.py 的 section_titles() 用 walk() 收集
-                    # 全部 text 节点找区块标题，导航里再冒出一个同名 text 就会让
-                    # 「车位页不含车库区块」「车市页不含车库区块」两条断言误判。
-                    # 改走 html 后它不再是 text 节点，断言恢复成立，显示完全一致。
-                    {"component": "div",
-                     "props": {"style": {"fontWeight": "bold" if active else "normal"}},
-                     "html": label},
-                ],
-                "events": {"click": {"api": api, "method": "post", "params": {"tab": key}}},
-            })
-        return {
-            "component": "div",
-            "props": {"style": {
-                "display": "flex", "gap": "6px", "marginBottom": "14px",
-                "flexWrap": "wrap",
-                # 外面套一层内嵌槽：页签是「一组互斥选项」，收进一个凹槽里
-                # 比四颗按钮直接浮在页面上更像一组。按钮自己的样式一个都没动。
-                "padding": "6px", "borderRadius": "14px",
-                "backgroundColor": "rgba(255,255,255,0.03)",
-                "border": "1px solid rgba(255,255,255,0.10)",
-            }},
-            "content": buttons,
-        }
+        return self._segmented(
+            [(key, label, key) for key, label in self._TABS],
+            current, api, param="tab", level="L1")
 
     def get_page(self) -> List[dict]:
         """返回插件详情页：顶部切换栏 + 当前选中的那一个区块。"""
@@ -7826,7 +8067,7 @@ class ParkingBot(_PluginBase):
                                      "gap": "6px"}},
                  "content": [
                      self._text("最近一轮", {"fontSize": "11px",
-                                             "color": "rgba(255,255,255,0.32)"}),
+                                             "color": _DIM}),
                      self._text(last_run, {"fontSize": "12px", "fontWeight": "700",
                                            "color": "rgba(255,255,255,0.92)"}),
                  ]},
@@ -7836,7 +8077,7 @@ class ParkingBot(_PluginBase):
                  "content": [
                      self._text("本进程累计挪车收益",
                                 {"fontSize": "11px",
-                                 "color": "rgba(255,255,255,0.32)"}),
+                                 "color": _DIM}),
                      self._coin(f"{self._total_earned} 金币", size=14, color=_GOLD,
                                 bold=True, align="left"),
                  ]},
@@ -7986,7 +8227,7 @@ class ParkingBot(_PluginBase):
             # VRow/VCol，少 8 层组件，宽度也能自己说了算。
             {"component": "div",
              "props": {"style": {"display": "flex", "flexWrap": "wrap",
-                                 "marginRight": "-8px", "marginBottom": "4px"}},
+                                 "gap": "8px", "marginBottom": "4px"}},
              "content": stats},
             self._nav_row(tab),
             *sections,
@@ -8000,9 +8241,9 @@ class ParkingBot(_PluginBase):
     # 声明式 JSON 没有 JS 执行口，唯一能给页面补规则的途径就是 html 字段里
     # 的一段 <style>（v-html 插入的 style 标签浏览器会正常解析生效）。
     #
-    # 作用域：所有选择器都以 .pb-tap 打头，只匹配我们自己挂上去的类，
-    # 不会波及同一弹窗里的其他插件。不用包裹容器是因为 get_page() 返回的是
-    # 平铺的列表，各顶层块是兄弟节点、没有共同父节点可挂类名。
+    # 作用域：所有选择器都以 pb- 前缀的类名打头（pb-tap / pb-nav-item / pb-card …），
+    # 只匹配我们自己挂上去的类，不会波及同一弹窗里的其他插件。不用包裹容器是因为
+    # get_page() 返回的是平铺的列表，各顶层块是兄弟节点、没有共同父节点可挂类名。
     _TAP_CSS = (
         "<style>"
         ".pb-tap{transition:filter .12s ease,transform .12s ease}"
@@ -8010,6 +8251,22 @@ class ParkingBot(_PluginBase):
         ".pb-tap:active{transform:scale(.96)}"
         # 尊重系统的「减少动态效果」设置：有人对动效敏感，别硬给。
         "@media (prefers-reduced-motion:reduce){.pb-tap{transition:none}}"
+        # ---------- 窄屏 ----------
+        # 声明式 JSON 写不了媒体查询，但「5 个页签 + 图标」在 360px 弹窗里
+        # 必然排不进单行（换行后凹槽被切成两段、高度翻倍）。唯一的补规则口子
+        # 就是这段 <style>，所以窄屏适配全部集中在这里，靠 class 钩子生效。
+        # 每条都必须 !important：这些属性在节点上是内联 style，内联优先级更高。
+        "@media (max-width:430px){"
+        # 一级页签：收紧内距、去掉图标，只留 2 字标签
+        ".pb-seg-l1{gap:2px!important;padding:3px!important}"
+        ".pb-seg-l1 .pb-nav-item{padding:4px 2px!important;gap:0!important;"
+        "font-size:12px!important}"
+        ".pb-nav-ico{display:none!important}"
+        # 二级页签：文字带 emoji，内距压到 10px 仍够读
+        ".pb-seg-l2 .pb-nav-item{padding:4px 10px!important}"
+        # 卡片内距 16 → 12：小屏上左右各让出 8px 给内容
+        ".pb-card{padding:12px!important}"
+        "}"
         "</style>")
 
     @classmethod
