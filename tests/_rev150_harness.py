@@ -773,19 +773,38 @@ CASES = [
          '                _lock = (self._trade_locks or {}).get(_cat)\n'),
     ], "锁定「代步车=桑塔纳」后只换桑塔纳", "fail"),
 
-    ("金币流水不落盘（_coin_events 收走了但没进 bucket）", [
+    ("金币支出流水不落盘（_coin_events 收走了但没进 bucket）", [
         ('            bucket["log"] = _log[-200:]\n', '            pass\n'),
-    ], "流水落进当天 daily", "fail"),
+    ], "支出落进当天 daily", "fail"),
 
-    ("零元收支也刷一条流水", [
-        ('        if not delta:\n            return\n',
+    ("收入和 0 元也刷进流水（v1.54.1 起流水只记支出）", [
+        ('        if delta >= 0:\n            return\n',
          '        if False:\n            return\n'),
-    ], "金额为 0 的不记", "fail"),
+    ], "只记支出：kind / delta / note 都对", "fail"),
 
     ("锁定接口只能加不能取消", [
         ('        if str(locks.get(category)) == car_key:\n',
          '        if False:\n'),
     ], "同款再点一次 = 取消该分类锁定", "fail"),
+
+    # ---- v1.54.1 贴条失败后就地刷新车位 ----
+    ("车位上没有车时不刷新快照（幽灵车一直挂着）", [
+        ('            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")\n'
+         '            return _result({"success": False,\n'
+         '                            "error": "车位上没有车（可能刚被挪走，已刷新车位状态）"})\n',
+         '            return _result({"success": False,\n'
+         '                            "error": "车位上没有车（可能刚被挪走，已刷新车位状态）"})\n'),
+    ], "车位上没有车：返回失败，且刷新了快照", "fail"),
+
+    ("停放不足时长也白刷一次（把刷新加到了规则性失败上）", [
+        ('        if mins < min_ticket:\n'
+         '            return _result({"success": False,\n'
+         '                            "error": f"停放不足 {min_ticket} 分钟，还差 {min_ticket - mins} 分钟"})\n',
+         '        if mins < min_ticket:\n'
+         '            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")\n'
+         '            return _result({"success": False,\n'
+         '                            "error": f"停放不足 {min_ticket} 分钟，还差 {min_ticket - mins} 分钟"})\n'),
+    ], "停放不足时长：只报错、不白刷一次", "fail"),
 ]
 
 ok = True
