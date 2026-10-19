@@ -371,7 +371,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.54.0"
+    plugin_version = "1.54.1"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -433,16 +433,18 @@ class ParkingBot(_PluginBase):
     # 车市可用的排序档位。ratio = 收益÷价格（性价比），默认按这个排。
     _SHOP_SORTS = (("ratio", "性价比"), ("price", "价格低→高"),
                    ("earn", "收益高→低"))
-    # 金币流水的来源标签。键是 _coin_event 的 kind，值是统计页上显示的中文。
+    # 金币**支出**流水的来源标签。键是 _coin_event 的 kind，值是统计页显示的中文。
+    # 收入类（unpark/fine/recycle）不在流水里；标签保留只为兼容 v1.54.0 写下的
+    # 老数据 —— 渲染层按 delta < 0 过滤，它们不会显示出来。
     _COIN_KINDS = {
-        "unpark": "挪车收益",
-        "fine": "贴条罚款",
-        "recycle": "回收车辆",
         "buy": "买车",
         "trade": "换车差价",
         "flash": "抢购特卖",
         "bg": "买场景",
         "qqshow": "买皮皮秀",
+        "unpark": "挪车收益",
+        "fine": "贴条罚款",
+        "recycle": "回收车辆",
     }
     # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
     # 切页签回来还在，和 _cat / _trade_for 一个套路。
@@ -2736,16 +2738,21 @@ class ParkingBot(_PluginBase):
 
     def _coin_event(self, kind: str, delta: int, note: str = "") -> None:
         """
-        记一笔金币流水（只进内存，_record_round 落进当天 daily["log"] 后清空）。
+        记一笔**金币支出**流水（只进内存，_record_round 落进当天 daily["log"] 后清空）。
 
         kind 是机器可读的来源：
-          unpark 挪车收益 / fine 贴条罚款 / recycle 回收车辆 /
           buy 买车 / trade 换车差价 / flash 抢购特卖 / bg 买场景 / qqshow 买皮皮秀
 
+        ★v1.54.1 起**只记支出**（delta < 0），收入一律不进流水。
+        理由：挪车收益每 5 分钟一轮、一天 288 条，逐笔列出来会把每天的条数上限
+        占满，真正想查的「钱花在哪了」全被挤出去。收入在「当日收益 / 其中贴条 /
+        其中回收」三格汇总里本来就有，不需要逐笔。
+        金额为 0 的同样不记（免费场景 / 免费皮皮秀不算一笔支出）。
+
         ★和 _shop_* 累加器是**双写**：累加器继续供当日/本月汇总（已有测试锁着），
-        这里供逐笔明细。金额为 0 的不记（免费场景/免费皮皮秀不算一笔收支）。
+        这里供逐笔明细。
         """
-        if not delta:
+        if delta >= 0:
             return
         self._coin_events.append({
             "t": self._now_naive().strftime("%H:%M"),
@@ -3042,12 +3049,10 @@ class ParkingBot(_PluginBase):
             self._shop_recycled = 0
             self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
 
-            # ---------- 金币流水 ----------
-            # 本轮所有逐笔操作（买车/换车/回收/贴条/抢购/场景/皮皮秀）在发生时
-            # 已经进了 _coin_events；这里再补「挪车收益」那一笔，整体并入当天。
-            # 每天最多留 200 条 —— 流水是「最近怎么赚的/怎么花的」，不是永久账本。
-            self._coin_event("unpark", earned,
-                             f"挪走 {moved} 辆" if moved else "")
+            # ---------- 金币支出流水 ----------
+            # 只记支出：本轮所有花钱的操作（买车/换车/抢购/场景/皮皮秀）在发生时
+            # 已经进了 _coin_events。收入不进流水（理由见 _coin_event 的注释）。
+            # 每天最多留 200 条 —— 只记支出后一天通常只有个位数，200 只是兜底上限。
             _log = bucket.get("log")
             _log = list(_log) if isinstance(_log, list) else []
             _log.extend(self._coin_events)
@@ -4743,11 +4748,26 @@ class ParkingBot(_PluginBase):
         avg = round(m_earned / max(1, len(month_days)))
         buys = sum(self._to_int((daily[d] or {}).get("bought"), 0) for d in month_days)
         trades = sum(self._to_int((daily[d] or {}).get("traded"), 0) for d in month_days)
-        # 当天金币流水：脏数据逐条滤掉（落盘数据被手改时 list 里可能混进字符串）
+        # 当天金币支出流水。
+        # 三重过滤：
+        #   1) 脏数据（落盘被手改时 list 里可能混进字符串）
+        #   2) 只留 delta < 0 —— v1.54.0 写进去的收入记录（挪车/贴条/回收）
+        #      在 v1.54.1 之后不该再显示，否则「支出流水」里混着 +120 很别扭
+        #   3) 金额转成正数，列名已经叫「支出」，不用再带负号
+        # ★取 delta 不能用 _to_int：它默认 minimum=0，会把 -500 钳成 0，
+        # 结果所有支出都被当成「非负」过滤掉，流水永远是空的。
+        def _delta_of(entry: dict) -> int:
+            try:
+                return int(entry.get("delta") or 0)
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
         _coin_log = bucket.get("log")
-        _coin_log = ([e for e in _coin_log if isinstance(e, dict)]
+        _coin_log = ([e for e in _coin_log
+                      if isinstance(e, dict) and _delta_of(e) < 0]
                      if isinstance(_coin_log, list) else [])
         _coin_recent = list(reversed(_coin_log))[:30]
+        _coin_total = sum(-_delta_of(e) for e in _coin_log)
 
         blocks = [
             # 最近 7 天日期卡片
@@ -4787,25 +4807,28 @@ class ParkingBot(_PluginBase):
             # 只铺最近 30 笔（时间倒序）：流水回答的是「最近怎么赚的、怎么花的」，
             # 不是永久账本；完整 200 条仍在 daily["log"] 里。
             self._card(
-                "金币流水",
-                (f"{current} 共 {len(_coin_log)} 笔，这里显示最近 {len(_coin_recent)} 笔；"
-                 "正数是收入（挪车/贴条/回收），负数是支出（买车/换车/抢购/场景/皮皮秀）")
-                if _coin_log else f"{current} 还没有金币收支记录",
+                "金币支出流水",
+                (f"{current} 共 {len(_coin_log)} 笔，合计花出 "
+                 f"{self._fmt_num(_coin_total)} 金"
+                 f"（这里显示最近 {len(_coin_recent)} 笔）")
+                if _coin_log else f"{current} 还没有金币支出记录",
                 ([self._table(
-                    ["时间", "类型", "金额", "说明"],
+                    ["时间", "项目", "支出", "说明"],
                     [[str(e.get("t") or ""),
                       self._COIN_KINDS.get(str(e.get("kind") or ""),
                                             str(e.get("kind") or "其他")),
-                      ("+" if self._to_int(e.get("delta"), 0) > 0
-                       else "") + self._fmt_num(e.get("delta")),
+                      # 列名已经是「支出」，显示绝对值比 -500 更好读。
+                      # ★这里必须用 _delta_of 而不是 _to_int —— 后者默认
+                      # minimum=0，会把 -500 钳成 0，整列都变成「0」。
+                      self._fmt_num(-_delta_of(e)),
                       str(e.get("note") or "")]
                      for e in _coin_recent],
                     ["0.7", "1.1", "1", "1.8"],
                     ["left", "left", "right", "left"])]
                  if _coin_log else
                  [self._text(
-                     "本轮执行后开始记录：挪车、贴条、回收、买车、换车、抢购、"
-                     "场景与皮皮秀都会逐笔留下收支。",
+                     "只在花钱时记账：买车、换车差价、抢购特卖、买场景、买皮皮秀。"
+                     "收入（挪车/贴条/回收）看上面的「当日收益」，不重复列在这里。",
                      {"fontSize": "13px", "opacity": "0.7"})]),
                 accent=_GOLD),
             # 每日明细
@@ -6200,6 +6223,25 @@ class ParkingBot(_PluginBase):
         return _result({"success": True, "car": self._car_name(car, cars_map),
                         "rate": rate, "spotId": spot.get("id")})
 
+    async def _refresh_snapshot_inplace(self, client: Any, state: dict,
+                                       user_id: Any, what: str) -> None:
+        """
+        用**刚拉到的** state 就地刷一次快照，不再多打一次 state.php。
+
+        ★ v1.54.1：贴条失败（尤其「车位上没有车」）说明页面上的快照已经过期 ——
+        车早被挪走了，页面还显示着它。不刷新的话用户只能反复点同一个按钮，
+        每次都被同一句错误顶回来，看起来像插件坏了。
+
+        这里刻意不复用 `_refresh_snapshot`：那个会再拉一次 state.php（约 1.1 秒），
+        而我们手里这份 state 就是刚才 `_load_game_context` 拉的、已经是最新的。
+        """
+        try:
+            await self._record_round(client, state, user_id, 0, 0, 0,
+                                     record_history=False)
+        except Exception as err:
+            # 刷新失败不能把「贴条失败」变成 500：页面上那句错误本身仍然有用
+            logger.warning(f"[不可躺自动抢车位] {what}后刷新车位状态失败：{err}")
+
     async def api_ticket(self, request: TicketRequest) -> ApiResult:
         """
         给停在我私家车位上的别人的车贴条。
@@ -6227,21 +6269,35 @@ class ParkingBot(_PluginBase):
         spot = next((s for s in self._dict_rows(state.get("parkingSpots"))
                      if str(s.get("id")) == spot_key), None)
         if not spot:
-            return _result({"success": False, "error": "车位不存在"})
+            # 车位从最新状态里消失了（游戏侧删位/换位），页面上的快照同样过期
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
+            return _result({"success": False,
+                            "error": "车位不存在（已刷新车位状态）"})
         # 原样透传车位 ID，不做字符串化：游戏那边发的是数字（ticketCar(spot.id)），
         # 服务端按数字取值。先用字符串比较定位车位，命中后回传原始值。
         raw_spot_id = spot.get("id")
         if str(spot.get("ownerId")) != str(user_id):
-            return _result({"success": False, "error": "只能给自己的车位贴条"})
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
+            return _result({"success": False,
+                            "error": "只能给自己的车位贴条（已刷新车位状态）"})
         if spot.get("spotType") == "charity":
-            return _result({"success": False, "error": "爱心车位不能贴条"})
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
+            return _result({"success": False,
+                            "error": "这个车位已改成爱心车位（已刷新车位状态）"})
         car_in_spot = spot.get("carInSpot")
         if not car_in_spot:
-            return _result({"success": False, "error": "车位上没有车"})
+            # ★用户主诉：页面显示有车、点贴条却提示「车位上没有车」——
+            # 车早在快照生成之后被挪走了。不刷新的话页面一直挂着一辆幽灵车，
+            # 用户只能反复点同一个按钮、每次被同一句错误顶回来。
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
+            return _result({"success": False,
+                            "error": "车位上没有车（可能刚被挪走，已刷新车位状态）"})
         car = next((c for c in self._dict_rows(state.get("userCars"))
                     if str(c.get("id")) == str(car_in_spot)), None)
         if car is None:
-            return _result({"success": False, "error": "车位上的车已不在"})
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
+            return _result({"success": False,
+                            "error": "车位上的车已不在（已刷新车位状态）"})
         if str(car.get("userId")) == str(user_id):
             return _result({"success": False, "error": "自己停的车不用贴条"})
 
@@ -6257,8 +6313,12 @@ class ParkingBot(_PluginBase):
         result = await client.post_json(f"{self.API_BASE}/ticket.php",
                                        json={"spotId": raw_spot_id})
         if not result or not result.get("success"):
+            # 接口失败多半是并发：点下去那一刻车刚好被挪走。
+            # 刷新一次，让页面和真实状态对齐（否则又是「幽灵车」）。
+            await self._refresh_snapshot_inplace(client, state, user_id, "贴条")
             return _result({"success": False,
-                            "error": (result or {}).get("error") or "贴条失败"})
+                            "error": ((result or {}).get("error") or "贴条失败")
+                                     + "（已刷新车位状态）"})
         # 罚款是真金白银的收入，并进当天统计（和挪车收益同一口径）。
         #
         # 字段名要兼容：游戏 2026-10 改过 ticket.php 的返回结构，旧版给的是
