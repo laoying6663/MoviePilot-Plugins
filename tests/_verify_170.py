@@ -6774,6 +6774,86 @@ _r, _n = _ticket_run(_spot_ok)
 check("★贴条成功仍只刷新一次（新分支没有让成功路径多刷）",
       _r.success and _n == 1, (_r.message, _n))
 
+print("\n--- #47 皮皮秀购买：乐观更新，不重复扣钱（v1.54.2）---")
+# 用户主诉：买皮皮秀要点两次才显示「使用中」，而且金币支出流水记了两笔。
+# 根因：购买走 saveState，写完立刻回读时服务端可能还是旧值，
+#      _refresh_snapshot 把刚买好的状态覆盖回「未购买」→ 用户再点一次 → 重复扣钱。
+# 修法：买完直接乐观更新本地快照，不再依赖回读。
+
+_QS_STATE = {
+    "success": True, "userId": "me",
+    "gameSettings": {"MAX_CARS": 10},
+    "users": {"me": {"name": "我", "level": 5, "cash": 1000,
+                     "gender": "M", "qqShowId": 1}},
+    "ownedQqShows": [1],
+    "userCars": [], "parkingSpots": [],
+}
+_QS_GD = dict(GD)
+_QS_GD["qqShows"] = [
+    {"id": 1, "name": "默认男", "file": "a.png", "price": 0, "gender": "M"},
+    {"id": 3, "name": "潮男", "file": "b.png", "price": 300, "gender": "M"},
+]
+
+
+def _qs_run(qs_id, action, snap=None, current=1, owned=None):
+    """返回 (结果, 刷新次数, 快照, 记账条目)。"""
+    state = _copy.deepcopy(_QS_STATE)
+    state["users"]["me"]["qqShowId"] = current
+    if owned is not None:
+        state["ownedQqShows"] = list(owned)
+    calls = {"refresh": 0}
+    p = P()
+    p._enabled = True
+    p._game_data = _QS_GD
+    p._cars_cache = {}
+    p._cars_cache_at = time.monotonic()
+    p._title_cache = None
+    p._coin_events = []
+    p._shop_spent = 0
+    p._page_cache = {"snapshot": dict(snap) if snap else None}
+
+    async def _ctx(prefetch=True, extra=None):
+        return Client(), state, {}, "", None
+
+    async def _fake_save(client_, mutate):
+        mutate(state)
+        return True, ""
+
+    async def _fake_refresh(client_, note):
+        calls["refresh"] += 1
+
+    p._load_game_context = _ctx
+    p._save_state_patch = _fake_save
+    p._refresh_snapshot = _fake_refresh
+    r = asyncio.run(p.api_qqshow_action(
+        mod.QqShowActionRequest(qqshow_id=qs_id, action=action)))
+    return r, calls["refresh"], (p._page_cache or {}).get("snapshot"), list(p._coin_events)
+
+
+_base_snap = {"cash": 1000, "qqshow_id": 1, "owned_qqshows": [1], "gender": "M"}
+_r, _ref, _snap, _ev = _qs_run(3, "buy", snap=_base_snap)
+check("★购买成功后不再回读服务端（回读会覆盖乐观更新）",
+      _r.success and _ref == 0, (_r.message, _ref))
+check("★购买后本地快照立刻是「使用中 + 已拥有 + 已扣款」",
+      bool(_snap) and _snap.get("qqshow_id") == 3
+      and 3 in (_snap.get("owned_qqshows") or [])
+      and _snap.get("cash") == 700, _snap)
+check("★一次购买只记一笔支出（不会再出现「两次购买」）",
+      [(e.get("kind"), e.get("delta")) for e in _ev] == [("qqshow", -300)], _ev)
+
+# 已经穿着这一款时再点「购买」：直接返回，不扣钱、不记账
+_r, _ref, _snap, _ev = _qs_run(3, "buy", snap=_base_snap, current=3)
+check("★已经在穿的款再点购买 → 直接返回，不重复扣钱",
+      _r.success and _ev == [] and _snap.get("cash") == 1000,
+      (_r.message, _ev, _snap.get("cash") if _snap else None))
+
+# 切换穿戴：同样乐观更新，不刷新
+_r, _ref, _snap, _ev = _qs_run(3, "select", snap=dict(_base_snap, owned_qqshows=[1, 3]),
+                               owned=[1, 3])
+check("★切换穿戴也走乐观更新（qqshow_id 立刻变、不调刷新）",
+      _r.success and _ref == 0 and _snap.get("qqshow_id") == 3,
+      (_r.message, _ref, _snap.get("qqshow_id") if _snap else None))
+
 print("\n" + ("=" * 46))
 print(f"{sum(ok)}/{len(ok)} 通过" + ("" if all(ok) else "  <<< 有失败项"))
 sys.exit(0 if all(ok) else 1)
