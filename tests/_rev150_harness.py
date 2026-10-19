@@ -805,6 +805,23 @@ CASES = [
          '            return _result({"success": False,\n'
          '                            "error": f"停放不足 {min_ticket} 分钟，还差 {min_ticket - mins} 分钟"})\n'),
     ], "停放不足时长：只报错、不白刷一次", "fail"),
+
+    # ---- v1.54.2 皮皮秀购买乐观更新 ----
+    ("皮皮秀购买后仍回读服务端（会覆盖乐观更新，页面显示未购买）", [
+        # 购买分支结尾（12 空格缩进，和 select 分支的 8 空格区分开）
+        ('            self._set_result(note)\n'
+         '            logger.info(f"[不可躺自动抢车位] {note}")\n'
+         '            return _result({"success": True, "message": note})\n',
+         '            await self._refresh_snapshot(client, note)\n'
+         '            self._set_result(note)\n'
+         '            logger.info(f"[不可躺自动抢车位] {note}")\n'
+         '            return _result({"success": True, "message": note})\n'),
+    ], "购买成功后不再回读服务端", "fail"),
+
+    ("去掉「已在穿就别再买」的保护（重复点会扣两次钱）", [
+        ('        if action == "buy" and qs_id == current:\n',
+         '        if False:\n'),
+    ], "已经在穿的款再点购买", "fail"),
 ]
 
 ok = True
