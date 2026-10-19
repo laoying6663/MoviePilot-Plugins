@@ -1096,10 +1096,13 @@ check("以旧换新是透明底青框青字",
       and "34,211,238" in styles(trade_node).get("border", ""), styles(trade_node))
 rows = [n for n in nodes if styles(n).get("marginTop") == "10px"
         and styles(n).get("gap") == "8px" and n.get("content")]
-paired = [r for r in rows if len(r["content"]) == 2
+# v1.54.0 起是**三颗**：购买 / 以旧换新 / 锁定换新。actions 容器允许 wrap，
+# 窄屏上第三颗换行不影响功能，所以只断言三颗都在同一个容器里。
+paired = [r for r in rows if len(r["content"]) == 3
           and any("buy_car" in repr(c) for c in r["content"])
-          and any("trade_pick" in repr(c) for c in r["content"])]
-check("两个按钮在同一行并排", len(paired) >= 1,
+          and any("trade_pick" in repr(c) for c in r["content"])
+          and any("trade_lock" in repr(c) for c in r["content"])]
+check("购买 / 以旧换新 / 锁定换新 三个按钮在同一行并排", len(paired) >= 1,
       [len(r["content"]) for r in rows][:6])
 check("车图居中且放大到 96px", 'height:96px' in repr(p.get_page()), "96px")
 
@@ -6547,6 +6550,127 @@ _ir = asyncio.run(_ip.api_qqshow_action(
     mod.QqShowActionRequest(qqshow_id=7, action="buy")))
 check("★性别不匹配的皮皮秀不能买（和游戏 selectQqShow 一致）",
       not _ir.success and not _ic.writes, (_ir.message, _ic.writes))
+
+print("\n--- #45 金币流水 + 分类锁定换新（v1.54.0）---")
+
+# ---------- 金币流水 ----------
+_pc = P()
+_pc._coin_events = []
+_pc._coin_event("buy", -300, "桑塔纳")
+_pc._coin_event("unpark", 120, "挪走 2 辆")
+_pc._coin_event("buy", 0, "零元不记")
+check("★流水逐笔记录：kind / delta / note 都对",
+      [(e.get("kind"), e.get("delta"), e.get("note")) for e in _pc._coin_events]
+      == [("buy", -300, "桑塔纳"), ("unpark", 120, "挪走 2 辆")],
+      _pc._coin_events)
+check("★金额为 0 的不记（免费场景/免费皮皮秀不该刷屏）",
+      len(_pc._coin_events) == 2, _pc._coin_events)
+
+DB.clear()
+_pr = P()
+_pr._game_data = GD
+_pr._cars_cache = {}
+_pr._cars_cache_at = time.monotonic()
+_pr._title_cache = None
+_pr._coin_events = [{"t": "00:01", "kind": "buy", "delta": -500, "note": "奔驰C"}]
+asyncio.run(_pr._record_round(_RoundClient(), _RAW_STATE, "liyo1", 0, 0, 120,
+                              record_history=False))
+_day = P._now_naive().strftime("%Y-%m-%d")
+_log = ((DB.get("daily") or {}).get(_day) or {}).get("log") or []
+check("★流水落进当天 daily['log']（操作的那笔 + 挪车收益那笔）",
+      any(e.get("kind") == "buy" and e.get("delta") == -500 for e in _log)
+      and any(e.get("kind") == "unpark" and e.get("delta") == 120 for e in _log),
+      _log)
+check("★落盘后内存缓冲清空（不跨轮重复记）",
+      _pr._coin_events == [], _pr._coin_events)
+
+DB["daily"] = {_day: {"earned": 120, "log": [
+    {"t": "00:01", "kind": "buy", "delta": -500, "note": "奔驰C"},
+    {"t": "00:02", "kind": "recycle", "delta": 80, "note": "奥拓"},
+]}}
+_pst2 = P(); _pst2._page_cache = None; _pst2._tab = "stats"
+_stext = [n.get("text") for n in walk(_pst2.get_page()) if n.get("text")]
+check("★统计页出现「金币流水」卡片与中文类型",
+      "金币流水" in _stext and "买车" in _stext and "回收车辆" in _stext,
+      [t for t in _stext if "流水" in str(t) or "买车" in str(t)])
+check("★流水金额带正负号（支出 -500 / 收入 +80）",
+      "-500" in _stext and "+80" in _stext,
+      [t for t in _stext if "500" in str(t) or "80" in str(t)])
+
+# ---------- 分类锁定换新 ----------
+_LOCK_CARS = {
+    1: {"id": 1, "name": "奥拓", "price": 100, "levelReq": 1,
+        "earnPerMin": 6, "category": "代步车"},
+    2: {"id": 2, "name": "桑塔纳", "price": 300, "levelReq": 1,
+        "earnPerMin": 15, "category": "代步车"},
+    3: {"id": 3, "name": "奔驰C", "price": 500, "levelReq": 1,
+        "earnPerMin": 25, "category": "代步车"},
+    # 高级车故意卡 Lv.10：本夹具的角色是「别的分类的干扰项」，
+    # 让 Lv.5 换不了它，否则任何一轮都会选它（收益 99 最高），
+    # 「锁定代步车」那几条就测不出分类内约束。
+    4: {"id": 4, "name": "兰博基尼", "price": 900, "levelReq": 10,
+        "earnPerMin": 99, "category": "高级车"},
+}
+_LOCK_ST = {
+    "success": True, "userId": "me",
+    "gameSettings": {"MAX_CARS": 10},
+    "users": {"me": {"name": "我", "level": 5, "cash": 1000}},
+    "userCars": [{"id": "idle-old", "userId": "me", "carId": 1, "status": "idle"}],
+    "parkingSpots": [],
+}
+
+
+def _trade_once(locks):
+    """按给定锁定表跑一次自动换新，返回 trade_in 请求体列表。"""
+    Client.POSTS = []
+    p = P()
+    p._auto_trade = True
+    p._exp_farm = False
+    p._trade_locks = dict(locks)
+    asyncio.run(p._auto_trade_one(Client(), _copy.deepcopy(_LOCK_ST),
+                                  _LOCK_CARS, "me"))
+    return [q for e, q in Client.POSTS if e == "trade_in.php"]
+
+
+_no_lock = _trade_once({})
+check("★未锁定时仍按收益增量最大选（奥拓 → 奔驰C）",
+      bool(_no_lock) and _no_lock[0].get("newCarId") == 3, _no_lock)
+_lock2 = _trade_once({"代步车": 2})
+check("★锁定「代步车=桑塔纳」后只换桑塔纳（不换收益更高的奔驰C）",
+      bool(_lock2) and _lock2[0].get("newCarId") == 2, _lock2)
+_lock_high = _trade_once({"高级车": 4})
+check("★锁的是别的分类时本分类不受影响（仍换奔驰C）",
+      bool(_lock_high) and _lock_high[0].get("newCarId") == 3, _lock_high)
+_lock_miss = _trade_once({"代步车": 99})
+check("★锁定款不存在时整轮不换（不退回收益最高）",
+      _lock_miss == [], _lock_miss)
+
+# 锁定接口：写入 / 取消
+_pl = P()
+_pl._page_cache = {"snapshot": dict(SHOP_SNAP), "history": [], "daily": {}}
+_r1 = asyncio.run(_pl.api_trade_lock(mod.TradeLockRequest(car_id=2)))
+check("★锁定接口把车型写进它所属分类",
+      _r1.success and _pl._trade_locks.get("代步车") == 2, _pl._trade_locks)
+_r2 = asyncio.run(_pl.api_trade_lock(mod.TradeLockRequest(car_id=2)))
+check("★同款再点一次 = 取消该分类锁定",
+      _r2.success and "代步车" not in _pl._trade_locks, _pl._trade_locks)
+_r3 = asyncio.run(_pl.api_trade_lock(mod.TradeLockRequest(car_id=999)))
+check("★不存在的车型拒绝锁定（不写脏数据）",
+      not _r3.success and not _pl._trade_locks, (_r3.message, _pl._trade_locks))
+
+# 车市页：锁定按钮 + 副标题提示
+# ★必须显式挂上 SHOP_SNAP：_page_cache=None 时 _page_data 会去 DB 读，
+# 而前面几个用例已经把 DB["snapshot"] 改掉了，catalog 对不上 → 锁定车型找不到名字。
+_pshop = P()
+_pshop._page_cache = {"snapshot": dict(SHOP_SNAP), "history": [], "daily": {}}
+_pshop._tab = "shop"
+_pshop._trade_locks = {"代步车": 2}
+_shtext = [n.get("text") for n in walk(_pshop.get_page()) if n.get("text")]
+check("★车市卡片出现「已锁定」按钮",
+      "已锁定" in _shtext, [t for t in _shtext if "锁定" in str(t)])
+check("★车市副标题写明本分类锁定了哪款",
+      any("本分类已锁定换新" in str(t) and "桑塔纳" in str(t) for t in _shtext),
+      [t for t in _shtext if "本分类" in str(t)])
 
 print("\n" + ("=" * 46))
 print(f"{sum(ok)}/{len(ok)} 通过" + ("" if all(ok) else "  <<< 有失败项"))
