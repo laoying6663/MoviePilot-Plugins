@@ -633,7 +633,10 @@ CASES = [
     ], "每日重置时刻按北京时间记", "fail"),
 
     ("回收拿回的钱不记账", [
+        # v1.54.0 起 `_shop_recycled += back` 后面多了一行金币流水，
+        # 注入片段必须把那一行一起带上，否则只是「定位失败」而不是抓到。
         ("        self._shop_recycled += back\n"
+         "        self._coin_event(\"recycle\", back, hi_def.get(\"name\"))\n"
          "        note = \"", "        note = \""),
     ], "回收拿回的钱记成", "fail"),
 
@@ -759,6 +762,30 @@ CASES = [
          '                    continue\n',
          ''),
     ], "个性化·皮皮秀：只列男性款", "fail"),
+
+    # ---- v1.54.0 金币流水 + 分类锁定换新 ----
+    ("分类锁定形同虚设（候选不按锁定过滤）", [
+        ('                _cat = str(definition.get("category") or "")\n'
+         '                _lock = (self._trade_locks or {}).get(_cat)\n'
+         '                if _lock is not None and str(definition.get("id")) != str(_lock):\n'
+         '                    continue\n',
+         '                _cat = str(definition.get("category") or "")\n'
+         '                _lock = (self._trade_locks or {}).get(_cat)\n'),
+    ], "锁定「代步车=桑塔纳」后只换桑塔纳", "fail"),
+
+    ("金币流水不落盘（_coin_events 收走了但没进 bucket）", [
+        ('            bucket["log"] = _log[-200:]\n', '            pass\n'),
+    ], "流水落进当天 daily", "fail"),
+
+    ("零元收支也刷一条流水", [
+        ('        if not delta:\n            return\n',
+         '        if False:\n            return\n'),
+    ], "金额为 0 的不记", "fail"),
+
+    ("锁定接口只能加不能取消", [
+        ('        if str(locks.get(category)) == car_key:\n',
+         '        if False:\n'),
+    ], "同款再点一次 = 取消该分类锁定", "fail"),
 ]
 
 ok = True
