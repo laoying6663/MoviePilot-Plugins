@@ -371,7 +371,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.54.1"
+    plugin_version = "1.54.2"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -5950,6 +5950,16 @@ class ParkingBot(_PluginBase):
             self._shop_spent += price
             self._coin_event("bg", -price, name)
             note = f"已购买场景「{name}」，花费 {self._fmt_num(price)} 金"
+            # 乐观更新：购买后立刻回读同样可能拿到旧值，页面会显示成「未购买」
+            _snap = (self._page_cache or {}).get("snapshot")
+            _snap = _snap if isinstance(_snap, dict) else {}
+            _owned_bgs = [str(x) for x in (_snap.get("owned_bgs") or [])]
+            if bg_id not in _owned_bgs:
+                _owned_bgs.append(bg_id)
+            await self._optimistic_snapshot({
+                "owned_bgs": _owned_bgs,
+                "cash": max(0, self._to_int(_snap.get("cash"), 0) - price),
+            })
         else:
             owned = {str(x) for x in (state.get("ownedBgs") or [])}
             if price > 0 and bg_id not in owned:
@@ -5959,8 +5969,8 @@ class ParkingBot(_PluginBase):
             if not ok:
                 return _result({"success": False, "error": reason})
             note = f"已切换场景为「{name}」"
+            await self._optimistic_snapshot({"current_bg": bg_id})
 
-        await self._refresh_snapshot(client, note)
         self._set_result(note)
         logger.info(f"[不可躺自动抢车位] {note}")
         return _result({"success": True, "message": note})
@@ -5997,6 +6007,12 @@ class ParkingBot(_PluginBase):
         current = self._to_int(mine.get("qqShowId"), 0)
         cash = self._to_int(mine.get("cash"), 0)
 
+        # ★已经在穿这一款了就别再买。服务端「写后立刻读」可能还没同步，
+        # 页面会显示成「未购买」，用户很容易再点一次 —— 那一下就是重复扣钱。
+        if action == "buy" and qs_id == current:
+            return _result({"success": True,
+                            "message": f"已经穿着「{show.get('name')}」了，没有重复购买"})
+
         if action == "buy" and qs_id not in owned and price > 0:
             if cash < price:
                 return _result({"success": False,
@@ -6021,7 +6037,19 @@ class ParkingBot(_PluginBase):
             self._shop_spent += price
             self._coin_event("qqshow", -price, show.get("name"))
             note = f"已购买皮皮秀「{show.get('name')}」，花费 {self._fmt_num(price)} 金"
-            await self._refresh_snapshot(client, note)
+            # ★乐观更新，**不调 _refresh_snapshot**：saveState 之后立刻回读，
+            # 服务端可能还没看到新值，会把刚买好的状态覆盖回「未购买」——
+            # 用户再点一次就重复扣钱、流水记两笔（v1.54.2 修的就是这个）。
+            _snap = (self._page_cache or {}).get("snapshot")
+            _snap = _snap if isinstance(_snap, dict) else {}
+            _owned_now = [self._to_int(x, 0) for x in (_snap.get("owned_qqshows") or [])]
+            if qs_id not in _owned_now:
+                _owned_now.append(qs_id)
+            await self._optimistic_snapshot({
+                "qqshow_id": qs_id,
+                "owned_qqshows": _owned_now,
+                "cash": max(0, self._to_int(_snap.get("cash"), 0) - price),
+            })
             self._set_result(note)
             logger.info(f"[不可躺自动抢车位] {note}")
             return _result({"success": True, "message": note})
@@ -6049,7 +6077,8 @@ class ParkingBot(_PluginBase):
             return _result({"success": False, "error": reason})
         note = ("已恢复默认皮皮秀" if qs_id == current
                 else f"皮皮秀已更换为「{show.get('name')}」")
-        await self._refresh_snapshot(client, note)
+        # 同上：切换穿戴也走 saveState，回读可能是旧值 → 乐观更新
+        await self._optimistic_snapshot({"qqshow_id": target})
         self._set_result(note)
         logger.info(f"[不可躺自动抢车位] {note}")
         return _result({"success": True, "message": note})
@@ -6241,6 +6270,34 @@ class ParkingBot(_PluginBase):
         except Exception as err:
             # 刷新失败不能把「贴条失败」变成 500：页面上那句错误本身仍然有用
             logger.warning(f"[不可躺自动抢车位] {what}后刷新车位状态失败：{err}")
+
+    async def _optimistic_snapshot(self, patch: Dict[str, Any]) -> None:
+        """
+        乐观更新本地快照：直接把新值写进内存 + 落盘，**不等服务端回读**。
+
+        ★v1.54.2 修的「皮皮秀要点两次」：
+        皮皮秀购买走的是 `saveState()` 全量回写（游戏侧就是这条路，没有专用接口）。
+        写完之后立刻 GET state.php，服务端**不一定**已经能看到新值 ——
+        实测第一次回读还是旧状态，`_refresh_snapshot` 就把刚买好的
+        `qqShowId` / `ownedQqShows` 覆盖回「未购买」，页面显示没生效；
+        用户再点一次，又走一遍购买分支，于是**扣两次钱、流水记两笔**。
+
+        这里不再依赖回读：买完直接把新值写进快照，页面立刻显示「使用中」。
+        下一轮定时任务的 `_record_round` 再和服务端对齐（那时写入早已落盘）。
+        """
+        cache = self._page_cache if isinstance(self._page_cache, dict) else {}
+        snap = cache.get("snapshot")
+        if not isinstance(snap, dict):
+            # 没有快照可更新（还没跑过一轮）：什么都不做，下一轮自然会带上
+            return
+        snap = dict(snap)
+        snap.update(patch)
+        cache["snapshot"] = snap
+        self._page_cache = cache
+        try:
+            await self.async_save_data("snapshot", snap)
+        except Exception as err:
+            logger.warning(f"[不可躺自动抢车位] 乐观更新快照失败：{err}")
 
     async def api_ticket(self, request: TicketRequest) -> ApiResult:
         """
