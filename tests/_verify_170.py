@@ -6557,13 +6557,14 @@ print("\n--- #45 金币流水 + 分类锁定换新（v1.54.0）---")
 _pc = P()
 _pc._coin_events = []
 _pc._coin_event("buy", -300, "桑塔纳")
-_pc._coin_event("unpark", 120, "挪走 2 辆")
-_pc._coin_event("buy", 0, "零元不记")
-check("★流水逐笔记录：kind / delta / note 都对",
+_pc._coin_event("unpark", 120, "挪走 2 辆")      # 收入：不该进流水
+_pc._coin_event("buy", 0, "零元不记")             # 0：不该进流水
+_pc._coin_event("trade", -80, "奥拓 → 桑塔纳")
+check("★只记支出：kind / delta / note 都对",
       [(e.get("kind"), e.get("delta"), e.get("note")) for e in _pc._coin_events]
-      == [("buy", -300, "桑塔纳"), ("unpark", 120, "挪走 2 辆")],
+      == [("buy", -300, "桑塔纳"), ("trade", -80, "奥拓 → 桑塔纳")],
       _pc._coin_events)
-check("★金额为 0 的不记（免费场景/免费皮皮秀不该刷屏）",
+check("★收入和 0 元都不进流水（v1.54.1 起流水只记支出）",
       len(_pc._coin_events) == 2, _pc._coin_events)
 
 DB.clear()
@@ -6577,9 +6578,9 @@ asyncio.run(_pr._record_round(_RoundClient(), _RAW_STATE, "liyo1", 0, 0, 120,
                               record_history=False))
 _day = P._now_naive().strftime("%Y-%m-%d")
 _log = ((DB.get("daily") or {}).get(_day) or {}).get("log") or []
-check("★流水落进当天 daily['log']（操作的那笔 + 挪车收益那笔）",
+check("★支出落进当天 daily['log']，收入（unpark）不落",
       any(e.get("kind") == "buy" and e.get("delta") == -500 for e in _log)
-      and any(e.get("kind") == "unpark" and e.get("delta") == 120 for e in _log),
+      and not any(e.get("kind") == "unpark" for e in _log),
       _log)
 check("★落盘后内存缓冲清空（不跨轮重复记）",
       _pr._coin_events == [], _pr._coin_events)
@@ -6590,12 +6591,18 @@ DB["daily"] = {_day: {"earned": 120, "log": [
 ]}}
 _pst2 = P(); _pst2._page_cache = None; _pst2._tab = "stats"
 _stext = [n.get("text") for n in walk(_pst2.get_page()) if n.get("text")]
-check("★统计页出现「金币流水」卡片与中文类型",
-      "金币流水" in _stext and "买车" in _stext and "回收车辆" in _stext,
+check("★统计页出现「金币支出流水」卡片与中文类型",
+      "金币支出流水" in _stext and "买车" in _stext,
       [t for t in _stext if "流水" in str(t) or "买车" in str(t)])
-check("★流水金额带正负号（支出 -500 / 收入 +80）",
-      "-500" in _stext and "+80" in _stext,
-      [t for t in _stext if "500" in str(t) or "80" in str(t)])
+check("★老数据里的收入记录不显示（只铺支出）",
+      "回收车辆" not in _stext,
+      [t for t in _stext if "回收" in str(t)])
+check("★支出金额显示绝对值（列名已是「支出」，不带负号）",
+      "500" in _stext and "-500" not in _stext,
+      [t for t in _stext if "500" in str(t)])
+check("★副标题汇总当天支出总额",
+      any("合计花出 500 金" in str(t) for t in _stext),
+      [t for t in _stext if "合计花出" in str(t)])
 
 # ---------- 分类锁定换新 ----------
 _LOCK_CARS = {
@@ -6671,6 +6678,101 @@ check("★车市卡片出现「已锁定」按钮",
 check("★车市副标题写明本分类锁定了哪款",
       any("本分类已锁定换新" in str(t) and "桑塔纳" in str(t) for t in _shtext),
       [t for t in _shtext if "本分类" in str(t)])
+
+print("\n--- #46 贴条失败后就地刷新车位（v1.54.1）---")
+# 用户主诉：车位卡片上明明停着车，点「贴条」却提示「车位上没有车」，
+# 而且刷不掉那张卡 —— 车早在快照生成之后被挪走了。
+# 修法：贴条遇到「数据已过期」类失败时，用刚拉到的 state 就地刷一次快照。
+
+
+class _TicketFail(Client):
+    """ticket.php 本身返回失败（模拟「点下去那一刻车刚好走了」的并发）。"""
+
+    async def post_json(self, url, json=None, **kw):
+        Client.POSTS.append((url.rsplit("/", 1)[-1], json))
+        if "ticket.php" in url:
+            return {"success": False, "error": "车位上没有车"}
+        return {"success": True}
+
+
+def _ticket_run(spot, with_car=True, mins=30, client=None):
+    """构造「页面快照说有车」的场景，调 api_ticket，返回 (结果, 刷新次数)。
+
+    刷新次数用 mock 掉的 _record_round 计数 —— 真跑 _record_round 需要整套
+    client/state，而它自己的正确性已有专门断言；这里只关心「有没有触发刷新」。
+    """
+    Client.POSTS = []
+    st = {
+        "success": True, "userId": "me",
+        "gameSettings": {"MIN_TICKET_TIME": 5},
+        "users": {"me": {"name": "我", "level": 5, "cash": 1000}},
+        "userCars": ([{"id": "other-car", "userId": "other", "carId": 1,
+                       "status": "parked"}] if with_car else []),
+        "parkingSpots": [dict(spot)],
+    }
+    calls = []
+
+    async def _fake_record(client_, state, user_id, np, mv, earned,
+                           record_history=True):
+        calls.append(state.get("parkingSpots"))
+
+    p = P()
+    p._enabled = True          # api_ticket 第一行就查 get_state()
+    p._game_data = GD
+    p._cars_cache = {}
+    p._cars_cache_at = time.monotonic()
+    p._title_cache = None
+    p._record_round = _fake_record
+    cl = client or Client()
+
+    async def _ctx(prefetch=True, extra=None):
+        return cl, st, {}, "", None
+
+    p._load_game_context = _ctx
+    # 成功路径会再 GET 一次 state.php 再调 _record_round；把 Client.STATE 指向
+    # 同一份 state，用完恢复，别污染后面的用例。
+    _prev = Client.STATE
+    Client.STATE = st
+    try:
+        r = asyncio.run(p.api_ticket(mod.TicketRequest(spot_id=spot.get("id"))))
+    finally:
+        Client.STATE = _prev
+    return r, len(calls)
+
+
+_spot_ok = {"id": 501, "ownerId": "me", "spotType": "private",
+            "carInSpot": "other-car", "parkedTime": ts(30)}
+_spot_empty = {"id": 502, "ownerId": "me", "spotType": "private",
+               "carInSpot": None, "parkedTime": ts(30)}
+_spot_ghost = {"id": 503, "ownerId": "me", "spotType": "private",
+               "carInSpot": "ghost", "parkedTime": ts(30)}
+_spot_short = {"id": 504, "ownerId": "me", "spotType": "private",
+               "carInSpot": "other-car", "parkedTime": ts(2)}
+
+_r, _n = _ticket_run(_spot_empty)
+check("★车位上没有车：返回失败，且刷新了快照（幽灵车不会一直挂着）",
+      (not _r.success) and _n == 1, (_r.message, _n))
+check("★「没有车」的提示里写明已刷新（用户知道下一步该看什么）",
+      "已刷新" in _r.message, _r.message)
+
+_r, _n = _ticket_run(_spot_ghost)
+check("★车位上的车已不在：同样刷新",
+      (not _r.success) and _n == 1, (_r.message, _n))
+
+_r, _n = _ticket_run(_spot_ok, client=_TicketFail())
+check("★ticket.php 返回失败（并发被挪走）：也刷新",
+      (not _r.success) and _n == 1, (_r.message, _n))
+check("★接口失败时把原始原因也带上（不吞掉游戏的话）",
+      "车位上没有车" in _r.message, _r.message)
+
+_r, _n = _ticket_run(_spot_short)
+check("★停放不足时长：只报错、不白刷一次（数据没变，刷新纯浪费）",
+      (not _r.success) and _n == 0, (_r.message, _n))
+
+# 成功路径仍然只刷一次（不能因为新加的失败分支变成两次）
+_r, _n = _ticket_run(_spot_ok)
+check("★贴条成功仍只刷新一次（新分支没有让成功路径多刷）",
+      _r.success and _n == 1, (_r.message, _n))
 
 print("\n" + ("=" * 46))
 print(f"{sum(ok)}/{len(ok)} 通过" + ("" if all(ok) else "  <<< 有失败项"))
