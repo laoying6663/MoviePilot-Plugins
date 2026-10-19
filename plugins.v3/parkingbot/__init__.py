@@ -132,6 +132,12 @@ class TradePickRequest(BaseModel):
         default=None, description="要换成的目标车型 ID；留空表示退出选车模式")
 
 
+class TradeLockRequest(BaseModel):
+    """车市「锁定换新」：把某车型设为它所属分类的换新目标；再点一次取消。"""
+
+    car_id: Any = Field(description="要锁定 / 取消锁定的车型 ID")
+
+
 class ParkRequest(BaseModel):
     """车库「立即停到他人车位」按钮的请求体。"""
 
@@ -365,7 +371,7 @@ class ParkingBot(_PluginBase):
     # 这里用方式 1，图标跟着仓库走，不用往 MoviePilot 主机上放文件。
     plugin_icon = ("https://raw.githubusercontent.com/laoying6663/"
                    "MoviePilot-Plugins/main/icons/Parking_A.png")
-    plugin_version = "1.53.2"
+    plugin_version = "1.54.0"
     plugin_author = "laoying6663"
     author_url = "https://github.com/laoying6663/MoviePilot-Plugins"
     plugin_config_prefix = "parkingbot_"
@@ -427,6 +433,17 @@ class ParkingBot(_PluginBase):
     # 车市可用的排序档位。ratio = 收益÷价格（性价比），默认按这个排。
     _SHOP_SORTS = (("ratio", "性价比"), ("price", "价格低→高"),
                    ("earn", "收益高→低"))
+    # 金币流水的来源标签。键是 _coin_event 的 kind，值是统计页上显示的中文。
+    _COIN_KINDS = {
+        "unpark": "挪车收益",
+        "fine": "贴条罚款",
+        "recycle": "回收车辆",
+        "buy": "买车",
+        "trade": "换车差价",
+        "flash": "抢购特卖",
+        "bg": "买场景",
+        "qqshow": "买皮皮秀",
+    }
     # 称号选择器是否展开。插件页没有弹窗，展开状态同样记在服务端，
     # 切页签回来还在，和 _cat / _trade_for 一个套路。
     _title_open = False
@@ -479,6 +496,18 @@ class ParkingBot(_PluginBase):
     # 刷购车/以旧换新经验走的是「买 -> 换 -> 回收」的循环，只记支出不记回收的话，
     # 统计页的当日净收会凭空少一大截（实测每轮 400，一天 4000）。
     _shop_recycled = 0
+
+    # 本轮的金币流水（逐笔）。每笔操作发生时 append，_record_round 并入当天
+    # daily["log"] 后清空。只留内存、跨这一轮传递，不单独落盘。
+    # 每条：{"t": "HH:MM", "kind": "unpark|buy|trade|recycle|fine|flash|bg|qqshow",
+    #        "delta": +120 / -3000, "note": "奔驰C"}
+    # ★和上面几个累加器是**双写**：累加器继续供当日/本月汇总，流水供明细。
+    _coin_events: List[dict] = []
+
+    # 分类 → 锁定的目标车型 ID（车市「锁定换新」用）。
+    # 存 view（和 _cat/_trade_for 同一套），**不进配置表单**：分类是游戏动态下发的，
+    # 配置表单没法预先列出。锁定后自动以旧换新只换这一款，不会退而求其次。
+    _trade_locks: Dict[str, Any] = {}
 
     # ---------- 运行态（仅内存，用于详情页展示） ----------
     _last_run = "尚未运行"
@@ -583,6 +612,9 @@ class ParkingBot(_PluginBase):
         # 分类直接取快照里真实存在的分类名，不认任何外部输入。
         self._cat = str(saved_view.get("cat") or "").strip()
         self._trade_for = str(saved_view.get("trade_for") or "").strip()
+        # 分类 → 锁定换新车型 ID。只认 dict，脏数据一律当没锁。
+        _locks = saved_view.get("trade_locks")
+        self._trade_locks = dict(_locks) if isinstance(_locks, dict) else {}
         # 车市的「只看可买」/ 排序不进存档，每次打开恢复默认（理由见类属性注释）
         # 车市的「只看可买」/ 排序不进存档，每次打开恢复默认（理由见类属性注释）
         self._shop_afford = False
@@ -978,6 +1010,13 @@ class ParkingBot(_PluginBase):
             for definition in cars_map.values():
                 if not isinstance(definition, dict):
                     continue
+                # 分类锁定：车市里锁了某款，本分类就只允许换那一款。
+                # 刻意**不**做「锁定款换不了就退而求其次」—— 那就等于没锁。
+                # 锁定的车等级不够/差价不够时这一轮直接不换，等条件满足。
+                _cat = str(definition.get("category") or "")
+                _lock = (self._trade_locks or {}).get(_cat)
+                if _lock is not None and str(definition.get("id")) != str(_lock):
+                    continue
                 price = self._to_int(definition.get("price"), 0, minimum=0)
                 diff = price - old_price
                 # 以旧换新只扣「差价」，不是新车的全价：旧车已经折价抵掉了大半。
@@ -1007,6 +1046,8 @@ class ParkingBot(_PluginBase):
             # 记账给「数据统计」页用：换车补的差价是真金白银的支出
             self._shop_diff += diff
             self._shop_traded += 1
+            self._coin_event("trade", -diff,
+                             f"{self._car_name(car, cars_map)} → {target.get('name')}")
             note = (f"自动以旧换新：{self._car_name(car, cars_map)} → {target.get('name')}，"
                     f"补 {diff} 金，每分钟收益 +{gain}")
             logger.info(f"[不可躺自动抢车位] {note}")
@@ -1254,6 +1295,7 @@ class ParkingBot(_PluginBase):
                 return ""
             back = self._to_int((result.get("data") or {}).get("recyclePrice"), 0)
             self._shop_recycled += back
+            self._coin_event("recycle", back, self._car_name(victim, cars_map))
             steps.append(f"回收 {self._car_name(victim, cars_map)} 换回 {back} 金")
 
         # --- 买一辆最便宜的：既刷购车经验，又是以旧换新的旧车 ---
@@ -1264,6 +1306,7 @@ class ParkingBot(_PluginBase):
             return "；".join(steps)
         self._shop_spent += lo_price
         self._shop_bought += 1
+        self._coin_event("buy", -lo_price, lo_def.get("name"))
         steps.append(f"买 {lo_def.get('name')} {lo_price} 金")
 
         bought = await self._exp_farm_find_new(
@@ -1289,6 +1332,7 @@ class ParkingBot(_PluginBase):
             return "；".join(steps)
         self._shop_diff += diff
         self._shop_traded += 1
+        self._coin_event("trade", -diff, hi_def.get("name"))
         steps.append(f"换 {hi_def.get('name')} 补 {diff} 金")
 
         # --- 回收换来的那辆：把工位还回去，车位数回到本轮开始时的样子 ---
@@ -1304,6 +1348,7 @@ class ParkingBot(_PluginBase):
             return "；".join(steps)
         back = self._to_int((result.get("data") or {}).get("recyclePrice"), 0)
         self._shop_recycled += back
+        self._coin_event("recycle", back, hi_def.get("name"))
         note = "；".join(steps) + f"；回收换来的车换回 {back} 金，本轮净支出 {lo_price + diff - back} 金"
         logger.info(f"[不可躺自动抢车位] {note}")
         return note
@@ -1465,6 +1510,8 @@ class ParkingBot(_PluginBase):
             # run_once 里 _auto_ticket_one 后面紧跟着 _record_round，会把这笔
             # 连同挪车收益一起收走落盘。
             self._shop_fined += got
+            self._coin_event("fine", got,
+                             f"{self._car_name(car, cars_map)}@{spot_key}")
             notes.append(f"{self._car_name(car, cars_map)}@{spot_key} 罚 {got}")
 
         if not notes:
@@ -1527,6 +1574,7 @@ class ParkingBot(_PluginBase):
         # 记账给「数据统计」页：买车是全额支出，和换车的差价分开记
         self._shop_spent += price
         self._shop_bought += 1
+        self._coin_event("buy", -price, target.get("name"))
         note = f"自动买车：{target.get('name')}，花费 {price} 金，每分钟收益 {earn}"
         logger.info(f"[不可躺自动抢车位] {note}")
         return note
@@ -2686,6 +2734,26 @@ class ParkingBot(_PluginBase):
         self._set_result(text)
         logger.info(f"[不可躺自动抢车位] {text}")
 
+    def _coin_event(self, kind: str, delta: int, note: str = "") -> None:
+        """
+        记一笔金币流水（只进内存，_record_round 落进当天 daily["log"] 后清空）。
+
+        kind 是机器可读的来源：
+          unpark 挪车收益 / fine 贴条罚款 / recycle 回收车辆 /
+          buy 买车 / trade 换车差价 / flash 抢购特卖 / bg 买场景 / qqshow 买皮皮秀
+
+        ★和 _shop_* 累加器是**双写**：累加器继续供当日/本月汇总（已有测试锁着），
+        这里供逐笔明细。金额为 0 的不记（免费场景/免费皮皮秀不算一笔收支）。
+        """
+        if not delta:
+            return
+        self._coin_events.append({
+            "t": self._now_naive().strftime("%H:%M"),
+            "kind": str(kind or ""),
+            "delta": int(delta),
+            "note": str(note or "")[:40],
+        })
+
     async def _record_round(
         self,
         client: AsyncRequestUtils,
@@ -2973,6 +3041,18 @@ class ParkingBot(_PluginBase):
             bucket["earned"] = self._to_int(bucket.get("earned"), 0) + self._shop_recycled
             self._shop_recycled = 0
             self._shop_spent = self._shop_bought = self._shop_diff = self._shop_traded = 0
+
+            # ---------- 金币流水 ----------
+            # 本轮所有逐笔操作（买车/换车/回收/贴条/抢购/场景/皮皮秀）在发生时
+            # 已经进了 _coin_events；这里再补「挪车收益」那一笔，整体并入当天。
+            # 每天最多留 200 条 —— 流水是「最近怎么赚的/怎么花的」，不是永久账本。
+            self._coin_event("unpark", earned,
+                             f"挪走 {moved} 辆" if moved else "")
+            _log = bucket.get("log")
+            _log = list(_log) if isinstance(_log, list) else []
+            _log.extend(self._coin_events)
+            bucket["log"] = _log[-200:]
+            self._coin_events = []
             daily[day_key] = bucket
 
             if not record_history:
@@ -4663,6 +4743,11 @@ class ParkingBot(_PluginBase):
         avg = round(m_earned / max(1, len(month_days)))
         buys = sum(self._to_int((daily[d] or {}).get("bought"), 0) for d in month_days)
         trades = sum(self._to_int((daily[d] or {}).get("traded"), 0) for d in month_days)
+        # 当天金币流水：脏数据逐条滤掉（落盘数据被手改时 list 里可能混进字符串）
+        _coin_log = bucket.get("log")
+        _coin_log = ([e for e in _coin_log if isinstance(e, dict)]
+                     if isinstance(_coin_log, list) else [])
+        _coin_recent = list(reversed(_coin_log))[:30]
 
         blocks = [
             # 最近 7 天日期卡片
@@ -4698,6 +4783,31 @@ class ParkingBot(_PluginBase):
                        f"买车 {self._to_int(bucket.get('bought'), 0)} 次、"
                        f"换车 {self._to_int(bucket.get('traded'), 0)} 次",
                        [self._hour_chart(hours)], accent=_GREEN),
+            # 金币流水：当天逐笔收支。正=收入，负=支出。
+            # 只铺最近 30 笔（时间倒序）：流水回答的是「最近怎么赚的、怎么花的」，
+            # 不是永久账本；完整 200 条仍在 daily["log"] 里。
+            self._card(
+                "金币流水",
+                (f"{current} 共 {len(_coin_log)} 笔，这里显示最近 {len(_coin_recent)} 笔；"
+                 "正数是收入（挪车/贴条/回收），负数是支出（买车/换车/抢购/场景/皮皮秀）")
+                if _coin_log else f"{current} 还没有金币收支记录",
+                ([self._table(
+                    ["时间", "类型", "金额", "说明"],
+                    [[str(e.get("t") or ""),
+                      self._COIN_KINDS.get(str(e.get("kind") or ""),
+                                            str(e.get("kind") or "其他")),
+                      ("+" if self._to_int(e.get("delta"), 0) > 0
+                       else "") + self._fmt_num(e.get("delta")),
+                      str(e.get("note") or "")]
+                     for e in _coin_recent],
+                    ["0.7", "1.1", "1", "1.8"],
+                    ["left", "left", "right", "left"])]
+                 if _coin_log else
+                 [self._text(
+                     "本轮执行后开始记录：挪车、贴条、回收、买车、换车、抢购、"
+                     "场景与皮皮秀都会逐笔留下收支。",
+                     {"fontSize": "13px", "opacity": "0.7"})]),
+                accent=_GOLD),
             # 每日明细
             # 窄屏（360px）下 5 列挤在一行，表头「换车差价」会被省略号吃掉、
             # 「2026-10-18」也截断成「2026-10-1…」。表头收到 2 字、日期只留
@@ -5642,6 +5752,15 @@ class ParkingBot(_PluginBase):
                 "description": "记下要换成的目标车型，页面据此列出可用的空闲车；传空 car_id 表示取消",
             },
             {
+                "path": "/trade_lock",
+                "endpoint": self.api_trade_lock,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "锁定某分类的换新车型",
+                "response_model": ApiResult,
+                "description": "把该车型设为所属分类的换新目标，自动换新只换这一款；再点一次取消",
+            },
+            {
                 "path": "/park",
                 "endpoint": self.api_park,
                 "methods": ["POST"],
@@ -5804,6 +5923,9 @@ class ParkingBot(_PluginBase):
             if not result or not result.get("success"):
                 return _result({"success": False,
                                 "error": (result or {}).get("error") or "购买失败"})
+            # 场景也是真金白银的支出，进统计页与金币流水（此前漏记）
+            self._shop_spent += price
+            self._coin_event("bg", -price, name)
             note = f"已购买场景「{name}」，花费 {self._fmt_num(price)} 金"
         else:
             owned = {str(x) for x in (state.get("ownedBgs") or [])}
@@ -5872,6 +5994,9 @@ class ParkingBot(_PluginBase):
             ok, reason = await self._save_state_patch(client, _buy)
             if not ok:
                 return _result({"success": False, "error": reason})
+            # 皮皮秀同样是真金白银的支出，进统计页与金币流水（此前漏记）
+            self._shop_spent += price
+            self._coin_event("qqshow", -price, show.get("name"))
             note = f"已购买皮皮秀「{show.get('name')}」，花费 {self._fmt_num(price)} 金"
             await self._refresh_snapshot(client, note)
             self._set_result(note)
@@ -6147,6 +6272,7 @@ class ParkingBot(_PluginBase):
         fine = self._to_int(raw_earn, 0, minimum=0)
         exp = self._to_int(result.get("expGained"), 0, minimum=0)
         self._shop_fined += fine
+        self._coin_event("fine", fine, "手动贴条")
         # 立刻落盘，不等下一轮定时任务。
         #
         # 原先只累加、不记账，等下一次 run_once 里的 _record_round 才写进 daily。
@@ -6490,6 +6616,42 @@ class ParkingBot(_PluginBase):
         await self._save_view({"trade_for": car_key})
         return _result({"success": True, "name": target.get("name", "")})
 
+    async def api_trade_lock(self, request: TradeLockRequest) -> ApiResult:
+        """
+        车市「锁定换新」：把某车型设为它**所属分类**的换新目标。
+
+        为什么要按分类锁：自动以旧换新原本每轮挑「收益增量最大」的那辆，
+        同一个分类里今天可能换 A、明天换 B。用户想要的是「这个级别我只认迈巴赫」。
+
+        锁定存 view（和 _cat / _trade_for 同一套），**不进配置表单** ——
+        分类是游戏动态下发的（2026-10 一次从 4 个加到 9 个），表单没法预先列。
+
+        再点同一款 = 取消该分类的锁定；没有锁定时恢复原来的「挑收益最高」。
+        """
+        car_key = str(getattr(request, "car_id", "") or "").strip()
+        if not car_key:
+            return _result({"success": False, "error": "缺少车型 ID"})
+        snapshot, _hist, _daily = self._page_data()
+        target = next((c for c in self._dict_rows(snapshot.get("catalog"))
+                       if str(c.get("id")) == car_key), None)
+        if not target:
+            return _result({"success": False, "error": "车型不存在（先刷新一次车市）"})
+        category = str(target.get("category") or "").strip()
+        if not category:
+            return _result({"success": False, "error": "该车型没有分类，无法锁定"})
+        locks = dict(self._trade_locks or {})
+        if str(locks.get(category)) == car_key:
+            locks.pop(category, None)
+            note = f"已取消「{category}」的换新锁定"
+        else:
+            locks[category] = target.get("id")
+            note = f"「{category}」已锁定只换「{target.get('name')}」"
+        self._trade_locks = locks
+        await self._save_view({"trade_locks": locks})
+        self._set_result(note)
+        logger.info(f"[不可躺自动抢车位] {note}")
+        return _result({"success": True, "message": note})
+
     async def api_buy_car(self, request: CarBuyRequest) -> ApiResult:
         """
         购买车辆。
@@ -6536,6 +6698,7 @@ class ParkingBot(_PluginBase):
         # 不记就等于手动花掉的金币凭空消失，当日净收虚高。
         self._shop_spent += price
         self._shop_bought += 1
+        self._coin_event("buy", -price, name)
         await self._refresh_snapshot(client, "买车")
         self._set_result(f"购买 {name}，花费 {price} 金币")
         logger.info(f"[不可躺自动抢车位] 已购买 {name}，花费 {price} 金币")
@@ -6606,6 +6769,7 @@ class ParkingBot(_PluginBase):
         new_name = new_def.get("name") or "新车"
         self._shop_diff += diff
         self._shop_traded += 1
+        self._coin_event("trade", -diff, f"{old_name} → {new_name}")
         await self._refresh_snapshot(client, "换车")
         # 换完了就把选旧车的面板收掉，否则页面刷新后它还杵在最上面
         self._trade_for = ""
@@ -6650,8 +6814,10 @@ class ParkingBot(_PluginBase):
         )
         if not result or not result.get("success"):
             return _result({"success": False, "error": (result or {}).get("error") or "抢购失败"})
-        self._shop_spent += self._to_int(sale.get("price"), 0, minimum=0)
+        _flash_price = self._to_int(sale.get("price"), 0, minimum=0)
+        self._shop_spent += _flash_price
         self._shop_bought += 1
+        self._coin_event("flash", -_flash_price, sale.get("name"))
         await self._refresh_snapshot(client, "抢购")
         name = sale.get("name") or "特卖车型"
         self._set_result(f"抢购成功 {name}，花费 {sale.get('price', 0)} 金币")
@@ -7563,6 +7729,7 @@ class ParkingBot(_PluginBase):
         filter_api = f"plugin/{pid}/shop_filter"
         afford_api = f"plugin/{pid}/shop_afford"
         sort_api = f"plugin/{pid}/shop_sort"
+        lock_api = f"plugin/{pid}/trade_lock"
 
         price_by_id = {str(c.get("id")): self._to_int(c.get("price"), 0) for c in catalog}
         idle_cars = [c for c in cars if c.get("status") == "空闲"]
@@ -7664,11 +7831,21 @@ class ParkingBot(_PluginBase):
                     upgradable = [c for c in idle_cars
                                   if self._is_tradeable_idle(c, price_by_id)
                                   and price_by_id.get(str(c.get("carId")), 0) < price]
+                    _cat = str(car.get("category") or "")
+                    _lock_id = (self._trade_locks or {}).get(_cat)
+                    _is_locked = (_lock_id is not None
+                                  and str(_lock_id) == str(car.get("id")))
                     actions = [
                         self._action_btn("购买", buy_api, {"car_id": car.get("id")},
                                          disabled=full or price > cash),
                         self._action_btn("以旧换新", pick_api, {"car_id": car.get("id")},
                                          kind="trade", disabled=not upgradable),
+                        # 锁定按钮：按「车型所属分类」生效，自动以旧换新只换这一款。
+                        # 再点一次取消。放第三颗，换行也不挤（actions 容器允许 wrap）。
+                        self._action_btn(
+                            "已锁定" if _is_locked else "锁定换新", lock_api,
+                            {"car_id": car.get("id")},
+                            kind="secondary" if _is_locked else "ghost"),
                     ]
                     # 购买和换新的禁用原因互不相干，各说各的，不能用 elif 串成一条：
                     # 「购买」要的是一个空车位，满员就买不了；「以旧换新」是 1 换 1、
@@ -7695,6 +7872,15 @@ class ParkingBot(_PluginBase):
             _sort_label = dict(self._SHOP_SORTS).get(self._shop_sort, "性价比")
             _sub = (f"当前金币 {ParkingBot._fmt_num(cash)}，车辆 {owned_count}/{car_max} 辆；"
                     f"按钮直接扣金币，可用性在后端还会再校验一次。")
+            # 当前分类若锁了换新车型，写在副标题里 —— 不写的话用户看不到
+            # 「为什么自动换新只换那一辆」，会以为插件坏了。
+            _cur_lock = (self._trade_locks or {}).get(current)
+            if _cur_lock is not None:
+                _lock_name = next(
+                    (str(c.get("name") or "") for c in catalog
+                     if str(c.get("id")) == str(_cur_lock)), str(_cur_lock))
+                _sub += (f" 本分类已锁定换新：「{_lock_name}」"
+                         f"（自动以旧换新只换这一款，再点它的「已锁定」可取消）。")
             if self._shop_afford:
                 _sub += (f" 当前按「只看可买」过滤：等级够 + 现金够的 "
                          f"{_n_aff} 辆（现在列的是 {len(visible)} 辆）。")
