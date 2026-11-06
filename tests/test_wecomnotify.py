@@ -697,8 +697,9 @@ def test_plugin_version_matches_index():
     cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
     version = _class_assign(cls_node, "plugin_version")
     index = json.loads((REPO_ROOT / "package.v3.json").read_text(encoding="utf-8"))
-    assert version == "4.0.1"
+    assert version == "4.0.2"
     assert version == index["DynamicWeChatSelfUse"]["version"]
+    assert "v4.0.2" in index["DynamicWeChatSelfUse"]["history"]
     assert "v4.0.1" in index["DynamicWeChatSelfUse"]["history"]
     assert "v4.0.0" in index["DynamicWeChatSelfUse"]["history"]
 
@@ -1006,6 +1007,7 @@ def test_verify_code_api_registered():
 
     class _Wrapper:
         api_verify_code = staticmethod(lambda request: None)
+        api_verify_state = staticmethod(lambda: None)
 
         def __init__(self, host):
             self._host = host
@@ -1030,12 +1032,14 @@ def test_verify_code_page_has_input():
         extra={
             "_VERIFY_CODE_PAGE_HTML": _module_constant("_VERIFY_CODE_PAGE_HTML"),
             "_VERIFY_CODE_SUBMIT_JS": _module_constant("_VERIFY_CODE_SUBMIT_JS"),
+            "_VERIFY_CODE_POLL_JS": _module_constant("_VERIFY_CODE_POLL_JS"),
             "_html_escape": _html.escape,
         },
     )
     host = DynamicWeChatSelfUse()
     host._qr_running = True
     host._verification_code = None
+    host._verify_code_required = True
     host._verify_code_message = ""
     card = fn(host)
     assert len(card) == 1 and card[0]["component"] == "div"
@@ -1044,7 +1048,8 @@ def test_verify_code_page_has_input():
     assert "提交验证码" in page
     assert "plugin/DynamicWeChatSelfUse/verify_code" in page
     assert "window.MoviePilotAPI" in page
-    assert "扫码任务进行中" in page
+    assert "企业微信需要短信验证" in page
+    assert "display:block" in page  # 需要验证码时必须可见
     # 内联 JS 要放进 onclick="..."，不能含双引号
     js = _module_constant("_VERIFY_CODE_SUBMIT_JS")
     assert '"' not in js
@@ -1058,12 +1063,14 @@ def test_verify_code_page_shows_received_state():
         extra={
             "_VERIFY_CODE_PAGE_HTML": _module_constant("_VERIFY_CODE_PAGE_HTML"),
             "_VERIFY_CODE_SUBMIT_JS": _module_constant("_VERIFY_CODE_SUBMIT_JS"),
+            "_VERIFY_CODE_POLL_JS": _module_constant("_VERIFY_CODE_POLL_JS"),
             "_html_escape": _html.escape,
         },
     )
     host = DynamicWeChatSelfUse()
     host._qr_running = True
     host._verification_code = "123456"
+    host._verify_code_required = True
     host._verify_code_message = ""
     assert "已收到验证码" in fn(host)[0]["html"]
 
@@ -1167,6 +1174,96 @@ def test_new_qr_task_clears_stale_code():
         assert ("self._last_code = ''" in body or 'self._last_code = ""' in body), name
         assert "self._qr_running = True" in body, name
 
+
+def test_verify_code_card_hidden_when_not_required():
+    """没扫码 / 没到验证码步骤时，卡片必须是 display:none，不能常年占位。"""
+    fn = _extract_function(
+        "_verify_code_card",
+        extra={
+            "_VERIFY_CODE_PAGE_HTML": _module_constant("_VERIFY_CODE_PAGE_HTML"),
+            "_VERIFY_CODE_SUBMIT_JS": _module_constant("_VERIFY_CODE_SUBMIT_JS"),
+            "_VERIFY_CODE_POLL_JS": _module_constant("_VERIFY_CODE_POLL_JS"),
+            "_html_escape": _html.escape,
+        },
+    )
+    host = DynamicWeChatSelfUse()
+    host._qr_running = False
+    host._verification_code = None
+    host._verify_code_required = False
+    host._verify_code_message = ""
+    page = fn(host)[0]["html"]
+    assert 'id="dwcsu_wrap"' in page
+    assert "display:none" in page
+    assert "display:block" not in page
+    # 轮询钩子必须在，否则卡片永远没机会自动出现
+    assert "verify_state" in page
+
+
+def test_verify_state_api_registered():
+    """新增的 /verify_state 必须是 bear + GET，且不能与既有端点重复。"""
+    fn = _extract_function("get_api")
+    inner = DynamicWeChatSelfUse()
+    inner._init_wecom({})
+
+    class _Wrapper:
+        api_verify_code = staticmethod(lambda request: None)
+        api_verify_state = staticmethod(lambda: None)
+
+        def __init__(self, host):
+            self._host = host
+
+        def _wecom_api(self):
+            return self._host._wecom_api()
+
+    apis = fn(_Wrapper(inner))
+    pairs = [(a["path"], tuple(a["methods"])) for a in apis]
+    assert len(pairs) == len(set(pairs)), "API 端点不能重复注册"
+    state = [a for a in apis if a["path"] == "/verify_state"]
+    assert len(state) == 1
+    assert state[0]["auth"] == "bear"
+    assert state[0]["methods"] == ["GET"]
+    assert state[0]["endpoint"] is not None
+
+
+def test_verify_state_endpoint_reports_flags():
+    fn = _extract_function("api_verify_state")
+    host = DynamicWeChatSelfUse()
+    host._verify_code_required = True
+    host._qr_running = True
+    host._verification_code = None
+    host._verify_code_message = "请输入手机收到的 6 位验证码"
+    data = asyncio.run(fn(host))
+    assert data["success"] is True
+    assert data["data"]["need_code"] is True
+    assert data["data"]["qr_running"] is True
+    assert data["data"]["code_received"] is False
+    assert data["data"]["message"]
+
+    host._verify_code_required = False
+    assert asyncio.run(fn(host))["data"]["need_code"] is False
+
+
+def test_verify_code_required_lifecycle():
+    """状态位只在真正的验证码阶段为真，且所有退出路径都要复位。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    check = ast.unparse(_func_node(cls_node, "check_login_status"))
+    assert "self._verify_code_required = True" in check
+    assert "self._verify_code_required = False" in check
+    for name in ("local_scanning", "_push_qr_code_async", "init_plugin", "stop_service"):
+        body = ast.unparse(_func_node(cls_node, name))
+        assert "self._verify_code_required = False" in body, name
+
+
+def test_verify_code_poll_js_is_safe():
+    """轮询脚本要能放进 onerror="..."，且必须请求 verify_state。"""
+    js = _module_constant("_VERIFY_CODE_POLL_JS")
+    assert '"' not in js
+    assert "__PID__" in js and "verify_state" in js
+    assert "setInterval" in js
+    assert "localStorage" in js  # 老版本前端的 fetch 回退
+    assert "need_code" in js
+    assert "dwcsu_wrap" in js
+    assert "focus()" in js
 
 # ========================================================================
 # 独立脚本入口

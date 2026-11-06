@@ -30,7 +30,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `plugins.v3/dynamicwechatselfuse/__init__.py` | 宿主插件类：动态可信 IP / CookieCloud / 扫码 / 验证码（存量，含 v4.0.1 详情页提交入口）+ v4.0 合并后的契约方法、事件转发、表单、页面、命令、API、配置落库、停止逻辑 |
+| `plugins.v3/dynamicwechatselfuse/__init__.py` | 宿主插件类：动态可信 IP / CookieCloud / 扫码 / 验证码（存量，含 v4.0.2 按需自动弹出的验证码卡片）+ v4.0 合并后的契约方法、事件转发、表单、页面、命令、API、配置落库、停止逻辑 |
 | `plugins.v3/dynamicwechatselfuse/wecom_notify.py` | 新增的 `WecomNotifyMixin`：通知推送、回调验签与解密、远程命令、菜单、配置表单、详情页、状态 API。**不含任何 `@eventmanager.register`** |
 | `plugins.v3/dynamicwechatselfuse/client.py` | 企业微信 API 客户端：token 缓存、2048 字节分块、菜单、素材下载 |
 | `plugins.v3/dynamicwechatselfuse/crypt.py` | 回调加解密：SHA1 签名 + AES-256-CBC。**零宿主依赖**，可脱离宿主单测 |
@@ -115,7 +115,9 @@ DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase)
   里排除这两条后的 `/wecom_status`、`/wecom_test`。`/help` 与菜单都从这张表派生，
   新增命令只改一处。菜单只收 `category` 非空的命令，所以一级分组是「企业微信通知」。
 - **页面合并**：`get_page()` = 旧二维码/Cookie 面板 + `_verify_code_card()` + `self._wecom_page()`。
-  验证码卡片只在详情页：保存配置会触发 `init_plugin()`，把正在等码的扫码任务取消掉。
+  验证码卡片**默认 `display:none`**，只有 `_verify_code_required=True`（企业微信真的弹出短信验证面板）
+  时才显示；卡片内隐藏的 `<img onerror>` 启动 `GET /verify_state` 轮询，实现「需要时自动弹出、
+  登录后自动收起」。卡片只在详情页：保存配置会触发 `init_plugin()`，把正在等码的扫码任务取消掉。
 - **API**：`get_api()` 直接返回 `self._wecom_api()`，注册 `/wecom`(GET 验证 / POST 消息，
   `auth: none`) 与 `/status`(GET，`auth: bear`)。
 
@@ -615,3 +617,25 @@ mp_api_schema.json                  # MoviePilot MCP 的 operation_id 契约快�
 **回归点**：`test_verify_code_api_registered` / `test_verify_code_page_has_input` /
 `test_submit_verify_code_validates_and_sets_state` / `test_verify_code_endpoint_never_persists` /
 `test_verify_code_wait_is_polling`
+
+**v4.0.2 跟进**：上面的实现把卡片常驻在详情页，未扫码时也一直占着位置，用户反馈「不该一直显示，
+扫码以后才出现、需要时才弹」。现在改为：
+
+1. 新增运行时状态位 `_verify_code_required`（默认 `False`）。只在
+   `check_login_status()` 匹配到 `.receive_captcha_panel` 时置 `True`；
+   在 `local_scanning()` / `_push_qr_code_async()` 开始与 `finally`、普通登录成功、
+   验证码登录成功、等待超时、`stop_service()`、`init_plugin()` 处全部复位为 `False`。
+2. `_verify_code_card()` 始终返回一张卡，但 `display` 由状态位决定：`False` 时为 `none`，
+   页面上完全看不到；`True` 时为 `block`。
+3. 卡片末尾放一个隐藏的 `<img src="data:image/gif;base64,!!!" onerror="...">` 作为启动钩子，
+   轮询新增的 `GET /verify_state`（`auth: "bear"`，纯只读，不触发任何配置/生命周期动作）。
+   轮询发现 `need_code=true` 就显示卡片、`scrollIntoView` 并聚焦输入框；变回 `false` 就收起；
+   连续 60 次（约 150 秒）既不需要验证码、也没有扫码任务时停止轮询，避免空转。
+4. `v-html` 里 `<script>` 不会执行，所以自动启动只能用 `onerror` 这类 DOM 事件；
+   宿主 `public/nginx.conf` 无 CSP（已核对），内联事件处理器可用。
+5. `_submit_verify_code()` 成功时也会把 `_verify_code_required` 置 `True`，避免通过
+   `/wxcode` 或企微消息通道提交时卡片提前收起。
+
+**回归点（v4.0.2）**：`test_verify_code_card_hidden_when_not_required` /
+`test_verify_state_api_registered` / `test_verify_state_endpoint_reports_flags` /
+`test_verify_code_required_lifecycle` / `test_verify_code_poll_js_is_safe`
