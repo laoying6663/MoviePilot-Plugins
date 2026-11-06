@@ -9,6 +9,9 @@ import threading
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 
+from fastapi import Request
+from html import escape as _html_escape
+
 import httpx2
 import pytz
 from apscheduler.triggers.cron import CronTrigger
@@ -33,16 +36,23 @@ from .helper import PyCookieCloud, MySender, IpLocationParser, JsonFieldManager
 from .wecom_notify import WecomNotifyMixin
 
 
+# 详情页「短信验证码」卡片模板。
+# MoviePilot V3 的 PageRender 对详情页只做 v-bind(props) + 静态 params 的 API 调用，
+# 不会读取输入框的值；因此用原生 input + 内联 click 处理器直接请求插件 API。
+_VERIFY_CODE_PAGE_HTML = '<div style="margin-top:12px;padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03)">\n  <div style="font-size:15px;font-weight:600;margin-bottom:8px">短信验证码</div>\n  <div style="display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap">\n    <input id="dwcsu_vcode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="请输入 6 位短信验证码" style="flex:0 1 220px;min-width:160px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.24);background:rgba(0,0,0,0.25);color:inherit;font-size:15px;letter-spacing:2px;text-align:center" />\n    <button type="button" onclick="__SUBMIT_JS__" style="padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600;color:#ffffff;background:#1976d2">提交验证码</button>\n  </div>\n  <div id="dwcsu_vcode_msg" style="margin-top:8px;font-size:13px;text-align:center;color:#ffb74d">__STATUS__</div>\n  <div style="margin-top:6px;font-size:12px;text-align:center;color:#9e9e9e">也可在企业微信应用内发送「6位数字?」，或使用 /wxcode 6位数字</div>\n</div>'
+_VERIFY_CODE_SUBMIT_JS = "(function(){var el=document.getElementById('dwcsu_vcode'),msg=document.getElementById('dwcsu_vcode_msg');if(!el)return;var code=(el.value||'').replace(/[^0-9]/g,'').slice(0,6);var say=function(t,c){if(msg){msg.textContent=t;msg.style.color=c;}};if(code.length!==6){say('请输入 6 位数字验证码','#ff8a80');return;}say('正在提交...','#ffb74d');var path='plugin/__PID__/verify_code?code='+encodeURIComponent(code);var textOf=function(d){if(!d||typeof d!=='object')return '';if(typeof d.message==='string'&&d.message)return d.message;if(d.data&&typeof d.data.message==='string')return d.data.message;if(typeof d.detail==='string')return d.detail;return '';};var bad=function(e){var t=textOf(e)||'提交失败，请稍后重试，或在企业微信应用发送 6位数字?';say(String(t).slice(0,200),'#ff8a80');};var ok=function(d){if(d&&d.success===false){bad(d);return;}var t=textOf(d)||'验证码已提交，正在完成登录，请稍候';say(t,'#69f0ae');try{el.value='';}catch(e){}};try{var api=window.MoviePilotAPI;if(api&&typeof api.post==='function'){api.post(path,{}).then(ok).catch(bad);return;}}catch(e){}var t='';try{var a=JSON.parse(localStorage.getItem('auth')||'{}');t=a.token||localStorage.getItem('token')||'';}catch(e){try{t=localStorage.getItem('token')||'';}catch(e2){}}fetch('/api/v1/'+path,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:'{}'}).then(function(r){return r.json().then(function(d){if(!r.ok){throw d;}return d;});}).then(ok).catch(bad);})()"
+
+
 class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
     # 插件名称
     plugin_name = "动态企微可信IP（自用版）"
     # 插件描述
     plugin_desc = ("动态维护企业微信应用可信IP；并把 MoviePilot 通知推送到企业微信自建应用，"
-                   "支持回调验签、远程命令与控制菜单。验证码以？结尾发送到企业微信应用")
+                   "支持回调验签、远程命令与控制菜单；扫码后可直接在插件详情页输入短信验证码")
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "4.0.0"
+    plugin_version = "4.0.1"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -69,6 +79,10 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
     QR_CODE_REFUSE_OFFSET = 5          # 二维码拒绝时间偏移（秒，用于前端展示）
     FILE_LOCK_TIMEOUT = 5.0            # 文件锁获取超时（秒）
     BACKUP_TASK_JOIN_TIMEOUT = 10      # 停止时等待后台任务超时（秒）
+    # 出现短信验证码面板后，等待用户在详情页提交的最长时间（秒）。
+    # 轮询读取 _verification_code，收到即刻继续，不再干等固定 30 秒。
+    VERIFY_CODE_WAIT_SECONDS = 120
+    VERIFY_CODE_POLL_INTERVAL = 0.5
 
     # ------------------------------------------私有属性------------------------------------------
     _enabled = False  # 开关
@@ -125,6 +139,8 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
     text = ""
     # 手机验证码
     _verification_code = ''
+    # 详情页「提交验证码」最近一次结果提示（仅运行时展示，不落库、不进配置）
+    _verify_code_message = ''
     # 过期时间
     _future_timestamp = 0
     # 配置文件路径
@@ -735,6 +751,10 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
             if not event_data or event_data.get("action") != "dynamicwechatselfuse":
                 return
         context = None
+        # 开始新一轮扫码：清掉上一轮可能残留的验证码，避免新任务直接填入旧码
+        self._verification_code = None
+        self._last_code = ""
+        self._verify_code_message = ""
         self._qr_running = True
         try:
             context = await self._launch_browser_context_with_retry(headless=True)
@@ -1257,6 +1277,10 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
             logger.info("二维码推送任务正在执行，忽略重复触发")
             return
         try:
+            # 开始新一轮扫码：清掉上一轮可能残留的验证码
+            self._verification_code = None
+            self._last_code = ""
+            self._verify_code_message = ""
             self._qr_running = True
             context = None
             try:
@@ -1621,14 +1645,22 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
         try:
             captcha_panel = await page.wait_for_selector('.receive_captcha_panel', timeout=5000)
             if captcha_panel:
-                if task == 'local_scanning':
-                    await asyncio.sleep(3)
-                else:
-                    logger.info("等待30秒,请将短信验证码请以'？'结束,发送到<企业微信应用> 如： 110301？")
-                    for _ in range(30):
-                        if self._stopping:
-                            return False
-                        await asyncio.sleep(1)
+                # v4.0.1：详情页新增「提交验证码」输入框，等待逻辑改为轮询。
+                # 旧实现固定干等 30 秒后才检查一次 _verification_code：
+                # 一是页面提交最快也要等满 30 秒才生效，二是扫码 + 看短信经常不够用。
+                # 现在收到码即刻继续；local_scanning 也不再只给 3 秒。
+                logger.info(
+                    "已出现短信验证码面板，请在插件详情页输入验证码并提交"
+                    "（或发送到企业微信应用：6位数字?，或 /wxcode 6位数字），"
+                    f"最长等待 {self.VERIFY_CODE_WAIT_SECONDS} 秒"
+                )
+                wait_steps = int(self.VERIFY_CODE_WAIT_SECONDS / self.VERIFY_CODE_POLL_INTERVAL)
+                for _ in range(wait_steps):
+                    if self._stopping:
+                        return False
+                    if self._verification_code:
+                        break
+                    await asyncio.sleep(self.VERIFY_CODE_POLL_INTERVAL)
                 if self._verification_code:
                     for digit in self._verification_code:
                         await page.keyboard.press(digit)
@@ -1642,6 +1674,7 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                                 success_element = await page.wait_for_selector(selector, timeout=3000)
                                 if success_element:
                                     self._verification_code = None
+                                    self._last_code = ""
                                     logger.info("验证码登录成功！")
                                     return True
                             except asyncio.TimeoutError:
@@ -1650,7 +1683,9 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                                 continue
                 else:
                     logger.error(
-                        "未收到短信验证码，请以问号结尾发送到企业微信应用。如：510010? 使用全局AI助手需使用/wxcode 510010的格式发送验证码")
+                        "未收到短信验证码，请在插件详情页输入并提交，"
+                        "或以问号结尾发送到企业微信应用。如：510010? "
+                        "使用全局AI助手需使用/wxcode 510010的格式发送验证码")
                     return False
         except asyncio.TimeoutError:
             pass
@@ -2175,8 +2210,30 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                 ]
             }
         ]
+        # v4.0.1：二维码下方追加「短信验证码」输入卡片（详情页专用，不进配置表单）
+        base_content.extend(self._verify_code_card())
         # v4.0：把企业微信通知的运行状态面板接在原有详情页后面
         return base_content + self._wecom_page()
+
+    def _verify_code_card(self) -> List[dict]:
+        """详情页的短信验证码输入卡片。
+
+        不进 get_form()，也不写配置：保存配置会触发 init_plugin() -> stop_service()，
+        直接把正在等待验证码的扫码后台任务取消掉，用户永远收不到码。
+        """
+        pid = self.__class__.__name__
+        if self._verification_code and self._qr_running:
+            status = "已收到验证码，正在完成登录，请稍候"
+        elif self._qr_running:
+            status = "扫码任务进行中，扫码后在此输入短信验证码"
+        else:
+            status = "当前没有等待验证码的扫码任务，请先触发扫码（/push_qr 或本地扫码）"
+        message = getattr(self, "_verify_code_message", "") or status
+        js = _VERIFY_CODE_SUBMIT_JS.replace("__PID__", pid)
+        html = (_VERIFY_CODE_PAGE_HTML
+                .replace("__SUBMIT_JS__", js)
+                .replace("__STATUS__", _html_escape(str(message), quote=True)))
+        return [{"component": "div", "html": html}]
 
     # ---------- 企业微信通知事件转发（宿主类统一注册，保证只注册一次） ----------
 
@@ -2278,7 +2335,61 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         # v4.0：企业微信回调（匿名，靠 SHA1 验签）与状态查询端点
-        return self._wecom_api()
+        # v4.0.1：详情页提交短信验证码（需登录；不写配置、不触发 init_plugin）
+        return self._wecom_api() + [
+            {
+                "path": "/verify_code",
+                "endpoint": self.api_verify_code,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "提交企业微信短信验证码",
+            },
+        ]
+
+    async def api_verify_code(self, request: Request) -> Any:
+        """详情页「提交验证码」入口。
+
+        只改运行时状态，绝不调用 init_plugin() / update_config()：
+        扫码任务正在后台等码，任何一次配置保存都会触发 stop_service()
+        把这个任务取消掉，导致永远收不到验证码。
+        """
+        code = ""
+        try:
+            code = request.query_params.get("code") or ""
+        except Exception:
+            pass
+        if not code:
+            try:
+                payload = await request.json()
+                if isinstance(payload, dict):
+                    code = str(payload.get("code") or "")
+            except Exception:
+                pass
+        ok, message = self._submit_verify_code(code)
+        self._verify_code_message = message
+        return {
+            "success": ok,
+            "message": message,
+            "data": {
+                "qr_running": bool(getattr(self, "_qr_running", False)),
+                "code_received": bool(getattr(self, "_verification_code", None)),
+            },
+        }
+
+    def _submit_verify_code(self, code: Any) -> Tuple[bool, str]:
+        """校验并提交 6 位短信验证码，返回 (是否成功, 提示文案)。"""
+        digits = "".join(ch for ch in str(code or "") if ch in "0123456789")
+        if len(digits) != 6:
+            return False, "验证码必须是 6 位数字"
+        if not getattr(self, "_qr_running", False):
+            return False, "当前没有等待验证码的扫码任务，请先触发扫码（/push_qr 或本地扫码）"
+        if getattr(self, "_last_code", None) == digits:
+            return False, "该验证码已提交过，请勿重复提交"
+        self._verification_code = digits
+        self._last_code = digits
+        # 安全：绝不把验证码明文写进日志
+        logger.info("收到短信验证码（详情页提交）")
+        return True, "验证码已提交，正在完成登录，请稍候"
 
     def get_service(self) -> List[Dict[str, Any]]:
         return []

@@ -1,4 +1,4 @@
-"""DynamicWeChatSelfUse v4.0.0 离线自测。
+"""DynamicWeChatSelfUse v4.0.1 离线自测。
 
 文件名沿用 PR #1，实际测试的是合并后的 ``plugins.v3/dynamicwechatselfuse`` 包
 （原独立插件 ``plugins.v3/wecomnotify`` 已并入并删除）。
@@ -18,7 +18,9 @@
 """
 
 import ast
+import asyncio
 import base64
+import html as _html
 import copy
 import datetime
 import enum
@@ -322,7 +324,7 @@ def _class_assign(node, target):
     raise AssertionError(f"类属性 {target} 不存在")
 
 
-def _extract_function(fn_name, from_mixin=False):
+def _extract_function(fn_name, from_mixin=False, extra=None):
     """从源码里摘出单个方法，编译成模块级函数以便轻量调用。
 
     去掉装饰器，避免 @eventmanager.register / @staticmethod 的副作用。
@@ -354,10 +356,31 @@ def _extract_function(fn_name, from_mixin=False):
             "Tuple": Tuple,
         }
     )
+    namespace.update(extra or {})
     exec(compile(wrapper, f"<{fn_name}>", "exec"), namespace)
     fn = namespace[fn_name]
     _Alias._drop_shared_form_fields = staticmethod(fn)
     return fn
+
+
+def _module_constant(name):
+    """从 __init__.py 里取模块级字符串常量（不导入重型宿主依赖）。"""
+    tree = ast.parse(_host_source())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"模块常量 {name} 不存在")
+
+
+def _called_attrs(node):
+    """收集方法体内所有 self.xxx() 调用，避免把 docstring 当成调用。"""
+    return [
+        n.func.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    ]
 
 
 def _collect_models(nodes):
@@ -674,8 +697,9 @@ def test_plugin_version_matches_index():
     cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
     version = _class_assign(cls_node, "plugin_version")
     index = json.loads((REPO_ROOT / "package.v3.json").read_text(encoding="utf-8"))
-    assert version == "4.0.0"
+    assert version == "4.0.1"
     assert version == index["DynamicWeChatSelfUse"]["version"]
+    assert "v4.0.1" in index["DynamicWeChatSelfUse"]["history"]
     assert "v4.0.0" in index["DynamicWeChatSelfUse"]["history"]
 
 
@@ -795,11 +819,20 @@ def test_readme_documents_v4_callback_url():
     assert "/api/v1/plugin/WecomNotify/wecom" not in readme
 
 
+def test_readme_documents_verify_code_page():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "短信验证码" in readme
+    assert "提交验证码" in readme
+    assert "不会触发保存配置" in readme
+
+
 def test_handover_keeps_redlines_and_pitfalls():
     handover = (REPO_ROOT / "HANDOVER.md").read_text(encoding="utf-8")
     assert "## 6. 红线清单" in handover
     assert "## 7. 踩坑档案" in handover
     assert "5.2 真实宿主验收" in handover
+    assert "7.16" in handover
+    assert "PageRender" in handover
 
 
 # ========================================================================
@@ -958,6 +991,181 @@ def test_schedule_wecom_test_when_configured():
     assert args[0] == "DynamicWeChatSelfUse"
     assert args[1] == "wecom_test_once"
     assert kwargs.get("delay_seconds") == 3
+
+
+# ========================================================================
+# 四、v4.0.1 详情页短信验证码入口
+# ========================================================================
+
+
+def test_verify_code_api_registered():
+    """get_api() 合并后不能出现重复路径，新端点必须是 bear + POST。"""
+    fn = _extract_function("get_api")
+    inner = DynamicWeChatSelfUse()
+    inner._init_wecom({})
+
+    class _Wrapper:
+        api_verify_code = staticmethod(lambda request: None)
+
+        def __init__(self, host):
+            self._host = host
+
+        def _wecom_api(self):
+            return self._host._wecom_api()
+
+    apis = fn(_Wrapper(inner))
+    pairs = [(a["path"], tuple(a["methods"])) for a in apis]
+    assert len(pairs) == len(set(pairs)), "API 端点不能重复注册"
+    verify = [a for a in apis if a["path"] == "/verify_code"]
+    assert len(verify) == 1
+    assert verify[0]["auth"] == "bear"
+    assert verify[0]["methods"] == ["POST"]
+    assert verify[0]["endpoint"] is not None
+
+
+def test_verify_code_page_has_input():
+    """详情页必须有可输入的 input、提交按钮与正确的 API 路径。"""
+    fn = _extract_function(
+        "_verify_code_card",
+        extra={
+            "_VERIFY_CODE_PAGE_HTML": _module_constant("_VERIFY_CODE_PAGE_HTML"),
+            "_VERIFY_CODE_SUBMIT_JS": _module_constant("_VERIFY_CODE_SUBMIT_JS"),
+            "_html_escape": _html.escape,
+        },
+    )
+    host = DynamicWeChatSelfUse()
+    host._qr_running = True
+    host._verification_code = None
+    host._verify_code_message = ""
+    card = fn(host)
+    assert len(card) == 1 and card[0]["component"] == "div"
+    page = card[0]["html"]
+    assert 'id="dwcsu_vcode"' in page
+    assert "提交验证码" in page
+    assert "plugin/DynamicWeChatSelfUse/verify_code" in page
+    assert "window.MoviePilotAPI" in page
+    assert "扫码任务进行中" in page
+    # 内联 JS 要放进 onclick="..."，不能含双引号
+    js = _module_constant("_VERIFY_CODE_SUBMIT_JS")
+    assert '"' not in js
+    assert "__PID__" in js and "verify_code?code=" in js
+    assert "localStorage" in js  # 老版本前端的 fetch 回退
+
+
+def test_verify_code_page_shows_received_state():
+    fn = _extract_function(
+        "_verify_code_card",
+        extra={
+            "_VERIFY_CODE_PAGE_HTML": _module_constant("_VERIFY_CODE_PAGE_HTML"),
+            "_VERIFY_CODE_SUBMIT_JS": _module_constant("_VERIFY_CODE_SUBMIT_JS"),
+            "_html_escape": _html.escape,
+        },
+    )
+    host = DynamicWeChatSelfUse()
+    host._qr_running = True
+    host._verification_code = "123456"
+    host._verify_code_message = ""
+    assert "已收到验证码" in fn(host)[0]["html"]
+
+
+def test_submit_verify_code_validates_and_sets_state():
+    fn = _extract_function("_submit_verify_code")
+
+    class _Host:
+        _qr_running = True
+        _verification_code = None
+        _last_code = ""
+
+    host = _Host()
+    ok, msg = fn(host, "12 34-56")
+    assert ok and "已提交" in msg
+    assert host._verification_code == "123456" and host._last_code == "123456"
+
+    ok, msg = fn(host, "123456")
+    assert not ok and "已提交过" in msg  # 去重
+
+    host2 = _Host()
+    host2._qr_running = False
+    ok, msg = fn(host2, "987654")
+    assert not ok and "没有等待验证码" in msg
+
+    host3 = _Host()
+    ok, msg = fn(host3, "12345")
+    assert not ok and "6 位数字" in msg
+
+
+def test_verify_code_endpoint_accepts_query_and_body():
+    """端点同时兼容 query 参数与 JSON body，且返回标准信封。"""
+    fn = _extract_function("api_verify_code")
+    submit = _extract_function("_submit_verify_code")
+
+    class _Host:
+        _qr_running = True
+        _verification_code = None
+        _last_code = ""
+        _verify_code_message = ""
+
+        def _submit_verify_code(self, code):
+            return submit(self, code)
+
+    class _Req:
+        def __init__(self, query=None, payload=None):
+            self.query_params = query or {}
+            self._payload = payload
+
+        async def json(self):
+            if self._payload is None:
+                raise ValueError("no body")
+            return self._payload
+
+    h1 = _Host()
+    r1 = asyncio.run(fn(h1, _Req(query={"code": "123456"})))
+    assert r1["success"] is True and h1._verification_code == "123456"
+    assert h1._verify_code_message == r1["message"]
+
+    h2 = _Host()
+    r2 = asyncio.run(fn(h2, _Req(payload={"code": "654321"})))
+    assert r2["success"] is True and h2._verification_code == "654321"
+
+    h3 = _Host()
+    r3 = asyncio.run(fn(h3, _Req(query={"code": "12x"})))
+    assert r3["success"] is False and "6 位数字" in r3["message"]
+
+
+def test_verify_code_endpoint_never_persists():
+    """端点绝不能触发配置保存/重载，否则会杀掉正在等码的扫码任务。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    for name in ("api_verify_code", "_submit_verify_code"):
+        called = _called_attrs(_func_node(cls_node, name))
+        for forbidden in ("init_plugin", "update_config", "__update_config", "save_data"):
+            assert forbidden not in called, f"{name} 不应调用 {forbidden}"
+
+    # 验证码明文不能进日志
+    body = ast.unparse(_func_node(cls_node, "_submit_verify_code"))
+    assert "logger.info" in body
+    assert "{digits}" not in body
+    assert "f'" not in body and 'f"' not in body
+
+
+def test_verify_code_wait_is_polling():
+    """旧版固定干等 30 秒，现在必须是轮询且收到即刻继续。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    body = ast.unparse(_func_node(cls_node, "check_login_status"))
+    assert "VERIFY_CODE_WAIT_SECONDS" in body
+    assert "VERIFY_CODE_POLL_INTERVAL" in body
+    assert "range(30)" not in body
+    assert "if self._verification_code:" in body
+
+
+def test_new_qr_task_clears_stale_code():
+    """新一轮扫码必须清空上一轮残留验证码，避免直接填入旧码。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    for name in ("local_scanning", "_push_qr_code_async"):
+        body = ast.unparse(_func_node(cls_node, name))
+        assert "self._verification_code = None" in body, name
+        # ast.unparse 会把源码里的 "" 统一渲染成 ''
+        assert ("self._last_code = ''" in body or 'self._last_code = ""' in body), name
+        assert "self._qr_running = True" in body, name
 
 
 # ========================================================================

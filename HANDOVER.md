@@ -30,7 +30,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `plugins.v3/dynamicwechatselfuse/__init__.py` | 宿主插件类：动态可信 IP / CookieCloud / 扫码 / 验证码（存量）+ v4.0 合并后的契约方法、事件转发、表单、页面、命令、API、配置落库、停止逻辑 |
+| `plugins.v3/dynamicwechatselfuse/__init__.py` | 宿主插件类：动态可信 IP / CookieCloud / 扫码 / 验证码（存量，含 v4.0.1 详情页提交入口）+ v4.0 合并后的契约方法、事件转发、表单、页面、命令、API、配置落库、停止逻辑 |
 | `plugins.v3/dynamicwechatselfuse/wecom_notify.py` | 新增的 `WecomNotifyMixin`：通知推送、回调验签与解密、远程命令、菜单、配置表单、详情页、状态 API。**不含任何 `@eventmanager.register`** |
 | `plugins.v3/dynamicwechatselfuse/client.py` | 企业微信 API 客户端：token 缓存、2048 字节分块、菜单、素材下载 |
 | `plugins.v3/dynamicwechatselfuse/crypt.py` | 回调加解密：SHA1 签名 + AES-256-CBC。**零宿主依赖**，可脱离宿主单测 |
@@ -114,7 +114,8 @@ DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase)
 - **命令合并**：`get_command()` = 旧命令 `/push_qr`、`/wxcode` + `_wecom_commands()`
   里排除这两条后的 `/wecom_status`、`/wecom_test`。`/help` 与菜单都从这张表派生，
   新增命令只改一处。菜单只收 `category` 非空的命令，所以一级分组是「企业微信通知」。
-- **页面合并**：`get_page()` = 旧二维码/Cookie 面板 `base_content + self._wecom_page()`。
+- **页面合并**：`get_page()` = 旧二维码/Cookie 面板 + `_verify_code_card()` + `self._wecom_page()`。
+  验证码卡片只在详情页：保存配置会触发 `init_plugin()`，把正在等码的扫码任务取消掉。
 - **API**：`get_api()` 直接返回 `self._wecom_api()`，注册 `/wecom`(GET 验证 / POST 消息，
   `auth: none`) 与 `/status`(GET，`auth: bear`)。
 
@@ -584,3 +585,33 @@ mp_api_schema.json                  # MoviePilot MCP 的 operation_id 契约快�
 ```
 
 仓库里的代码才是权威来源。
+
+---
+
+### 7.16 【v4.0.1】扫码后要填验证码，但详情页没有输入的地方
+
+**症状**：用户扫码登录后企业微信要求短信验证码，插件详情页只有二维码，没有可填码的控件；
+旧文档写的「给企微应用发 `510010?`」依赖消息回调，而回调尚未打通（另见 7.14 / 5.3 的 apikey 拦截）。
+
+**根因**：三条约束叠在一起。
+
+1. MoviePilot V3 详情页由 `PageRender.vue` 渲染，它只做 `v-bind="config.props"`，
+   并用 `events.click` 里的**静态** `params` 调 `api.post(api_path, params)`。
+   它不像配置页的 `FormRender.vue` 那样解析 `props.model` 做 `v-model`，也不读取 DOM 输入框的值。
+   所以「VTextField + 按钮 events」这种写法在详情页**收不到用户输入的数字**。
+2. 不能把输入框放进 `get_form()` 配置表单：点保存会走
+   `update_config()` → `init_plugin()` → `stop_service()`，把正在等待验证码的扫码后台任务取消掉。
+   而且验证码是瞬时值，按红线 12 也不该落库。
+3. `get_api()` 的匿名端点还会被宿主全局 apikey 中间件拦下，不能靠 `auth: "none"` 绕开鉴权。
+
+**修法**：详情页用 `html` 注入原生 `<input>` + 内联 `onclick` 处理器，
+优先调宿主暴露的带鉴权 axios 客户端 `window.MoviePilotAPI.post('plugin/<ID>/verify_code?code=<6位数字>', {})`，
+老版本前端回退到 `fetch` + `localStorage` 里的 Bearer token。后端新增
+`POST /verify_code`（`auth: "bear"`），端点只写 `_verification_code` / `_last_code` /
+`_verify_code_message`，**不调 `init_plugin()`、不调 `update_config()`、不落库**。
+同时把 `check_login_status()` 里「固定干等 30 秒才检查一次」改成
+`VERIFY_CODE_WAIT_SECONDS = 120` 秒轮询，收到码即刻继续；新一轮扫码开始时清空上一轮残留码。
+
+**回归点**：`test_verify_code_api_registered` / `test_verify_code_page_has_input` /
+`test_submit_verify_code_validates_and_sets_state` / `test_verify_code_endpoint_never_persists` /
+`test_verify_code_wait_is_polling`
