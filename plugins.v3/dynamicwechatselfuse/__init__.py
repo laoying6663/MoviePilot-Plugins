@@ -63,10 +63,14 @@ _VERIFY_CODE_PAGE_HTML = (
     'onerror="__POLL_JS__" />'
 )
 _VERIFY_CODE_SUBMIT_JS = "(function(){var el=document.getElementById('dwcsu_vcode'),msg=document.getElementById('dwcsu_vcode_msg');if(!el)return;var code=(el.value||'').replace(/[^0-9]/g,'').slice(0,6);var say=function(t,c){if(msg){msg.textContent=t;msg.style.color=c;}};if(code.length!==6){say('请输入 6 位数字验证码','#ff8a80');return;}say('正在提交...','#ffb74d');var path='plugin/__PID__/verify_code?code='+encodeURIComponent(code);var textOf=function(d){if(!d||typeof d!=='object')return '';if(typeof d.message==='string'&&d.message)return d.message;if(d.data&&typeof d.data.message==='string')return d.data.message;if(typeof d.detail==='string')return d.detail;return '';};var bad=function(e){var t=textOf(e)||'提交失败，请稍后重试，或在企业微信应用发送 6位数字?';say(String(t).slice(0,200),'#ff8a80');};var ok=function(d){if(d&&d.success===false){bad(d);return;}var t=textOf(d)||'验证码已提交，正在完成登录，请稍候';say(t,'#69f0ae');try{el.value='';}catch(e){}};try{var api=window.MoviePilotAPI;if(api&&typeof api.post==='function'){api.post(path,{}).then(ok).catch(bad);return;}}catch(e){}var t='';try{var a=JSON.parse(localStorage.getItem('auth')||'{}');t=a.token||localStorage.getItem('token')||'';}catch(e){try{t=localStorage.getItem('token')||'';}catch(e2){}}fetch('/api/v1/'+path,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+t},body:'{}'}).then(function(r){return r.json().then(function(d){if(!r.ok){throw d;}return d;});}).then(ok).catch(bad);})()"
+# v5.0.1：轮询不再停表。旧版在「无扫码任务连续 60 次（约 150 秒）」后
+# clearInterval 并置 t=null，用户先打开详情页、过几分钟再点扫码时，轮询已经死了，
+# 验证码卡片永远不会弹。改成动态间隔：有扫码任务 / 需要验证码时 2.5 秒一次，
+# 空闲时降到 10 秒一次，既不会漏状态，也不会让长期开着的详情页刷爆接口。
 _VERIFY_CODE_POLL_JS = (
     "(function(){var w=document.getElementById('dwcsu_wrap'),b=document.getElementById('dwcsu_vcode'),"
     "m=document.getElementById('dwcsu_vcode_msg');if(!w||w.getAttribute('data-poll')==='1')return;"
-    "w.setAttribute('data-poll','1');var idle=0,t=null;"
+    "w.setAttribute('data-poll','1');var period=0,t=0;"
     "var get=function(p,cb){try{var a=window.MoviePilotAPI;"
     "if(a&&typeof a.get==='function'){a.get(p).then(cb).catch(function(){});return;}}catch(e){}"
     "var k='';try{var s=JSON.parse(localStorage.getItem('auth')||'{}');"
@@ -78,12 +82,14 @@ _VERIFY_CODE_POLL_JS = (
     "w.style.display=v?'block':'none';"
     "if(v&&h){try{w.scrollIntoView({block:'center',behavior:'smooth'});}catch(e){}"
     "try{b&&b.focus();}catch(e){}}};"
+    "var schedule=function(ms){if(ms===period)return;period=ms;"
+    "if(t){clearInterval(t);}t=setInterval(tick,period);};"
     "var tick=function(){get('plugin/__PID__/verify_state',function(d){"
     "var x=(d&&d.data)||d||{};"
-    "if(x.need_code){idle=0;show(true);if(m&&x.message)m.textContent=x.message;}"
-    "else{show(false);idle++;if(!x.qr_running&&idle>=60){"
-    "if(t){clearInterval(t);t=null;}}}});};"
-    "tick();t=setInterval(tick,2500);})()"
+    "schedule((x.need_code||x.qr_running)?2500:10000);"
+    "if(x.need_code){show(true);if(m&&x.message)m.textContent=x.message;}"
+    "else{show(false);}});};"
+    "tick();})()"
 )
 
 
@@ -97,7 +103,7 @@ class DynamicWeChatSelfUse(_PluginBase):
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "5.0.0"
+    plugin_version = "5.0.1"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -811,11 +817,16 @@ class DynamicWeChatSelfUse(_PluginBase):
                 self._future_timestamp = int(future_time.timestamp())
                 logger.info("请重新进入插件面板扫码! 每20秒检查登录状态,最大尝试5次")
                 for attempt in range(self.QR_CODE_MAX_ATTEMPTS):
-                    # 短轮询，每1秒检查一次停止信号
+                    # v5.0.1：短轮询里每秒顺带零等待探一次短信验证面板，
+                    # 命中就立刻进入 check_login_status() 的验证码流程，
+                    # 不必等满 20 秒的 QR_CODE_CHECK_INTERVAL 才轮到一次检查。
                     for _ in range(self.QR_CODE_CHECK_INTERVAL):
                         if self._stopping:
                             logger.debug("收到停止信号，退出扫码等待")
                             return
+                        if await self._probe_captcha_panel(page):
+                            logger.info("检测到短信验证面板，提前进入验证码流程")
+                            break
                         await asyncio.sleep(1)
                     if await self.check_login_status(page, task='local_scanning'):
                         await self._update_cookie(page, context)
@@ -1372,11 +1383,15 @@ class DynamicWeChatSelfUse(_PluginBase):
                         logger.info(
                             "远程推送任务: 二维码发送成功,等待用户 80 秒内扫码登录。V2'微信通知'的用户,此消息并不准确")
                         for attempt in range(self.QR_CODE_MAX_ATTEMPTS):
-                            # 短轮询检查停止信号
+                            # v5.0.1：同 local_scanning，每秒探一次短信验证面板，
+                            # 让远程推送二维码的场景也能秒级弹出输入框。
                             for _ in range(self.QR_CODE_CHECK_INTERVAL):
                                 if self._stopping:
                                     logger.debug("收到停止信号，退出扫码等待")
                                     return
+                                if await self._probe_captcha_panel(page):
+                                    logger.info("检测到短信验证面板，提前进入验证码流程")
+                                    break
                                 await asyncio.sleep(1)
                             if await self.check_login_status(page, 'push_qr_code'):
                                 await self._update_cookie(page, context)
@@ -1658,38 +1673,65 @@ class DynamicWeChatSelfUse(_PluginBase):
             PyCookieCloud.update_settings, self._settings_file_path, _mutate,
         )
 
+    async def _probe_captcha_panel(self, page):
+        """零等待探测企业微信是否已弹出短信验证码面板。
+
+        v5.0.1：扫码等待循环每秒调用一次。只用 query_selector（立即返回），
+        绝不用带超时的等待式选择器，否则会把「1 秒探一次」变成「1 秒 + 5 秒」。
+        命中时返回元素对象（truthy），未命中返回 None。
+        注意：这里**不置** _verify_code_required 状态位，统一由
+        check_login_status() 在真正进入验证码流程时置位，避免状态位被
+        轻量探针和正式流程两处写、生命周期变乱。
+        """
+        try:
+            return await page.query_selector('.receive_captcha_panel')
+        except Exception as e:
+            logger.debug(f"验证码面板探测异常: {e}")
+            return None
+
     async def check_login_status(self, page, task):
         """
         检查登录状态，支持验证码输入
         根据任务类型（refresh_cookie / local_scanning / push_qr_code）执行不同逻辑
         """
-        await asyncio.sleep(3)
-        if task != 'refresh_cookie':
-            logger.info("检查登录状态...")
+        # v5.0.1 快速通道：手机端弹出短信验证面板后，旧实现要等满
+        # QR_CODE_CHECK_INTERVAL(20s) 才轮到本函数，进来又固定 sleep(3) +
+        # 3 个各 3 秒超时的登录成功选择器 + 5 秒 wait_for_selector，
+        # 最坏接近 30 秒才把 _verify_code_required 置 True，而二维码只有 110 秒。
+        # 现在先零等待探一次：命中就跳过上面那一大段冗余探测，直接收验证码。
+        captcha_element = await self._probe_captcha_panel(page)
+        if captcha_element is None:
+            await asyncio.sleep(3)
+            if task != 'refresh_cookie':
+                logger.info("检查登录状态...")
         # 移除无效的XPath选择器，仅保留有效CSS或XPath
         success_selectors = [
             "//div[contains(@class, 'js_show_ipConfig_dialog')]//a[contains(@class, '_mod_card_operationLink') and text()='配置']",
             '#_hmt_click > div.index_colRight > div > div.index_info > div > a',
             '#_hmt_click > div.index_colLeft > div.index_greeting.index_explore_text > div:nth-child(1)'
         ]
+        if captcha_element is None:
+            try:
+                for selector in success_selectors:
+                    try:
+                        success_element = await page.wait_for_selector(selector, timeout=3000)
+                        if success_element:
+                            self._verify_code_required = False
+                            if task != 'refresh_cookie':
+                                logger.info("登录成功！")
+                            return True
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.debug(f"选择器查询异常: {e}")
+                        continue
+            except Exception as e:
+                logger.debug(f"登录检查异常: {e}")
         try:
-            for selector in success_selectors:
-                try:
-                    success_element = await page.wait_for_selector(selector, timeout=3000)
-                    if success_element:
-                        self._verify_code_required = False
-                        if task != 'refresh_cookie':
-                            logger.info("登录成功！")
-                        return True
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.debug(f"选择器查询异常: {e}")
-                    continue
-        except Exception as e:
-            logger.debug(f"登录检查异常: {e}")
-        try:
-            captcha_panel = await page.wait_for_selector('.receive_captcha_panel', timeout=5000)
+            # v5.0.1：预探测已命中就直接用它，省掉 5 秒 wait_for_selector
+            captcha_panel = captcha_element
+            if captcha_panel is None:
+                captcha_panel = await page.wait_for_selector('.receive_captcha_panel', timeout=5000)
             if captcha_panel:
                 # v4.0.2：只有走到这里（企业微信真的要求短信验证）详情页才显示输入卡片，
                 # 未扫码、或扫码后还没到这一步时完全不出现，避免常年占位打扰。

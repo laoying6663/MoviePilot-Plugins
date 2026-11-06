@@ -1,4 +1,4 @@
-"""DynamicWeChatSelfUse v5.0.0 离线自测。
+"""DynamicWeChatSelfUse v5.0.1 离线自测。
 
 v5.0.0 把企业微信自建应用那一整套能力（通知推送、`/wecom` 回调、远程命令、菜单）下线，
 包内只剩 `__init__.py` + `helper.py`。因此本文件也做了大幅精简：
@@ -196,16 +196,16 @@ def test_plugin_version_matches_index():
     cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
     version = _class_assign(cls_node, "plugin_version")
     index = json.loads((REPO_ROOT / "package.v3.json").read_text(encoding="utf-8"))
-    assert version == "5.0.0"
+    assert version == "5.0.1"
     assert version == index["DynamicWeChatSelfUse"]["version"]
 
 
-def test_index_history_has_v500_on_top():
+def test_index_history_has_latest_on_top():
     index = json.loads((REPO_ROOT / "package.v3.json").read_text(encoding="utf-8"))
     history = index["DynamicWeChatSelfUse"]["history"]
-    assert next(iter(history)) == "v5.0.0", "新版本必须在 history 顶部"
+    assert next(iter(history)) == "v5.0.1", "新版本必须在 history 顶部"
     # 历史不能被清掉
-    for old in ("v4.0.2", "v4.0.1", "v4.0.0", "v3.2.0"):
+    for old in ("v5.0.0", "v4.0.2", "v4.0.1", "v4.0.0", "v3.2.0"):
         assert old in history
 
 
@@ -706,6 +706,65 @@ def test_verify_code_poll_js_is_safe():
     assert "need_code" in js
     assert "dwcsu_wrap" in js
     assert "focus()" in js
+
+
+def test_poll_js_never_stops_and_is_adaptive():
+    """v5.0.1：旧版空闲 150 秒后 clearInterval 停表，之后再扫码卡片永不弹出。"""
+    js = _module_constant("_VERIFY_CODE_POLL_JS")
+    # 停表逻辑的两个特征串必须消失
+    assert "idle" not in js, "不允许再用 idle 计数停表"
+    assert "t=null" not in js, "不允许把 interval 置空后不再恢复"
+    # 动态间隔：有扫码任务/需要验证码时快，空闲时慢
+    assert "qr_running" in js
+    assert "2500" in js and "10000" in js
+    assert "schedule" in js
+
+
+def test_captcha_probe_is_nonblocking():
+    """探针必须零等待，否则「每秒探一次」会退化成「每秒 + 5 秒」。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    body = ast.unparse(_func_node(cls_node, "_probe_captcha_panel"))
+    assert "query_selector" in body
+    assert "wait_for_selector" not in body
+    assert "sleep" not in body
+    # 探针不能自己写状态位，生命周期仍由 check_login_status 统一管。
+    # 用 AST 赋值节点判断，避免被 docstring 里提到的变量名干扰。
+    fn = _func_node(cls_node, "_probe_captcha_panel")
+    assigned = []
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in targets:
+                if isinstance(t, ast.Attribute):
+                    assigned.append(t.attr)
+    assert "_verify_code_required" not in assigned
+
+
+def test_scan_loops_probe_captcha_every_second():
+    """本地扫码与远程推送二维码两条链路都要秒级探测。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    for name in ("local_scanning", "_push_qr_code_async"):
+        body = ast.unparse(_func_node(cls_node, name))
+        assert "_probe_captcha_panel" in body, name
+        assert "await asyncio.sleep(1)" in body, name
+        assert "QR_CODE_CHECK_INTERVAL" in body, name
+
+
+def test_check_login_status_has_captcha_fast_path():
+    """命中验证码面板时要跳过 sleep(3) + 9 秒选择器探测 + 5 秒 wait。"""
+    cls_node = _class_node(_host_source(), "DynamicWeChatSelfUse")
+    body = ast.unparse(_func_node(cls_node, "check_login_status"))
+    assert "_probe_captcha_panel" in body
+    assert "if captcha_element is None:" in body
+    assert "captcha_panel = captcha_element" in body
+    # 状态位仍然只在这两个函数里置 True（探针不参与写状态）
+    setters = []
+    for node in cls_node.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if "self._verify_code_required = True" in ast.unparse(node):
+            setters.append(node.name)
+    assert set(setters) == {"check_login_status", "_submit_verify_code"}, setters
 
 
 # ========================================================================
