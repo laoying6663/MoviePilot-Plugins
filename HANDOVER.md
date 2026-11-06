@@ -1,7 +1,10 @@
-# DynamicWeChatSelfUse v5.0.0 —— 交接文档
+# DynamicWeChatSelfUse v5.0.1 —— 交接文档
 
 > 面向接手继续开发的开发者。读完本文即可独立开工，不需要回看原始对话。
-> 文档对应代码版本：`plugin_version = "5.0.0"`，插件 ID `DynamicWeChatSelfUse`。
+> 文档对应代码版本：`plugin_version = "5.0.1"`，插件 ID `DynamicWeChatSelfUse`。
+>
+> **v5.0.1 增量**：纯行为修复。扫码后短信验证码输入框从「最长约 30 秒」缩短到约 3 秒弹出，
+> 并修掉详情页轮询停表后卡片再也不弹的问题。配置字段 / 命令 / API / 保活逻辑完全不变。
 >
 > **v5.0.0 定位**：本插件只负责「动态可信 IP + Cookie 保活」。企业微信自建应用的通知推送、
 > 回调验签、远程命令、控制菜单已在 v5.0.0 全部移除，通知请使用 MoviePilot 内置微信渠道。
@@ -15,25 +18,26 @@
 | 仓库 | `laoying6663/MoviePilot-Plugins`（个人 fork，插件市场数据源） |
 | 分支 | PR [#1](https://github.com/laoying6663/MoviePilot-Plugins/pull/1) 已 **merged / closed**（merge commit `4ce76d1d78e5c0cfa66be0611fac9fedc14dd254`）；`main` 已包含 v4.0.0 |
 | 插件 ID | **`DynamicWeChatSelfUse`**，目录 `plugins.v3/dynamicwechatselfuse/` |
-| 版本 | **5.0.0**（`plugin_version` 与 `package.v3.json` 一致） |
+| 版本 | **5.0.1**（`plugin_version` 与 `package.v3.json` 一致） |
 | 需求变更（v5.0.0） | 用户明确「直接调用 MP 内置的微信通知方式」，红框里的 11 个企微自建应用字段都不需要。于是把 v4.0 并入的通知推送、`/wecom` 回调、远程命令、菜单注册整套下线，插件回归「只管可信 IP 与 Cookie 保活」 |
+| 需求变更（v5.0.1） | 用户反馈「登录需要验证码，但是现在没看见验证码输入框」（约 21 秒后才看见）。定位为 20 秒检查周期 + 12 秒冗余探测叠加的显示延迟，顺带发现详情页轮询空闲 150 秒后停表的隐患，一并修复 |
 | 配置兼容性 | 插件 ID 与 `plugin_config_prefix = "dynamicwechatselfuse_"` **未改变**，数据目录 `/config/plugins/DynamicWeChatSelfUse/` 原样保留，升级不丢应用ID、Cookie 与通知渠道配置 |
-| 离线自测 | `pytest tests/test_wecomnotify.py` → **51 passed**；独立脚本 → **通过 51 / 51**（0 FAIL，退出码 0） |
+| 离线自测 | `pytest tests/test_wecomnotify.py` → **55 passed**；独立脚本 → **通过 55 / 55**（0 FAIL，退出码 0）；另有 `node --check` 校验内联轮询 JS、mock DOM 运行时状态切换、登录检查快速通道对照实验 |
 | 静态检查 | `py_compile` 通过、`pyflakes` 零告警（整目录含存量 `helper.py`） |
 | 真实宿主基线 | MoviePilot v3.2.4 / Python 3.14.7 / Docker（fnOS NAS，主机名 `moviepilot-v3`） |
-| 真实宿主部署 | `plugin.install`（`force=true` + `repo_url`）从 **4.0.2 → 5.0.0** 成功，`restart_required=false`；generation 87 → 89，全程 `ready=true` / pending 0 / failed 0 |
-| 配置兼容性实证 | 升级前后逐字段 SHA256 比对：保活相关字段**逐一 SAME**，命令 4 → 2 条（`/push_qr`、`/wxcode` 保留） |
-| 宿主验收 | 第 5.2 节 6 条全部完成；`/wecom` 已返回 404，证明回调路由确已下线 |
+| 真实宿主部署 | `plugin.install`（`force=true` + `repo_url`）：**4.0.2 → 5.0.0**（generation 87 → 89），**5.0.0 → 5.0.1**（generation 89 → 91），两次均 `restart_required=false` / `ready=true` / pending 0 / failed 0 |
+| 配置兼容性实证 | 4.0.2 → 5.0.0：24 → 13 字段，13 个保活字段逐一 SAME、11 个企微字段按预期移除，命令 4 → 2 条；5.0.0 → 5.0.1：13 → 13 字段 `same=13 diff=0 lost=0 new=0`，命令不变 |
+| 宿主验收 | 第 5.2 节 6 条全部完成；`/wecom` 返回 404 证明回调路由已下线。5.0.1 复验：端点三态不变（`GET/POST /wecom` 404、`GET /verify_state` 401、`POST /verify_code` 401、`GET /verify_code` 405）、`plugin.history` 顶部为 v5.0.1 |
 | **未验证** | 真机「扫码 → 短信验证码 → 登录成功」闭环仍待用户配合（与本次删减无关，v4.0.2 遗留） |
 
 ### 已交付文件
 
 | 文件 | 职责 |
 | --- | --- |
-| `plugins.v3/dynamicwechatselfuse/__init__.py` | 全部逻辑：动态可信 IP / CookieCloud / 扫码 / 验证码（含 v4.0.2 按需自动弹出的验证码卡片），以及 `get_form` / `get_page` / `get_command` / `get_api` / `__update_config` / `stop_service` 等契约方法 |
+| `plugins.v3/dynamicwechatselfuse/__init__.py` | 全部逻辑：动态可信 IP / CookieCloud / 扫码 / 验证码（v4.0.2 按需弹出 + v5.0.1 秒级探测与不停表轮询），以及 `get_form` / `get_page` / `get_command` / `get_api` / `__update_config` / `stop_service` 等契约方法 |
 | `plugins.v3/dynamicwechatselfuse/helper.py` | 存量：CookieCloud、第三方通知发送器、IP 解析、配置持久化 |
 | `tests/test_wecomnotify.py` | 离线自测，pytest / 独立脚本双模；v5.0.0 已剔除企微通知与加解密用例，保留保活 / 扫码 / 验证码 / 索引契约 |
-| `package.v3.json` | 仅 `DynamicWeChatSelfUse`(5.0.0) 与 `ParkingBot` 两条；`WecomNotify` 条目已删除 |
+| `package.v3.json` | 仅 `DynamicWeChatSelfUse`(5.0.1) 与 `ParkingBot` 两条；`WecomNotify` 条目已删除，`history` 顶部为 v5.0.1 |
 | `README.md` | 用户文档：保活能力、配置字段、两条命令、升级说明 |
 | `HANDOVER.md` | 本文件 |
 | `HANDOVER.md` | 本文件 |
@@ -278,11 +282,11 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 > ⚠️ 独立脚本模式下，如果一个用例都没跑到，脚本必须**判失败**而不是报「通过 0 / 0」。
 > 这条已内置（见 `test_wecomnotify.py` 的 `_run_standalone`），改动它时不要移除。
 
-### 5.2 真实宿主验收（v5.0.0 已全部完成）
+### 5.2 真实宿主验收（v5.0.0 / v5.0.1 均已全部完成）
 
 在真实 MoviePilot V3 宿主上逐条确认，全部可由宿主 MCP / HTTP 探测完成：
 
-1. 插件市场 / 插件源能发现并更新到 `DynamicWeChatSelfUse` **5.0.0**；索引里仍无 `WecomNotify`
+1. 插件市场 / 插件源能发现并更新到 `DynamicWeChatSelfUse` **5.0.0 / 5.0.1**；索引里仍无 `WecomNotify`
 2. 插件启动 / 禁用 / 重载都不残留后台资源（后台任务、scheduler once job）
 3. `DEBUG=true` 时**没有**旧导入兼容警告（存量非 `app.sdk.*` 依赖见红线 3 的例外清单）
 4. API 只注册 `/verify_code`(POST) 与 `/verify_state`(GET) 两个，均为 `bear`；
@@ -546,8 +550,8 @@ return self._post(url_template, {"button": buttons[:MAX_TOP_BUTTONS]})
 
 - [ ] 改动只在 `plugins.v3/dynamicwechatselfuse/`、`tests/test_wecomnotify.py`、
       `package.v3.json`、`README.md`、`HANDOVER.md`；`plugins.v3/wecomnotify/` 已删除
-- [ ] `plugin_version` 与 `package.v3.json` 的 `DynamicWeChatSelfUse.version` 一致（5.0.0），
-      且 `history` 顶部有 v5.0.0 记录
+- [ ] `plugin_version` 与 `package.v3.json` 的 `DynamicWeChatSelfUse.version` 一致（5.0.1），
+      且 `history` 顶部有 v5.0.1 记录
 - [ ] `package.v3.json` 只有两条插件条目，`ParkingBot` 未被改动
 - [ ] 插件 ID / 配置前缀 / 数据目录未改变，升级不丢配置
 - [ ] 配置页只保留保活相关字段，**不再出现**企微自建应用的 11 个字段
@@ -571,6 +575,8 @@ return self._post(url_template, {"button": buttons[:MAX_TOP_BUTTONS]})
    `app.sdk.*`，让整个插件都符合红线 3。需先确认 SDK 是否提供等价出口。
 3. **保活健壮性**：把「浏览器起不来」这一类失败再细分（缺 chromium / 内存不足 / 超时），
    在详情页给出可操作提示，而不是只往日志里写一行。
+4. **真机闭环**：完成「扫码 → 企业微信弹短信验证 → 详情页约 3 秒内出现输入框 → 填 6 位数字提交 → 登录成功」，
+   确认 v5.0.1 的秒级探测在真实页面上同样生效。
 
 > v5.0.0 已下线企业微信自建应用能力，原先「推送 / 回调 / 命令 / 菜单」相关的后续项全部作废。
 
@@ -678,3 +684,49 @@ Token、EncodingAESKey、接收人、管理员白名单、自动注册控制菜�
 
 **回归点**：`test_get_command_only_two` / `test_get_api_only_verify_endpoints` /
 `test_no_wecom_modules` / `test_config_has_no_wecom_fields` / `test_host_class_has_no_mixin`
+
+### 7.18 【v5.0.1】手机已弹出短信验证码，插件详情页却半天不出现输入框
+
+**症状**：用户第一张截图只有二维码，反馈「登录需要验证码，但是现在没看见验证码输入框」；
+约 21 秒后的第二张截图里卡片才出现。功能没坏，是太慢。
+
+**根因（两块延迟叠加）**：
+
+1. `local_scanning` / `_push_qr_code_async` 的等待循环是「先睡满
+   `QR_CODE_CHECK_INTERVAL`(20 秒) 再调一次 `check_login_status()`」。
+   `_verify_code_required` 只在后者检测到 `.receive_captcha_panel` 时才置 True，
+   所以从手机弹验证码到状态位翻转最多要 20 秒。
+2. `check_login_status()` 进来后固定 `sleep(3)`，再依次探 3 个登录成功选择器
+   （各 `wait_for_selector(timeout=3000)`，全不命中就是 9 秒），最后才
+   `wait_for_selector('.receive_captcha_panel', timeout=5000)`，最坏又是 17 秒。
+   叠加详情页 2.5 秒轮询，端到端接近 30 秒；而二维码 `QR_CODE_EXPIRE_SECONDS = 110`，
+   填码窗口经常被挤没，用户会以为功能坏了。
+
+**修法**：
+
+1. 新增 `_probe_captcha_panel(page)`：只用 `page.query_selector()` 零等待探测，
+   返回元素或 None；**不写状态位**（状态位仍由 `check_login_status` 与
+   `_submit_verify_code` 两处独占，见 `test_verify_code_required_lifecycle`）。
+2. 两个扫码等待循环的内层「每秒一次」里顺带探一次，命中就 `break`，
+   立即进 `check_login_status()`，不必等满 20 秒。
+3. `check_login_status()` 开头先做同一个预探测：命中就跳过 `sleep(3)` +
+   9 秒选择器探测，并直接复用该元素，省掉 5 秒 `wait_for_selector`。
+4. 详情页轮询改为动态间隔且**永不停表**（见下）。
+
+**顺带修掉的隐患**：旧 `_VERIFY_CODE_POLL_JS` 在 `!qr_running && idle>=60`
+（约 150 秒）后 `clearInterval` 并 `t=null`。用户先打开详情页、过几分钟再点扫码，
+轮询已经死了，卡片永远不会弹。现在 `schedule()` 按状态在 2500ms / 10000ms 之间
+切换，只变速不停止；空闲时 10 秒一次，长期开着也不会刷爆接口。
+
+**验证**（不要只跑 pytest：内联 JS 的运行时错误 Python 测不出来）：
+
+- `node --check` 校验替换 `__PID__` 后的 `_VERIFY_CODE_POLL_JS` 语法
+- mock DOM 跑 4 轮状态切换 `idle → need_code → idle → need_code`，
+  确认 display / period / 滚动聚焦 / 反复触发都正常（T1 10s → T2 2.5s → T3 10s → T4 2.5s）
+- 对照实验：把 `check_login_status` 摘出来编译运行，命中面板时
+  `wait_for_selector` 调用 **0 次**、无 `sleep(3)`；未命中时仍为 **4 次 wait + sleep(3)**，
+  证明快速通道没有改变「没有验证码」时的旧行为
+- 宿主 5.0.0 → 5.0.1，generation 89 → 91，13 个配置字段逐字段完全一致
+
+**红线**：探针绝不能用带超时的等待式选择器，否则「每秒探一次」会退化成「每秒 + 5 秒」；
+内联 JS 里仍不能出现双引号（会截断 `onerror="..."`）。
