@@ -13,15 +13,18 @@
 | 项目 | 状态 |
 | --- | --- |
 | 仓库 | `laoying6663/MoviePilot-Plugins`（个人 fork，插件市场数据源） |
-| 分支 | `feat/wecom-notify`，PR [#1](https://github.com/laoying6663/MoviePilot-Plugins/pull/1)，base `main`，状态 open |
+| 分支 | PR [#1](https://github.com/laoying6663/MoviePilot-Plugins/pull/1) 已 **merged / closed**（merge commit `4ce76d1d78e5c0cfa66be0611fac9fedc14dd254`）；`main` 已包含 v4.0.0 |
 | 插件 ID | **`DynamicWeChatSelfUse`**，目录 `plugins.v3/dynamicwechatselfuse/` |
 | 版本 | **4.0.0**（`plugin_version` 与 `package.v3.json` 一致） |
 | 需求变更 | PR #1 原本是「新增独立 `WecomNotify` 插件」。用户确认真实目标是**把企微通知能力并入已安装的 `DynamicWeChatSelfUse`**，并保留其动态可信 IP / CookieCloud 保活 / 扫码等全部旧功能。独立 `WecomNotify` 不再发布 |
 | 配置兼容性 | 插件 ID 与 `plugin_config_prefix = "dynamicwechatselfuse_"` **未改变**，数据目录 `/config/plugins/DynamicWeChatSelfUse/` 原样保留，升级不丢原有应用ID、Cookie 与通知渠道配置 |
 | 离线自测 | `pytest tests/test_wecomnotify.py` → **80 passed**；`python tests/test_wecomnotify.py` → **通过 80 / 80**（0 FAIL，退出码 0） |
 | 静态检查 | `py_compile` 通过、`pyflakes` 零告警（整目录含存量 `helper.py` + 测试文件） |
-| 真实宿主基线 | MoviePilot v3.2.4 / Python 3.14.7 / Docker（fnOS NAS）。宿主 `plugin.runtime.status`：`ready=true`、generation 72 → 74、pending 0、failed 0；全宿主 6 个命令、12 个服务 |
-| **未验证** | **v4.0.0 尚未部署到真实宿主**、真机企业微信联调（第 5.2 节 6–9 条）未做 |
+| 真实宿主基线 | MoviePilot v3.2.4 / Python 3.14.7 / Docker（fnOS NAS，主机名 `moviepilot-v3`）。升级前 `plugin.runtime.status`：`ready=true`、generation 74、pending 0、failed 0 |
+| 真实宿主部署 | PR #1 合并后 `plugin.install`（`force=true`）从 **3.2.0 → 4.0.0** 成功，`restart_required=false`；generation 74 → 83，全程 `ready=true` / pending 0 / failed 0 |
+| 配置兼容性实证 | 升级前后逐字段 SHA256 比对：原有 **13 个配置字段一个未丢、值全部 SAME**；新增 11 个企微字段；命令 2 → 4 条且无重复 |
+| 宿主验收 | 第 5.2 节 **1–5 条已完成**（详见第 5.3 节）；第 6–9 条真机企业微信联调**未做** |
+| **未验证** | 真机企业微信联调（第 5.2 节 6–9 条）；第 3 条因宿主 MCP 无日志读取入口，只做到「DEBUG 级重载零异常 + 静态导入零违例」，未逐行核对日志文本 |
 
 ### 已交付文件
 
@@ -271,7 +274,7 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 > ⚠️ 独立脚本模式下，如果一个用例都没跑到，脚本必须**判失败**而不是报「通过 0 / 0」。
 > 这条已内置（见 `test_wecomnotify.py` 的 `_run_standalone`），改动它时不要移除。
 
-### 5.2 真实宿主验收（**v4.0.0 尚未执行，交给接手人**）
+### 5.2 真实宿主验收（1–5 条已完成，6–9 条待真机配合）
 
 在真实 MoviePilot V3 宿主上逐条确认。第 1–5 条可由宿主 MCP / 文件系统完成，
 第 6–9 条需要用户配合企业微信真机操作：
@@ -290,6 +293,33 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 
 > 每次推完版本都要提醒用户 **强制刷新（Ctrl+F5）+ 重载插件**，否则大半「功能没生效」
 > 其实是在报浏览器 / 插件实例缓存。
+
+### 5.3 v4.0.0 真实宿主验收记录
+
+宿主：MoviePilot v3.2.4 / `moviepilot-v3` / Docker（fnOS NAS）。PR #1 合并到 `main` 后，
+通过宿主 MCP 完成升级与第 1–5 条验收。
+
+| 条目 | 结果 | 实测证据 |
+| --- | --- | --- |
+| 1 市场发现 v4.0.0 / 索引无 `WecomNotify` | ✅ | `plugin.market`（`force=true`）返回 `plugin_version=4.0.0`、`has_update=true`、`update_candidate.version=4.0.0`；查询 `WecomNotify` 返回 **0 条**；`plugin.install` 升级成功，`plugin_version` 3.2.0 → 4.0.0 |
+| 2 启停重载不残留 | ✅ | 禁用 → 命令 4 → **0**；启用 → 4；重载 → 4。`scheduler.list` 总数全程 **31 不变**；`plugin.runtime.status` 全程 `ready=true` / pending 0 / failed 0 / `restart_required=[]` |
+| 3 DEBUG 无旧导入兼容警告 | ⚠️ 部分 | 设 DEBUG 后重载：`failed=0`、命令仍 4 条，日志等级已恢复 INFO；新增 `client.py` / `crypt.py` / `wecom_notify.py` 静态扫描 **0 处** `app.adapters.*` / `app.core.*` 等禁用导入。**宿主 MCP 白名单没有日志读取入口，未能逐行核对运行时日志文本** |
+| 4 API / 服务 / 命令单次注册 | ✅ | `plugin.capabilities` 4 条命令唯一；`slash.list` 全宿主 23 条命令**零重复**；`actions` / `services` 均为 0（符合设计）；HTTP 匿名探测 `/wecom` 与 `/status` 均返回 401 而非 404（路由已注册），旧 `WecomNotify/wecom` 返回 **404**（无残留） |
+| 5 配置页两组字段 / 旧配置未丢 | ✅ | `plugin.config.get` 表单 22 个 `model` **22 unique 无重复**，`enabled` / `onlyonce` 各 1 个，旧组与企微组字段齐全；升级前后 `model` 逐字段 SHA256 比对：原有 **13 个字段一个未丢、值全部 SAME** |
+
+**升级前基线**：v3.2.0、`state=true` / `runtime_status=active`、generation 74、13 个配置字段、
+命令 `/push_qr` `/wxcode`。
+**升级后**：v4.0.0、generation 76 → 83、24 个配置字段（新增 11 个企微字段）、
+命令 `/push_qr` `/wxcode` `/wecom_status` `/wecom_test`。
+
+> ⚠️ **宿主全局 apikey 拦截（影响第 7 条）**：匿名 GET
+> `/api/v1/plugin/DynamicWeChatSelfUse/wecom` 返回 `401 apikey 校验不通过`；附加企微验签参数
+> 与 `?apikey=` 均被同一中间件拦下。插件已按红线 10 声明 `auth: "none"`，但该校验发生在
+> 宿主全局层、先于插件路由。企业微信后台保存回调 URL 时需按宿主规则附带有效 apikey 或在
+> 宿主侧放行该路径，并在真机第 7 条重点验证。
+
+> 第 6–9 条（`/wecom_test` 收消息、回调 URL 保存、企微内命令回复、应用菜单）仍需用户配合
+> 企业微信真机操作，**尚未执行**。
 
 ---
 
@@ -514,7 +544,8 @@ return self._post(url_template, {"button": buttons[:MAX_TOP_BUTTONS]})
       报 `通过 N / N`（N > 0）
 - [ ] `git diff` 里没有任何真实凭据
 - [ ] 新增逻辑都补了对应测试
-- [ ] 真实宿主完成第 5.2 节的 9 条验收（1–5 可自行完成，6–9 需真机配合）
+- [x] 真实宿主完成第 5.2 节的 **1–5 条**（详见第 5.3 节）
+- [ ] 第 6–9 条真机企业微信联调（需用户配合）
 - [ ] README 与实际行为一致（配置字段、命令、回调路径）
 - [ ] PR 正文写明：改了什么、为什么并入旧插件、测试结果、仍未覆盖的能力
 - [ ] 提醒用户在企业微信后台轮换此前明文出现过的凭据
@@ -524,8 +555,10 @@ return self._post(url_template, {"button": buttons[:MAX_TOP_BUTTONS]})
 
 ## 9. 后续可做的方向（按性价比排序）
 
-1. **补真实宿主验收**（第 5.2 节）。目前最大的未知项就是 v4.0.0 部署到宿主后的行为。
-2. **真机联调**：用真实企业微信应用跑通「推送 → 回调 → 命令 → 菜单」全链路。
+1. **真机联调**：用真实企业微信应用跑通「推送 → 回调 → 命令 → 菜单」全链路
+   （第 5.2 节 6–9 条），重点先解决第 5.3 节记录的宿主全局 apikey 拦截。
+2. **补第 3 条运行时日志核对**：宿主 MCP 无日志读取入口，需通过宿主文件系统 / 日志页面
+   确认 DEBUG 下确实没有旧导入兼容警告。
 3. **存量依赖迁移**：把 `app.adapters.external.cookiecloud` 等存量例外逐步收敛到
    `app.sdk.*`，让整个插件都符合红线 3。需先确认 SDK 是否提供等价出口。
 4. **智能机器人长连接**：宿主实现在 `app/modules/wechat/wechatbot.py`，
