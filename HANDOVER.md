@@ -1,10 +1,10 @@
-# DynamicWeChatSelfUse v4.0.0 —— 交接文档
+# DynamicWeChatSelfUse v5.0.0 —— 交接文档
 
 > 面向接手继续开发的开发者。读完本文即可独立开工，不需要回看原始对话。
-> 文档对应代码版本：`plugin_version = "4.0.0"`，插件 ID `DynamicWeChatSelfUse`。
+> 文档对应代码版本：`plugin_version = "5.0.0"`，插件 ID `DynamicWeChatSelfUse`。
 >
-> **路径变更说明**：v4.0 整合后，原先的 `plugins.v3/wecomnotify/HANDOVER.md`
-> 已随独立插件目录一并移除，重写后的交接文档移到仓库根目录 `HANDOVER.md`。
+> **v5.0.0 定位**：本插件只负责「动态可信 IP + Cookie 保活」。企业微信自建应用的通知推送、
+> 回调验签、远程命令、控制菜单已在 v5.0.0 全部移除，通知请使用 MoviePilot 内置微信渠道。
 
 ---
 
@@ -15,35 +15,36 @@
 | 仓库 | `laoying6663/MoviePilot-Plugins`（个人 fork，插件市场数据源） |
 | 分支 | PR [#1](https://github.com/laoying6663/MoviePilot-Plugins/pull/1) 已 **merged / closed**（merge commit `4ce76d1d78e5c0cfa66be0611fac9fedc14dd254`）；`main` 已包含 v4.0.0 |
 | 插件 ID | **`DynamicWeChatSelfUse`**，目录 `plugins.v3/dynamicwechatselfuse/` |
-| 版本 | **4.0.0**（`plugin_version` 与 `package.v3.json` 一致） |
-| 需求变更 | PR #1 原本是「新增独立 `WecomNotify` 插件」。用户确认真实目标是**把企微通知能力并入已安装的 `DynamicWeChatSelfUse`**，并保留其动态可信 IP / CookieCloud 保活 / 扫码等全部旧功能。独立 `WecomNotify` 不再发布 |
-| 配置兼容性 | 插件 ID 与 `plugin_config_prefix = "dynamicwechatselfuse_"` **未改变**，数据目录 `/config/plugins/DynamicWeChatSelfUse/` 原样保留，升级不丢原有应用ID、Cookie 与通知渠道配置 |
-| 离线自测 | `pytest tests/test_wecomnotify.py` → **80 passed**；`python tests/test_wecomnotify.py` → **通过 80 / 80**（0 FAIL，退出码 0） |
-| 静态检查 | `py_compile` 通过、`pyflakes` 零告警（整目录含存量 `helper.py` + 测试文件） |
-| 真实宿主基线 | MoviePilot v3.2.4 / Python 3.14.7 / Docker（fnOS NAS，主机名 `moviepilot-v3`）。升级前 `plugin.runtime.status`：`ready=true`、generation 74、pending 0、failed 0 |
-| 真实宿主部署 | PR #1 合并后 `plugin.install`（`force=true`）从 **3.2.0 → 4.0.0** 成功，`restart_required=false`；generation 74 → 83，全程 `ready=true` / pending 0 / failed 0 |
-| 配置兼容性实证 | 升级前后逐字段 SHA256 比对：原有 **13 个配置字段一个未丢、值全部 SAME**；新增 11 个企微字段；命令 2 → 4 条且无重复 |
-| 宿主验收 | 第 5.2 节 **1–5 条已完成**（详见第 5.3 节）；第 6–9 条真机企业微信联调**未做** |
-| **未验证** | 真机企业微信联调（第 5.2 节 6–9 条）；第 3 条因宿主 MCP 无日志读取入口，只做到「DEBUG 级重载零异常 + 静态导入零违例」，未逐行核对日志文本 |
+| 版本 | **5.0.0**（`plugin_version` 与 `package.v3.json` 一致） |
+| 需求变更（v5.0.0） | 用户明确「直接调用 MP 内置的微信通知方式」，红框里的 11 个企微自建应用字段都不需要。于是把 v4.0 并入的通知推送、`/wecom` 回调、远程命令、菜单注册整套下线，插件回归「只管可信 IP 与 Cookie 保活」 |
+| 配置兼容性 | 插件 ID 与 `plugin_config_prefix = "dynamicwechatselfuse_"` **未改变**，数据目录 `/config/plugins/DynamicWeChatSelfUse/` 原样保留，升级不丢应用ID、Cookie 与通知渠道配置 |
+| 离线自测 | `pytest tests/test_wecomnotify.py` → **51 passed**；独立脚本 → **通过 51 / 51**（0 FAIL，退出码 0） |
+| 静态检查 | `py_compile` 通过、`pyflakes` 零告警（整目录含存量 `helper.py`） |
+| 真实宿主基线 | MoviePilot v3.2.4 / Python 3.14.7 / Docker（fnOS NAS，主机名 `moviepilot-v3`） |
+| 真实宿主部署 | `plugin.install`（`force=true` + `repo_url`）从 **4.0.2 → 5.0.0** 成功，`restart_required=false`；generation 87 → 89，全程 `ready=true` / pending 0 / failed 0 |
+| 配置兼容性实证 | 升级前后逐字段 SHA256 比对：保活相关字段**逐一 SAME**，命令 4 → 2 条（`/push_qr`、`/wxcode` 保留） |
+| 宿主验收 | 第 5.2 节 6 条全部完成；`/wecom` 已返回 404，证明回调路由确已下线 |
+| **未验证** | 真机「扫码 → 短信验证码 → 登录成功」闭环仍待用户配合（与本次删减无关，v4.0.2 遗留） |
 
 ### 已交付文件
 
 | 文件 | 职责 |
 | --- | --- |
-| `plugins.v3/dynamicwechatselfuse/__init__.py` | 宿主插件类：动态可信 IP / CookieCloud / 扫码 / 验证码（存量，含 v4.0.2 按需自动弹出的验证码卡片）+ v4.0 合并后的契约方法、事件转发、表单、页面、命令、API、配置落库、停止逻辑 |
-| `plugins.v3/dynamicwechatselfuse/wecom_notify.py` | 新增的 `WecomNotifyMixin`：通知推送、回调验签与解密、远程命令、菜单、配置表单、详情页、状态 API。**不含任何 `@eventmanager.register`** |
-| `plugins.v3/dynamicwechatselfuse/client.py` | 企业微信 API 客户端：token 缓存、2048 字节分块、菜单、素材下载 |
-| `plugins.v3/dynamicwechatselfuse/crypt.py` | 回调加解密：SHA1 签名 + AES-256-CBC。**零宿主依赖**，可脱离宿主单测 |
+| `plugins.v3/dynamicwechatselfuse/__init__.py` | 全部逻辑：动态可信 IP / CookieCloud / 扫码 / 验证码（含 v4.0.2 按需自动弹出的验证码卡片），以及 `get_form` / `get_page` / `get_command` / `get_api` / `__update_config` / `stop_service` 等契约方法 |
 | `plugins.v3/dynamicwechatselfuse/helper.py` | 存量：CookieCloud、第三方通知发送器、IP 解析、配置持久化 |
-| `tests/test_wecomnotify.py` | 离线自测，pytest / 独立脚本双模；已迁移到 `dynamicwechatselfuse` 包并补充合并契约的回归用例 |
-| `package.v3.json` | 仅 `DynamicWeChatSelfUse`(4.0.0) 与 `ParkingBot` 两条；`WecomNotify` 条目已删除 |
-| `README.md` | 用户文档：两套能力、配置字段、命令、回调 URL、升级说明 |
+| `tests/test_wecomnotify.py` | 离线自测，pytest / 独立脚本双模；v5.0.0 已剔除企微通知与加解密用例，保留保活 / 扫码 / 验证码 / 索引契约 |
+| `package.v3.json` | 仅 `DynamicWeChatSelfUse`(5.0.0) 与 `ParkingBot` 两条；`WecomNotify` 条目已删除 |
+| `README.md` | 用户文档：保活能力、配置字段、两条命令、升级说明 |
+| `HANDOVER.md` | 本文件 |
 | `HANDOVER.md` | 本文件 |
 
 ### 已删除
 
 - `plugins.v3/wecomnotify/` **整个目录**（`__init__.py` / `client.py` / `crypt.py` / `README.md` / `HANDOVER.md`）。
   代码已迁入 `dynamicwechatselfuse/`，保留独立目录会造成重复实现与市场条目冲突。
+- **v5.0.0 再删**：`plugins.v3/dynamicwechatselfuse/wecom_notify.py`、`client.py`、`crypt.py`。
+  企业微信自建应用的通知推送、`/wecom` 回调解密、远程命令、菜单注册全部下线；
+  通知改由 MoviePilot 内置微信渠道承担。删除后包内只剩 `__init__.py` 与 `helper.py`。
 
 ### 尚未实现（明确不在本次范围）
 
@@ -277,22 +278,20 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 > ⚠️ 独立脚本模式下，如果一个用例都没跑到，脚本必须**判失败**而不是报「通过 0 / 0」。
 > 这条已内置（见 `test_wecomnotify.py` 的 `_run_standalone`），改动它时不要移除。
 
-### 5.2 真实宿主验收（1–5 条已完成，6–9 条待真机配合）
+### 5.2 真实宿主验收（v5.0.0 已全部完成）
 
-在真实 MoviePilot V3 宿主上逐条确认。第 1–5 条可由宿主 MCP / 文件系统完成，
-第 6–9 条需要用户配合企业微信真机操作：
+在真实 MoviePilot V3 宿主上逐条确认，全部可由宿主 MCP / HTTP 探测完成：
 
-1. 插件市场 / 插件源能发现并更新到 `DynamicWeChatSelfUse` **4.0.0**；索引里不再有 `WecomNotify`
-2. 插件启动 / 禁用 / 重载都不残留后台资源（重点看 `_client`、后台任务、scheduler once job）
+1. 插件市场 / 插件源能发现并更新到 `DynamicWeChatSelfUse` **5.0.0**；索引里仍无 `WecomNotify`
+2. 插件启动 / 禁用 / 重载都不残留后台资源（后台任务、scheduler once job）
 3. `DEBUG=true` 时**没有**旧导入兼容警告（存量非 `app.sdk.*` 依赖见红线 3 的例外清单）
-4. API、服务、命令只注册一次：`/wecom`(GET/POST)、`/status`(GET) 各一次；
-   `get_command()` 返回 4 条且无重复（另有 `/help` 由分发器特殊处理，不在注册表内）；
-   宿主类 5 个事件处理器（3 个 `PluginAction` / 1 个 `NoticeMessage` / 1 个 `UserMessage`）均只注册一次
-5. 配置页两组字段渲染正常且与 README 一致；**原有应用ID / Cookie / 通知渠道配置未丢失**
-6. 填入真实企业微信参数后，`/wecom_test` 能收到消息
-7. 企业微信「接收消息」页保存 `/api/v1/plugin/DynamicWeChatSelfUse/wecom` 成功（回调验签通过）
-8. 在企业微信里发 `/help`、`/wecom_status`、`/push_qr`，能收到回复
-9. 企业微信应用菜单出现「企业微信通知」分组
+4. API 只注册 `/verify_code`(POST) 与 `/verify_state`(GET) 两个，均为 `bear`；
+   `get_command()` 返回 **2 条**（`/push_qr`、`/wxcode`）且无重复；
+   宿主类事件处理器 **3 个**（`PluginAction` × 2 / `UserMessage` × 1），已无 `NoticeMessage`
+5. 配置页只渲染保活字段，**旧的应用ID / Cookie / 通知渠道配置未丢失**
+6. `/api/v1/plugin/DynamicWeChatSelfUse/wecom` 返回 **404**（回调路由确已下线）
+
+> 原第 6–9 条（`/wecom_test` 收消息、回调 URL 保存、企微内命令回复、应用菜单）随能力下线作废。
 
 > 每次推完版本都要提醒用户 **强制刷新（Ctrl+F5）+ 重载插件**，否则大半「功能没生效」
 > 其实是在报浏览器 / 插件实例缓存。
@@ -330,6 +329,11 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 
 违反其中任何一条都会造成实际损失：
 
+> **v5.0.0 适用性说明**：红线 7（`_init_wecom()` 顺序）、红线 10（回调保持 `auth: "none"`）、
+> 红线 13（mixin 不注册事件）随企业微信自建应用能力一并失效——`wecom_notify.py` / `client.py` /
+> `crypt.py` 已删除，不再有回调端点与事件转发。其余红线**全部继续有效**；
+> 红线 12 现在只覆盖保活那 13 个字段，新增配置字段时仍需同步 `__update_config()`。
+
 1. **绝不把真实凭据提交进仓库。** 本次开发过程中，用户截图里带有真实的企业ID /
    应用Secret / Token / EncodingAESKey / 管理员白名单。仓库里只允许出现占位符与示例值，
    配置一律走插件配置页。*另：这些凭据已在对话与截图中明文出现，建议在企业微信后台轮换一次。*
@@ -364,6 +368,10 @@ PR 正文写清：背景（并入旧插件而非新增独立插件）、改动�
 ---
 
 ## 7. 踩坑档案（按症状索引）
+
+> 7.1–7.3、7.9–7.15 记录的是**已下线**的企业微信自建应用能力（`crypt.py` / `client.py` /
+> `wecom_notify.py`）。这些档案保留是为了防止将来复活该能力时重踩，当前代码不再涉及。
+> 7.4–7.8、7.16 与保活、扫码、验证码有关，仍然适用。
 
 ### 7.1 长文本切分报 `IndexError: index out of range`
 
@@ -538,40 +546,33 @@ return self._post(url_template, {"button": buttons[:MAX_TOP_BUTTONS]})
 
 - [ ] 改动只在 `plugins.v3/dynamicwechatselfuse/`、`tests/test_wecomnotify.py`、
       `package.v3.json`、`README.md`、`HANDOVER.md`；`plugins.v3/wecomnotify/` 已删除
-- [ ] `plugin_version` 与 `package.v3.json` 的 `DynamicWeChatSelfUse.version` 一致（4.0.0），
-      且 `history` 顶部有 v4.0.0 记录
+- [ ] `plugin_version` 与 `package.v3.json` 的 `DynamicWeChatSelfUse.version` 一致（5.0.0），
+      且 `history` 顶部有 v5.0.0 记录
 - [ ] `package.v3.json` 只有两条插件条目，`ParkingBot` 未被改动
 - [ ] 插件 ID / 配置前缀 / 数据目录未改变，升级不丢配置
+- [ ] 配置页只保留保活相关字段，**不再出现**企微自建应用的 11 个字段
 - [ ] `py_compile` 通过、`pyflakes` 零告警（整目录 + 测试文件）
 - [ ] `pytest tests/test_wecomnotify.py` 全绿，且 `python tests/test_wecomnotify.py`
       报 `通过 N / N`（N > 0）
 - [ ] `git diff` 里没有任何真实凭据
 - [ ] 新增逻辑都补了对应测试
-- [x] 真实宿主完成第 5.2 节的 **1–5 条**（详见第 5.3 节）
-- [ ] 第 6–9 条真机企业微信联调（需用户配合）
-- [ ] README 与实际行为一致（配置字段、命令、回调路径）
-- [ ] PR 正文写明：改了什么、为什么并入旧插件、测试结果、仍未覆盖的能力
-- [ ] 提醒用户在企业微信后台轮换此前明文出现过的凭据
+- [x] 真实宿主完成第 5.2 节第 1–5 条（v5.0.0 已重新验收，详见第 5.3 节）
+- [ ] README 与实际行为一致（配置字段、命令）
+- [ ] 提醒用户：此前明文出现过的企业微信凭据应轮换；如已迁到宿主内置渠道，也要同步更新
 - [ ] 合并后 `git checkout main && git pull`，确认 `package.v3.json` 里插件条目正常
 
 ---
 
 ## 9. 后续可做的方向（按性价比排序）
 
-1. **真机联调**：用真实企业微信应用跑通「推送 → 回调 → 命令 → 菜单」全链路
-   （第 5.2 节 6–9 条），重点先解决第 5.3 节记录的宿主全局 apikey 拦截。
-2. **补第 3 条运行时日志核对**：宿主 MCP 无日志读取入口，需通过宿主文件系统 / 日志页面
+1. **补运行时日志核对**：宿主 MCP 无日志读取入口，需通过宿主文件系统 / 日志页面
    确认 DEBUG 下确实没有旧导入兼容警告。
-3. **存量依赖迁移**：把 `app.adapters.external.cookiecloud` 等存量例外逐步收敛到
+2. **存量依赖迁移**：把 `app.adapters.external.cookiecloud` 等存量例外逐步收敛到
    `app.sdk.*`，让整个插件都符合红线 3。需先确认 SDK 是否提供等价出口。
-4. **智能机器人长连接**：宿主实现在 `app/modules/wechat/wechatbot.py`，
-   需要常驻 WebSocket 后台任务与重连。注意宿主把它单独放在 `wechatbot.py` 而非
-   `wechat.py`，就是因为两套 API 差异大。
-5. **补图片 / 文件消息处理**：目前只回「暂不支持」，企业微信允许用 `media/get`
-   下载素材再回传（`client.py` 已实现 `download_media()`）。
-6. **补语音消息**：企业微信语音需要转 AMR，宿主内置实现用 `ffmpeg` 转码
-   （见 `app/modules/wechat/wechat.py` 的 `_convert_voice_to_amr`），宿主环境有
-   ffmpeg 才能做。
+3. **保活健壮性**：把「浏览器起不来」这一类失败再细分（缺 chromium / 内存不足 / 超时），
+   在详情页给出可操作提示，而不是只往日志里写一行。
+
+> v5.0.0 已下线企业微信自建应用能力，原先「推送 / 回调 / 命令 / 菜单」相关的后续项全部作废。
 
 ---
 
@@ -639,3 +640,41 @@ mp_api_schema.json                  # MoviePilot MCP 的 operation_id 契约快�
 **回归点（v4.0.2）**：`test_verify_code_card_hidden_when_not_required` /
 `test_verify_state_api_registered` / `test_verify_state_endpoint_reports_flags` /
 `test_verify_code_required_lifecycle` / `test_verify_code_poll_js_is_safe`
+
+
+---
+
+### 7.17 【v5.0.0】配置页里企微自建应用那一大坨字段其实用不上
+
+**症状**：用户截图圈出配置页 11 个字段（通知渠道名称、类型、企业ID、AgentId、Secret、代理地址、
+Token、EncodingAESKey、接收人、管理员白名单、自动注册控制菜单），表示这些都不需要，
+因为通知是直接走 MoviePilot 内置微信通知渠道的。
+
+**先别急着全删**：这 11 个字段当时被混在一起，实际支撑三件不同的事——
+
+| 字段 | 实际支撑 |
+| --- | --- |
+| 通知渠道名称 / 类型 / 接收人 | 只用于把 MP 通知推到企微（用内置渠道后确实冗余） |
+| 企业ID / AgentId / Secret / 代理地址 | 自建应用发消息 + 建菜单 + 回调验签的 `receive_id` |
+| Token / EncodingAESKey | 回调解密验签 |
+| 管理员白名单 / 自动注册菜单 | 远程命令鉴权 + 菜单注册 |
+
+关键判断：**动态可信 IP 保活对这 11 个字段零依赖**（走 CookieCloud / 扫码改网页后台），
+但**远程命令的回复是主动调 `message/send`**（不是被动 XML），所以删掉 Secret/AgentId 后
+回调就变成「能收不能回」。也就是说「删字段」和「删能力」是同一件事，必须让用户显式确认。
+
+**修法**：用户选择全部删除后，一次性下线整层能力。
+
+1. 删 `wecom_notify.py` / `client.py` / `crypt.py`，宿主类去掉 `WecomNotifyMixin` 基类。
+2. `get_form()` 不再 merge `_wecom_form()`；`__update_config()` 删掉 11 个键；
+   `get_page()` 不再追加 `_wecom_page()`；`get_command()` 只留 2 条；`get_api()` 不再挂 `_wecom_api()`。
+3. 删两个事件转发（`NoticeMessage` / `PluginAction` 的 wecom 版本）与 `stop_service()` 里的 `_stop_wecom()`。
+4. `plugin_version` → `5.0.0`（破坏性变更，语义化版本该跳大版本）。
+
+**坑**：`package.v3.json` 用 `json.dumps` 重写时要注意两件事——
+一是它包含 `DynamicWeChatSelfUse` 与 `ParkingBot` **两个**条目，必须整体读改写、不能只写一个；
+二是原文件是 **2 空格缩进**，用 `indent=4` 会产生整篇无意义 diff。
+改完要用「结构化比较」验证：`ParkingBot` 完全一致、差异字段只有 version / description / history。
+
+**回归点**：`test_get_command_only_two` / `test_get_api_only_verify_endpoints` /
+`test_no_wecom_modules` / `test_config_has_no_wecom_fields` / `test_host_class_has_no_mixin`

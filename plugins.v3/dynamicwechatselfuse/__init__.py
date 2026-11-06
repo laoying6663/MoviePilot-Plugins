@@ -33,7 +33,6 @@ from app.sdk.plugin import _PluginBase
 from app.schemas.types import EventType, NotificationChannel
 
 from .helper import PyCookieCloud, MySender, IpLocationParser, JsonFieldManager
-from .wecom_notify import WecomNotifyMixin
 
 
 # 详情页「短信验证码」卡片模板。
@@ -88,16 +87,17 @@ _VERIFY_CODE_POLL_JS = (
 )
 
 
-class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
+class DynamicWeChatSelfUse(_PluginBase):
     # 插件名称
     plugin_name = "动态企微可信IP（自用版）"
     # 插件描述
-    plugin_desc = ("动态维护企业微信应用可信IP；并把 MoviePilot 通知推送到企业微信自建应用，"
-                   "支持回调验签、远程命令与控制菜单；扫码需要短信验证时详情页会自动弹出验证码输入框")
+    plugin_desc = ("动态维护企业微信应用可信IP并保活 Cookie，支持 CookieCloud / 扫码登录；"
+                   "扫码需要短信验证时详情页会自动弹出验证码输入框。"
+                   "通知请使用 MoviePilot 内置的微信通知渠道")
     # 插件图标
     plugin_icon = "Wecom_A.png"
     # 插件版本
-    plugin_version = "4.0.2"
+    plugin_version = "5.0.0"
     # 插件作者
     plugin_author = "RamenRa, laoying6663"
     # 作者主页
@@ -348,18 +348,11 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
         # 停止之前残留的任务，若未完全停止则跳过启动
         if not self.stop_service():
             logger.warning("仍有后台任务未退出，跳过启动新后台循环")
-            # v4.0：这一支同样会走 __update_config() 整体覆盖，但走不到下面的
-            # _init_wecom()。必须先把企微配置读回实例，否则用户已保存的凭据会被
-            # 类属性默认值抹成空（只填 IP 保活的老用户尤其容易踩到）。
-            self._load_wecom_config(config or {})
             self.__update_config()
             return
 
         # 重置停止标志，使新任务可以启动
         self._stopping = False
-        # v4.0：初始化企业微信通知能力。必须放在 stop_service() 之后——
-        # stop_service() 会释放 _client，若先建客户端会被立刻清掉。
-        self._init_wecom(config or {})
         # 恢复上次落盘的 Cookie。
         # 放在 stop_service() 之后：旧后台任务完全退出前就改 _saved_cookie /
         # _cookie_valid，可能把仍在运行的那份覆盖成更旧的磁盘副本；而且上一段
@@ -573,8 +566,6 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
         这些任务仅在用户点击保存或手动触发时执行一次
         """
         if self._onlyonce:
-            # v4.0：同一个「立即运行一次」同时触发企微通知连通性测试
-            self.schedule_wecom_test_once()
             if self.wan2:
                 if not self._forced_update or not self._local_scan:
                     logger.info("多网络出口检查需要时间较长，预计25秒内完成")
@@ -1886,42 +1877,11 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
             "input_id_list": self._input_id_list,
             "cookie_header": self._cookie_header,
             "use_cookiecloud": self._use_cookiecloud,
-            # v4.0：update_config 是整体覆盖，缺了这些键会在每次保存/重载时
-            # 把用户填的企业微信通知凭据从配置里抹掉。
-            "name": self._name,
-            "types": self._types,
-            "corpid": self._corpid,
-            "agentid": self._agentid,
-            "secret": self._secret,
-            "proxy": self._proxy,
-            "token": self._token,
-            "encoding_aes_key": self._encoding_aes_key,
-            "userid": self._userid,
-            "admins": ",".join(self._admins),
-            "create_menu": self._create_menu,
         })
 
     def get_state(self) -> bool:
         """返回插件启用状态"""
         return self._enabled
-
-    @staticmethod
-    def _drop_shared_form_fields(nodes):
-        """剔除通知表单里与宿主表单重复的 enabled / onlyonce 字段。"""
-        shared = {"enabled", "onlyonce"}
-        cleaned = []
-        for node in nodes or []:
-            if not isinstance(node, dict):
-                cleaned.append(node)
-                continue
-            if (node.get("props") or {}).get("model") in shared:
-                continue
-            content = node.get("content")
-            if isinstance(content, list):
-                node = dict(node)
-                node["content"] = DynamicWeChatSelfUse._drop_shared_form_fields(content)
-            cleaned.append(node)
-        return cleaned
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -2113,11 +2073,6 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
             "wechat_userid": "",
             "input_id_list": ""
         }
-        wecom_conf, wecom_model = self._wecom_form()
-        legacy_conf.extend(self._drop_shared_form_fields(wecom_conf))
-        for key in ("enabled", "onlyonce"):
-            wecom_model.pop(key, None)
-        legacy_model.update(wecom_model)
         return legacy_conf, legacy_model
 
     def get_page(self) -> List[dict]:
@@ -2272,10 +2227,9 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                 ]
             }
         ]
-        # v4.0.1：二维码下方追加「短信验证码」输入卡片（详情页专用，不进配置表单）
+        # 二维码下方追加「短信验证码」输入卡片（详情页专用，不进配置表单）
         base_content.extend(self._verify_code_card())
-        # v4.0：把企业微信通知的运行状态面板接在原有详情页后面
-        return base_content + self._wecom_page()
+        return base_content
 
     def _verify_code_card(self) -> List[dict]:
         """详情页的短信验证码输入卡片（默认隐藏，只在真正需要时自动弹出）。
@@ -2304,16 +2258,6 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                 .replace("__DISPLAY__", "block" if required else "none")
                 .replace("__STATUS__", _html_escape(str(message), quote=True)))
         return [{"component": "div", "html": html}]
-
-    # ---------- 企业微信通知事件转发（宿主类统一注册，保证只注册一次） ----------
-
-    @eventmanager.register(EventType.NoticeMessage)
-    async def wecom_notice_message(self, event: Event):
-        await WecomNotifyMixin.notice_message(self, event)
-
-    @eventmanager.register(EventType.PluginAction)
-    async def wecom_plugin_action(self, event: Event):
-        await WecomNotifyMixin.plugin_action(self, event)
 
     # ---------- 统一事件入口 ----------
     @eventmanager.register(EventType.PluginAction)
@@ -2380,9 +2324,7 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """
-        注册插件命令。v4.0：合并动态可信IP与企业微信通知两套命令，去重后只注册一次。
-        """
+        """注册插件命令（v5.0.0：只保留扫码与验证码两条）。"""
         return [
             {
                 "cmd": "/push_qr",
@@ -2398,15 +2340,12 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
                 "category": "",
                 "data": {"action": "dynamicwechatselfuse", "sub_action": "wxcode"}
             }
-        ] + [
-            c for c in WecomNotifyMixin._wecom_commands()
-            if c.get("cmd") not in {"/push_qr", "/wxcode"}
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        # v4.0：企业微信回调（匿名，靠 SHA1 验签）与状态查询端点
-        # v4.0.1：详情页提交短信验证码（需登录；不写配置、不触发 init_plugin）
-        return self._wecom_api() + [
+        # 详情页专用：提交短信验证码 + 查询是否该显示验证码卡片。
+        # 两者都需登录、都不写配置、都不触发 init_plugin（否则会杀掉扫码任务）。
+        return [
             {
                 "path": "/verify_code",
                 "endpoint": self.api_verify_code,
@@ -2499,8 +2438,6 @@ class DynamicWeChatSelfUse(WecomNotifyMixin, _PluginBase):
         """
         self._stopping = True
         self._verify_code_required = False
-        # v4.0：释放企业微信通知客户端（可重复调用）
-        self._stop_wecom()
 
         # 检测当前事件循环
         try:

@@ -1,14 +1,15 @@
 {
   "DynamicWeChatSelfUse": {
     "name": "动态企微可信IP（自用版）",
-    "description": "动态维护企业微信应用可信IP并保活Cookie；同时把MoviePilot通知推送到企业微信自建应用，支持回调验签、远程命令与控制菜单。兼容Server酱等第三方通知，扫码需要短信验证时详情页会自动弹出验证码输入框",
+    "description": "动态维护企业微信应用可信IP并保活Cookie，支持CookieCloud与本地扫码登录；扫码需要短信验证时，插件详情页会自动弹出验证码输入框。通知请直接使用 MoviePilot 内置的微信通知渠道，本插件不再维护自建应用凭据。",
     "labels": "消息通知",
-    "version": "4.0.2",
+    "version": "5.0.0",
     "icon": "Wecom_A.png",
     "author": "RamenRa, laoying6663",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v5.0.0": "精简为「只管可信 IP 与 Cookie 保活」。移除企业微信自建应用那一整套配置：通知渠道名称、消息类型、企业ID、应用AgentId、应用Secret、代理地址、回调Token、EncodingAESKey、接收人、管理员白名单、自动注册控制菜单共 11 项，连带移除自建应用发消息、/wecom 回调验签、远程斜杠命令与菜单注册，以及 /wecom_test、/wecom_status 两条命令。通知统一改用 MoviePilot 内置微信通知渠道。保留全部保活能力（CookieCloud、本地扫码、多WAN、IP变更通知）与 /push_qr、/wxcode 两条命令；详情页验证码卡片、POST /verify_code、GET /verify_state 行为不变。老配置里残留的上述 11 个键会在下次保存时被清除。",
       "v4.0.2": "验证码卡片改为「按需自动弹出」：平时不扫码时详情页完全不显示输入框，只有企业微信真的弹出短信验证面板时，卡片才自动出现、滚动到可见位置并聚焦输入框，登录成功或等待超时后自动收起。新增 GET /verify_state（bear 鉴权，纯只读运行时状态）供详情页每 2.5 秒轮询；不新增任何配置项，POST /verify_code、/wxcode 与「6位数字?」通道保持不变。",
       "v4.0.1": "新增插件详情页「短信验证码」输入框与「提交验证码」按钮：扫码后需要短信验证码时，无需企业微信消息回调、无需 AI 全局助手，可直接在详情页填入 6 位数字提交。新增 POST /verify_code 端点（bear 鉴权，只改运行时状态，不写配置、不触发 init_plugin，因此不会打断正在等待验证码的扫码任务）；验证码等待由固定 30 秒改为最长 120 秒轮询，收到即刻继续；新一轮扫码会清空上一轮残留验证码。原有 /wxcode 与「6位数字?」通道保持不变。",
       "v4.0.0": "并入企业微信通知能力（原独立插件 WecomNotify / PR #1）：新增 MoviePilot 通知推送、回调 SHA1 验签与 AES 解密、远程命令与控制菜单；同时完整保留动态可信IP、CookieCloud 保活、扫码与验证码等 3.x 旧功能。插件 ID 与配置前缀不变，升级后原有应用ID、Cookie 与通知渠道配置不丢失。新增字段 corpid/agentid/secret/proxy/token/encoding_aes_key/userid/admins/create_menu/types/name；回调地址 /api/v1/plugin/DynamicWeChatSelfUse/wecom。WecomNotify 不再单独发布。",
