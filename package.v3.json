@@ -1,14 +1,15 @@
 {
   "DynamicWeChatSelfUse": {
     "name": "动态企微可信IP（自用版）",
-    "description": "修改企微应用可信IP，支持Srever酱等第三方通知。验证码以？结尾发送到企业微信应用",
+    "description": "动态维护企业微信应用可信IP并保活Cookie；同时把MoviePilot通知推送到企业微信自建应用，支持回调验签、远程命令与控制菜单。兼容Server酱等第三方通知，验证码以？结尾发送到企业微信应用",
     "labels": "消息通知",
-    "version": "3.2.0",
+    "version": "4.0.0",
     "icon": "Wecom_A.png",
     "author": "RamenRa, laoying6663",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v4.0.0": "并入企业微信通知能力（原独立插件 WecomNotify / PR #1）：新增 MoviePilot 通知推送、回调 SHA1 验签与 AES 解密、远程命令与控制菜单；同时完整保留动态可信IP、CookieCloud 保活、扫码与验证码等 3.x 旧功能。插件 ID 与配置前缀不变，升级后原有应用ID、Cookie 与通知渠道配置不丢失。新增字段 corpid/agentid/secret/proxy/token/encoding_aes_key/userid/admins/create_menu/types/name；回调地址 /api/v1/plugin/DynamicWeChatSelfUse/wecom。WecomNotify 不再单独发布。",
       "v1.20.0": "车位卡片新增贴条按钮与贴条预计收益",
       "v1.19.0": "插件图标改用 Parking_A.png，市场页不再显示默认拼图图标",
       "v1.18.0": "手动买车与换车也计入数据统计，并修好选中页签看不清的问题",
@@ -133,19 +134,6 @@
       "v1.0.2": "修复定时任务表达式",
       "v1.0.1": "补齐插件契约接口",
       "v1.0.0": "首个版本"
-    }
-  },
-  "WecomNotify": {
-    "name": "企业微信通知",
-    "description": "把 MoviePilot 通知推送到企业微信自建应用，并支持在企业微信里执行远程命令",
-    "labels": "消息通知",
-    "version": "1.0.0",
-    "icon": "Wecom_A.png",
-    "author": "laoying6663",
-    "level": 2,
-    "system_version": ">=3.0.0",
-    "history": {
-      "v1.0.0": "首次发布：通知推送（按类型/接收人筛选）、消息回调（SHA1 签名校验 + AES 解密）、远程命令与控制菜单、管理员白名单、转发代理地址支持。"
     }
   }
 }

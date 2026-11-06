@@ -692,7 +692,7 @@ class IpLocationParser:
                 if 'China' in location or '中国' in location
             ]
             return ';'.join(china_ips)
-        except Exception as e:
+        except Exception:
             return ""
 
     # ---------- 同步文件操作方法（保留兼容） ----------
